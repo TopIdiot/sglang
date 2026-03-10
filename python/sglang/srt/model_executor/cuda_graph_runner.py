@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 import inspect
 import logging
@@ -23,7 +24,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import torch
 import tqdm
@@ -114,9 +115,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
-    input_ids_gram2: Optional[torch.Tensor] = None
-    input_ids_gram3: Optional[torch.Tensor] = None
-    input_ids_gram4: Optional[torch.Tensor] = None
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
+    scale_seq_factor: int = 1
 
     @classmethod
     def create(
@@ -137,7 +137,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
-        prepare_n_gram_inputs: bool,
+        num_n_gram: int,
+        scale_seq_factor: int,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -156,14 +157,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_num_token, vocab_size),
                 dtype=torch.float,
             )
-            if prepare_n_gram_inputs:
-                input_ids_gram2 = torch.zeros((max_num_token,), dtype=torch.int64)
-                input_ids_gram3 = torch.zeros((max_num_token,), dtype=torch.int64)
-                input_ids_gram4 = torch.zeros((max_num_token,), dtype=torch.int64)
+            if num_n_gram > 0:
+                input_ids_grams = [
+                    torch.zeros((max_num_token,), dtype=torch.int64)
+                    for _ in range(num_n_gram - 1)
+                ]
             else:
-                input_ids_gram2 = None
-                input_ids_gram3 = None
-                input_ids_gram4 = None
+                input_ids_grams = []
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -223,9 +223,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
-            input_ids_gram2=input_ids_gram2,
-            input_ids_gram3=input_ids_gram3,
-            input_ids_gram4=input_ids_gram4,
+            input_ids_grams=input_ids_grams,
+            scale_seq_factor=scale_seq_factor,
         )
 
     def populate_from_forward_batch(
@@ -251,24 +250,17 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_mask.fill_(False)
 
         # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        is_scale_seq = self.scale_seq_factor > 1
+        raw_model_input = raw_bs if is_scale_seq else raw_num_token
+        self.input_ids[:raw_model_input].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if (
-            forward_batch.n_gram_input_ids is not None
-            and self.input_ids_gram2 is not None
-        ):
-            self.input_ids_gram2[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram2
-            )
-            self.input_ids_gram3[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram3
-            )
-            self.input_ids_gram4[:raw_num_token].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram4
-            )
+        if forward_batch.n_gram_input_ids is not None and len(self.input_ids_grams) > 0:
+            for i, gram in enumerate(forward_batch.n_gram_input_ids.input_ids_grams):
+                if i < len(self.input_ids_grams):
+                    self.input_ids_grams[i][:raw_model_input].copy_(gram)
 
         if (
             self.mamba_track_indices is not None
@@ -516,6 +508,12 @@ class CudaGraphRunner:
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
+        self.scale_seq_factor = (
+            getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
+        )
+        if self.scale_seq_factor > 1 and self.num_tokens_per_bs == 1:
+            self.num_tokens_per_bs = self.scale_seq_factor
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -578,7 +576,8 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
-            prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
+            num_n_gram=getattr(self.model_runner.model_config, "num_n_gram", 0),
+            scale_seq_factor=self.scale_seq_factor,
         )
         self.buffers.share_buffers()
 
@@ -789,7 +788,9 @@ class CudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
+        is_scale_seq = self.scale_seq_factor > 1
+        model_input_len = bs if is_scale_seq else num_tokens
+        input_ids = buffers.input_ids[:model_input_len]
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -800,7 +801,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:model_input_len]
         buffers.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
@@ -907,11 +908,12 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
-        if self.model_runner.server_args.prepare_n_gram_inputs:
+        if len(buffers.input_ids_grams) > 0:
             forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
-                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
-                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
+                input_ids_grams=[
+                    gram[:model_input_len] for gram in buffers.input_ids_grams
+                ],
+                buffer_size=len(buffers.input_ids_grams) + 1,
             )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -1105,7 +1107,10 @@ class CudaGraphRunner:
                 full_logits = output.full_logits[: self.raw_num_token]
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                output_len = (
+                    self.raw_bs if self.scale_seq_factor > 1 else self.raw_num_token
+                )
+                next_token_logits = output.next_token_logits[:output_len]
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,

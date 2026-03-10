@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welmv4 import (
-    Qwen2MoeDecoderLayer,
+    WeLMV4MoeDecoderLayer,
     WeLMV4MoeForCausalLM,
     hash_input_ids_vectorized,
 )
@@ -81,7 +81,7 @@ class WeLMV4ModelNextN(nn.Module):
 
         self.decoder_layers = nn.ModuleList(
             [
-                Qwen2MoeDecoderLayer(
+                WeLMV4MoeDecoderLayer(
                     config,
                     i,
                     quant_config=quant_config,
@@ -112,16 +112,18 @@ class WeLMV4ModelNextN(nn.Module):
         if len(self.oe_grams) > 0:
             input_ids_ngram = []
             input_ids_ngram_tmp = input_ids
+            max_n = max(self.oe_grams)
             if getattr(forward_batch, "n_gram_input_ids", None) is not None:
-                input_ids_gram_n = [
-                    forward_batch.n_gram_input_ids.input_ids_gram2,
-                    forward_batch.n_gram_input_ids.input_ids_gram3,
-                    forward_batch.n_gram_input_ids.input_ids_gram4,
-                ]
+                input_ids_gram_n = []
+                for n in range(2, max_n + 1):
+                    gram = forward_batch.n_gram_input_ids.get_gram(n)
+                    input_ids_gram_n.append(
+                        gram if gram is not None else torch.zeros_like(input_ids)
+                    )
             else:
                 zero_ids = torch.zeros_like(input_ids)
-                input_ids_gram_n = [zero_ids, zero_ids, zero_ids]
-            for g in range(1, max(self.oe_grams)):
+                input_ids_gram_n = [zero_ids for _ in range(max_n - 1)]
+            for g in range(1, max_n):
                 input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[g - 1] * (
                     self.vocab_size**g
                 )

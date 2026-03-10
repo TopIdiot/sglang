@@ -485,12 +485,42 @@ class MultimodalInputs:
 
 @dataclasses.dataclass
 class NGramInputIds:
-    input_ids_gram2: Optional[torch.Tensor] = None
-    input_ids_gram3: Optional[torch.Tensor] = None
-    input_ids_gram4: Optional[torch.Tensor] = None
+    """N-gram input IDs for over encoding support.
+
+    Supports configurable n-gram range. The n values (e.g., 2, 3, 4) are determined
+    by model config (num_n_gram). For CUDA graph compatibility, tensors are stored
+    in a list with fixed length based on model's num_n_gram setting.
+
+    Args:
+        input_ids_grams: List of tensors for n-gram input IDs.
+                         Index i corresponds to (i+2)-gram (i.e., index 0 = 2-gram).
+    """
+
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
     input_ids_buffer: Optional[torch.Tensor] = None
     buffer_size: int = 4
     filtered: bool = False
+
+    def get_gram(self, n: int) -> Optional[torch.Tensor]:
+        """Get the tensor for n-gram input IDs (n >= 2)."""
+        idx = n - 2
+        if 0 <= idx < len(self.input_ids_grams):
+            return self.input_ids_grams[idx]
+        return None
+
+    def set_gram(self, n: int, value: torch.Tensor):
+        """Set the tensor for n-gram input IDs (n >= 2). Extends list if needed."""
+        idx = n - 2
+        while len(self.input_ids_grams) <= idx:
+            self.input_ids_grams.append(None)
+        self.input_ids_grams[idx] = value
+
+    def __getitem__(self, n: int) -> Optional[torch.Tensor]:
+        """Get the tensor for n-gram input IDs (n >= 2)."""
+        return self.get_gram(n)
+
+    def __len__(self) -> int:
+        return len(self.input_ids_grams)
 
     @staticmethod
     def get_token_ids_gram_n(req_input_ids: List[int], n: int):
@@ -517,6 +547,22 @@ class NGramInputIds:
 
     def start_new_step(self):
         self.filtered = False
+
+    # Backward compat: obj.input_ids_gramN  (N = any digit, e.g. 2, 3, 4)
+    def __getattr__(self, name: str):
+        if name.startswith("input_ids_gram"):
+            suffix = name[len("input_ids_gram") :]
+            if suffix.isdigit():
+                return self.get_gram(int(suffix))
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+    def __setattr__(self, name: str, value):
+        if name.startswith("input_ids_gram"):
+            suffix = name[len("input_ids_gram") :]
+            if suffix.isdigit():
+                self.set_gram(int(suffix), value)
+                return
+        object.__setattr__(self, name, value)
 
 
 class Req(ReqDllmMixin):
@@ -680,8 +726,10 @@ class Req(ReqDllmMixin):
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
-        # The prefix length that is inserted into the tree cache
+        # The prefix length that is inserted into the tree cache (in scaled units)
         self.cache_protected_len: int = 0
+        # Physical-to-logical KV scale factor, set by init_next_round_input
+        self._scale_seq_factor: int = 1
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -930,6 +978,7 @@ class Req(ReqDllmMixin):
                 match_result.mamba_branching_seqlen,
             )
             self.cache_protected_len = len(self.prefix_indices)
+            self._scale_seq_factor = getattr(tree_cache, "scale_seq_factor", 1)
 
         if (
             self.is_retracted
@@ -946,7 +995,10 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        scale = getattr(self, "_scale_seq_factor", 1)
+        self.set_extend_input_len(
+            len(self.fill_ids) - len(self.prefix_indices) // scale
+        )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1281,6 +1333,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
+    # (scale_seq_times + 1). 1 when scale_seq is disabled. Set in prepare_for_extend.
+    scale_seq_factor: int = 1
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
@@ -1460,6 +1514,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    def _get_scale_seq_factor(self):
+        """Return (scale_seq_times + 1). Returns 1 when scale_seq is disabled."""
+        return getattr(self.model_config.hf_config, "scale_seq_times", 0) + 1
+
+    @staticmethod
+    def _get_token_ids_gram_n(req_input_ids, n):
+        """Get n-gram shifted token ids for over encoding."""
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        result_id[n:] = req_input_ids[:-n]
+        return result_id
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -1467,14 +1535,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
 
+        self.scale_seq_factor = self._get_scale_seq_factor()
+
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        scale = self.scale_seq_factor
+        logical_prefix_lens = [len(r.prefix_indices) // scale for r in reqs]
+        input_ids = [r.fill_ids[lpl:] for r, lpl in zip(reqs, logical_prefix_lens)]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        prefix_lens = logical_prefix_lens
         extend_lens = [r.extend_input_len for r in reqs]
+
+        # Expanded values for KV cache / attention (multiply by scale)
+        expanded_seq_lens = [s * self.scale_seq_factor for s in seq_lens]
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1495,39 +1570,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
 
         if get_global_server_args().prepare_n_gram_inputs:
-            input_ids_gram2 = []
-            input_ids_gram3 = []
-            input_ids_gram4 = []
-            for r in reqs:
-                prefix_len = len(r.prefix_indices)
-                input_ids_gram2.append(
-                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:]
+            num_n_gram = getattr(self.model_config, "num_n_gram", 0)
+            if num_n_gram > 0:
+                input_ids_grams = [[] for _ in range(num_n_gram - 1)]
+                for r, lpl in zip(reqs, logical_prefix_lens):
+                    for i in range(num_n_gram - 1):
+                        n = i + 2  # n = 2, 3, 4, ...
+                        input_ids_grams[i].append(
+                            self._get_token_ids_gram_n(r.fill_ids, n - 1)[lpl:]
+                        )
+                self.n_gram_input_ids = NGramInputIds(
+                    input_ids_grams=[
+                        torch.tensor(
+                            sum(gram_list, []), dtype=torch.int64, pin_memory=_pin
+                        ).to(self.device, non_blocking=True)
+                        for gram_list in input_ids_grams
+                    ],
+                    buffer_size=num_n_gram,
                 )
-                input_ids_gram3.append(
-                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:]
-                )
-                input_ids_gram4.append(
-                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:]
-                )
-
-            self.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=torch.tensor(
-                    sum(input_ids_gram2, []), dtype=torch.int64, pin_memory=_pin
-                ).to(self.device, non_blocking=True),
-                input_ids_gram3=torch.tensor(
-                    sum(input_ids_gram3, []), dtype=torch.int64, pin_memory=_pin
-                ).to(self.device, non_blocking=True),
-                input_ids_gram4=torch.tensor(
-                    sum(input_ids_gram4, []), dtype=torch.int64, pin_memory=_pin
-                ).to(self.device, non_blocking=True),
-            )
+            else:
+                self.n_gram_input_ids = None
         else:
             self.n_gram_input_ids = None
 
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
-        )
-        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        seq_lens_tensor = torch.tensor(
+            expanded_seq_lens, dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+        seq_lens_cpu = torch.tensor(expanded_seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
@@ -1538,17 +1607,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
             ).to(self.device, non_blocking=True)
 
-        # Set batch fields needed by alloc_for_extend
+        # Set batch fields needed by alloc_for_extend (logical lengths; common scales them)
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
-        self.extend_num_tokens = extend_num_tokens
+        self.extend_num_tokens = extend_num_tokens * self.scale_seq_factor
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self
         )
+
+        # Switch to physical lengths for the rest of the pipeline
+        self.prefix_lens = [p * self.scale_seq_factor for p in prefix_lens]
+        self.extend_lens = [e * self.scale_seq_factor for e in extend_lens]
 
         # Set fields
         input_embeds = []
@@ -1560,7 +1633,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_input_len, (
+                f"seq_len={seq_len}, pre_len={pre_len}, "
+                f"extend_input_len={req.extend_input_len}, "
+                f"len(prefix_indices)={len(req.prefix_indices)}, "
+                f"batch_scale={scale}, req_scale={req._scale_seq_factor}, "
+                f"is_chunked={req.is_chunked}, rid={req.rid}"
+            )
 
             req.extend_batch_idx += 1
 
@@ -1818,6 +1897,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        scale = self._get_scale_seq_factor()
 
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
@@ -1834,14 +1914,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        # With scale_seq, KV entries are expanded, so prefix_lens and extend_lens
+        # must be in expanded (KV) space.
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
+                (len(r.origin_input_ids) + len(r.output_ids) + delta) * scale
                 for r in running_batch.reqs
             ]
         )
-        self.extend_lens.extend([1] * running_bs)
-        self.extend_num_tokens += running_bs
+        self.extend_lens.extend([scale] * running_bs)
+        self.extend_num_tokens += running_bs * scale
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
@@ -1850,6 +1932,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, selected_indices: Optional[List[int]] = None
     ):
         page_size = self.token_to_kv_pool_allocator.page_size
+        scale = self._get_scale_seq_factor()
         requests = (
             self.reqs
             if selected_indices is None
@@ -1858,7 +1941,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_algorithm.is_none():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            return new_pages * page_size * scale
 
         server_args = get_global_server_args()
         len_per_topk = server_args.speculative_num_steps or 1
@@ -1874,7 +1957,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len_per_topk = ceil_align(len_per_topk, page_size)
             spec_tokens = ceil_align(spec_tokens, page_size)
 
-        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests) * scale
 
         # v2 eagle has over-allocation
         return num_tokens * (1 + self.is_spec_v2)
@@ -1994,6 +2077,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        scale = self._get_scale_seq_factor()
+        # Always keep DECODE for scheduler routing.
+        # When scale > 1, the ForwardBatch will override to EXTEND for the
+        # attention backend (see ForwardBatch.init_new).
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
@@ -2035,51 +2122,62 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.output_ids = None
 
         if get_global_server_args().prepare_n_gram_inputs:
-            input_ids_gram2 = []
-            input_ids_gram3 = []
-            input_ids_gram4 = []
-            for r in self.reqs:
-                ids = r.origin_input_ids + r.output_ids
-                input_ids_gram2.append(ids[-2] if len(ids) > 1 else 0)
-                input_ids_gram3.append(ids[-3] if len(ids) > 2 else 0)
-                input_ids_gram4.append(ids[-4] if len(ids) > 3 else 0)
+            num_n_gram = getattr(self.model_config, "num_n_gram", 0)
+            if num_n_gram > 0:
+                input_ids_grams = [[] for _ in range(num_n_gram - 1)]
+                for r in self.reqs:
+                    for i in range(num_n_gram - 1):
+                        n = i + 2  # n = 2, 3, 4, ...
+                        if len(r.output_ids) >= n:
+                            val = r.output_ids[-n]
+                        elif len(r.output_ids) + len(r.origin_input_ids) >= n:
+                            val = r.origin_input_ids[-(n - len(r.output_ids))]
+                        else:
+                            val = 0
+                        input_ids_grams[i].append(val)
 
-            self.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(
-                    self.device, non_blocking=True
-                ),
-                input_ids_gram3=torch.tensor(input_ids_gram3, dtype=torch.int64).to(
-                    self.device, non_blocking=True
-                ),
-                input_ids_gram4=torch.tensor(input_ids_gram4, dtype=torch.int64).to(
-                    self.device, non_blocking=True
-                ),
-            )
+                self.n_gram_input_ids = NGramInputIds(
+                    input_ids_grams=[
+                        torch.tensor(gram_list, dtype=torch.int64).to(
+                            self.device, non_blocking=True
+                        )
+                        for gram_list in input_ids_grams
+                    ],
+                    buffer_size=num_n_gram,
+                )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=scale)
 
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
+        locs = self.seq_lens.clone()
 
         # Update seq_lens after allocation
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
+            self.seq_lens = self.seq_lens + scale
+            self.seq_lens_cpu = self.seq_lens_cpu + scale
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
+            self.seq_lens.add_(scale)
+            self.seq_lens_cpu.add_(scale)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        self.seq_lens_sum += bs * scale
+
+        if scale > 1:
+            self.extend_num_tokens = bs * scale
+            self.extend_lens = [scale] * bs
+            self.prefix_lens = locs.tolist()
+            self.extend_logprob_start_lens = [0] * bs
+            self.extend_input_logprob_token_ids = None
 
         if get_global_server_args().enable_mamba_extra_buffer():
             if len(self.reqs) == 0:
@@ -2267,7 +2365,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode_or_idle():
+        # For scale_seq decode, extend metadata is populated even in DECODE mode
+        # so that ForwardBatch can override to EXTEND for the attention backend.
+        scale = self._get_scale_seq_factor()
+        if self.forward_mode.is_decode_or_idle() and scale <= 1:
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens

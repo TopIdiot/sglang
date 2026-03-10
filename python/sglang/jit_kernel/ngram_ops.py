@@ -10,14 +10,11 @@ Provides JIT-compiled CUDA kernels that were previously in ``prc_custom_ops``:
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -63,12 +60,6 @@ def build_ngram_with_tree(
         topk: Top-k value.
         i: Current tree layer index.
     """
-    logger.info(
-        "jit_kernel ngram_ops: build_ngram_with_tree called (gram_n=%d, topk=%d, i=%d)",
-        gram_n,
-        topk,
-        i,
-    )
     module = _jit_ngram_ops_module()
     module.build_ngram_with_tree(
         ngram_input_ids,
@@ -107,11 +98,6 @@ def build_ngram_with_target_verify(
         draft_token_num: Number of draft tokens.
         buffer_size: Size of the buffer per sequence.
     """
-    logger.info(
-        "jit_kernel ngram_ops: build_ngram_with_target_verify called (gram_n=%d, draft_token_num=%d)",
-        gram_n,
-        draft_token_num,
-    )
     module = _jit_ngram_ops_module()
     module.build_ngram_with_target_verify(
         ngram_input_ids,
@@ -146,12 +132,6 @@ def assign_ngram_input_ids_draft_extend_after_decode(
         buffer_size: Size of the buffer per sequence (must be < 10).
         update_buffer: Whether to update the buffer (default: False).
     """
-    logger.info(
-        "jit_kernel ngram_ops: assign_ngram_input_ids_draft_extend_after_decode called (gram_n=%d, buffer_size=%d, update_buffer=%s)",
-        gram_n,
-        buffer_size,
-        update_buffer,
-    )
     module = _jit_ngram_ops_module()
     module.assign_ngram_input_ids_draft_extend_after_decode(
         input_ids,

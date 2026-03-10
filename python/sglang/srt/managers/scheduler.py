@@ -723,9 +723,12 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        if server_args.enable_streaming_session:
+        scale_seq_times = getattr(self.model_config.hf_config, "scale_seq_times", 0)
+        self.tree_cache.scale_seq_factor = scale_seq_times + 1
 
+        if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
+            self.tree_cache.scale_seq_factor = scale_seq_times + 1
 
         if (
             server_args.disaggregation_mode == "decode"

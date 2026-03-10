@@ -36,8 +36,13 @@ class ForwardInputBuffers:
             name = f.name
             buffer = getattr(self, name)
 
-            if buffer is None:
+            if buffer is None or not isinstance(buffer, (torch.Tensor, dict, list)):
                 continue
+            elif isinstance(buffer, list):
+                for idx, item in enumerate(buffer):
+                    if isinstance(item, torch.Tensor):
+                        new_buffer = self._share_one_buffer(f"{name}[{idx}]", item)
+                        buffer[idx] = new_buffer
             elif isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
                     assert isinstance(

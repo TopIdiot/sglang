@@ -495,8 +495,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             ret.positions = ret.spec_info.positions
 
+        if ret.forward_mode.is_decode() and batch.extend_seq_lens is not None:
+            ret.forward_mode = ForwardMode.TARGET_VERIFY
+
         # Init position information
-        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+        if ret.forward_mode.is_decode() or (
+            ret.forward_mode.is_target_verify() and ret.spec_info is not None
+        ):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:

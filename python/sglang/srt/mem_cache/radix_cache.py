@@ -292,6 +292,9 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        # Each logical token maps to scale_seq_factor physical KV slots.
+        # Overridden by scheduler after init via tree_cache.scale_seq_factor = N.
+        self.scale_seq_factor = 1
 
         self.kv_event_queue = []
 
@@ -462,7 +465,10 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        scale = self.scale_seq_factor
+        logical_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = logical_committed_len * scale
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -470,15 +476,15 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:logical_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : len(token_ids) * scale
         ]
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
+        values = kv_indices[: len(keys) * scale].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
@@ -490,15 +496,15 @@ class RadixCache(BasePrefixCache):
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+                kv_indices[req.cache_protected_len : new_prefix_len * scale]
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+                kv_indices[req.cache_protected_len : len(keys) * scale]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) * scale :])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -508,15 +514,16 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        scale = self.scale_seq_factor
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : len(token_ids) * scale
         ]
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
+        values = kv_indices[: len(keys) * scale].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
@@ -531,7 +538,7 @@ class RadixCache(BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+            kv_indices[req.cache_protected_len : new_prefix_len * scale]
         )
 
         # The prefix indices could be updated, reuse it
@@ -540,7 +547,9 @@ class RadixCache(BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
+        assert (
+            len(new_indices) == len(keys) * scale
+        ), f"{len(new_indices)=}, {len(keys)=}, {scale=}"
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
@@ -608,12 +617,14 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
+        scale = self.scale_seq_factor
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.key)
-                self.protected_size_ += len(node.key)
-                delta -= len(node.key)
+                sz = len(node.key) * scale
+                self.evictable_size_ -= sz
+                self.protected_size_ += sz
+                delta -= sz
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -623,12 +634,14 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
+        scale = self.scale_seq_factor
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.key)
-                self.protected_size_ -= len(node.key)
-                delta += len(node.key)
+                sz = len(node.key) * scale
+                self.evictable_size_ += sz
+                self.protected_size_ -= sz
+                delta += sz
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -687,15 +700,16 @@ class RadixCache(BasePrefixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
+        scale = self.scale_seq_factor
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len].clone()
+        new_node.value = child.value[: split_len * scale].clone()
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:].clone()
+        child.value = child.value[split_len * scale :].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
@@ -709,6 +723,7 @@ class RadixCache(BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
+        scale = self.scale_seq_factor
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
@@ -725,7 +740,7 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-            value = value[prefix_len:]
+            value = value[prefix_len * scale :]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -743,7 +758,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value.clone()
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            self.evictable_size_ += len(key) * scale
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
@@ -773,7 +788,8 @@ class RadixCache(BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        self.evictable_size_ -= len(node.key)
+        scale = self.scale_seq_factor
+        self.evictable_size_ -= len(node.key) * scale
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)

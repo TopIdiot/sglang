@@ -2089,6 +2089,31 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
+        hf_config = model_config.hf_config
+        model_arch = hf_config.architectures[0]
+        if model_arch == "WeLMV4MoeForCausalLM":
+            scale_seq_times = getattr(hf_config, "scale_seq_times", 0)
+            if scale_seq_times > 0 and self.enable_kv_mirror:
+                raise ValueError(
+                    "WeLMV4 does not support enabling scale_seq and kv_mirror "
+                    "at the same time."
+                )
+            prefill_backend, decode_backend = self.get_attention_backends()
+            if scale_seq_times > 0:
+                if prefill_backend != "fa3" or decode_backend != "fa3":
+                    raise ValueError(
+                        f"WeLMV4 with scale_seq requires fa3 attention backend, "
+                        f"but got prefill={prefill_backend}, decode={decode_backend}. "
+                        f"Please set --attention-backend fa3."
+                    )
+            elif self.enable_kv_mirror:
+                if prefill_backend != "fa3" or decode_backend != "fa3":
+                    raise ValueError(
+                        f"WeLMV4 with kv_mirror requires fa3 attention backend, "
+                        f"but got prefill={prefill_backend}, decode={decode_backend}. "
+                        f"Please set --attention-backend fa3."
+                    )
+
         if (
             self.prefill_attention_backend == "fa4"
             and not self.use_mla_backend()

@@ -2230,6 +2230,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
+        scale_seq_factor = (
+            getattr(self.model_config.hf_config, "scale_seq_times", 0) + 1
+        )
+        if scale_seq_factor > 1:
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph for scale_seq models "
+                "(dynamic token expansion is incompatible with CUDA graph capture in EXTEND mode)",
+            )
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(

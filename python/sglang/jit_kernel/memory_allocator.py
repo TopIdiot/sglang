@@ -16,7 +16,6 @@ previously in the external ``prc_custom_ops`` package:
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,8 +24,6 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -214,15 +211,6 @@ def custom_empty(
     sizes = tuple(sizes)
     total_bytes = _numel(sizes) * _element_size(dtype)
 
-    logger.info(
-        "jit_kernel memory_allocator: custom_empty called "
-        "(sizes=%s, dtype=%s, device_id=%d, total_bytes=%d)",
-        sizes,
-        dtype,
-        device_id,
-        total_bytes,
-    )
-
     # Guard against zero-size allocations: cudaMallocHost(0) returns a null
     # pointer which would cause undefined behaviour in storage construction.
     if total_bytes == 0:
@@ -242,8 +230,6 @@ def custom_empty(
         )
     ptr = host_ptr.value
 
-    logger.info("jit_kernel memory_allocator: cudaMallocHost returned ptr=0x%x", ptr)
-
     def _free_host(p, _cudart=cudart, _c_void_p=ctypes.c_void_p):
         _cudart.cudaFreeHost(_c_void_p(p))
 
@@ -253,22 +239,13 @@ def custom_empty(
 
     # Synchronize and check for latent CUDA errors right after tensor creation.
     torch.cuda.synchronize(device_id)
-    logger.info(
-        "jit_kernel memory_allocator: tensor created and sync OK, shape=%s, "
-        "device=%s, data_ptr=0x%x",
-        tensor.shape,
-        tensor.device,
-        tensor.data_ptr(),
-    )
 
     # Quick sanity test: try a small fill to verify the tensor is actually usable.
     try:
         if tensor.numel() > 0:
             tensor.view(-1)[0:1].data.fill_(0)
             torch.cuda.synchronize(device_id)
-        logger.info("jit_kernel memory_allocator: sanity fill_ test PASSED")
-    except Exception as e:
-        logger.error("jit_kernel memory_allocator: sanity fill_ test FAILED: %s", e)
+    except Exception:
         raise
 
     return tensor
@@ -292,12 +269,6 @@ def unified_empty(
     """
     sizes = tuple(sizes)
     total_bytes = _numel(sizes) * _element_size(dtype)
-
-    logger.info(
-        "jit_kernel memory_allocator: unified_empty called (sizes=%s, dtype=%s)",
-        sizes,
-        dtype,
-    )
 
     if total_bytes == 0:
         return torch.empty(sizes, dtype=dtype, device="cpu")
@@ -331,13 +302,6 @@ def unified_empty_with_device(
     """
     sizes = tuple(sizes)
     total_bytes = _numel(sizes) * _element_size(dtype)
-
-    logger.info(
-        "jit_kernel memory_allocator: unified_empty_with_device called (sizes=%s, dtype=%s, device_id=%d)",
-        sizes,
-        dtype,
-        device_id,
-    )
 
     if total_bytes == 0:
         return torch.empty(sizes, dtype=dtype, device=torch.device("cuda", device_id))

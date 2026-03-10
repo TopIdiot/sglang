@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
@@ -340,10 +341,13 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    scale = getattr(batch, "scale_seq_factor", 1)
+    prefix_lens = [s * scale for s in batch.prefix_lens]
+    extend_lens = [s * scale for s in batch.extend_lens]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+    extend_lens_cpu = torch.tensor(extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -428,15 +432,38 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc: allocated cache locations
     """
 
-    batch.maybe_evict_swa()
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        for req in batch.reqs:
+            batch.tree_cache.evict_swa(
+                req, req.seqlen - 1, batch.model_config.attention_chunk_size
+            )
 
     bs = batch.seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+    elif token_per_req > 1:
+        # Paged allocation with multiple tokens per request (e.g. scale_seq).
+        # alloc_decode only returns 1 slot per request, so use alloc_extend instead.
+        prefix_lens = batch.seq_lens
+        prefix_lens_cpu = batch.seq_lens_cpu
+        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next_cpu = batch.seq_lens_cpu + token_per_req
+        last_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, batch.seq_lens - 1
+        ]
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens_next,
+            seq_lens_cpu=seq_lens_next_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=bs * token_per_req,
+        )
     else:
-        # Paged allocation
+        # Paged allocation for single-token decode
         last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, batch.seq_lens - 1
         ]
@@ -455,9 +482,23 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    # batch.req_to_token_pool.write(
+    #     (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    # )
+    if token_per_req > 1:
+        expanded_req_pool_indices = batch.req_pool_indices.repeat_interleave(
+            token_per_req
+        )
+        offsets = torch.arange(token_per_req, device=batch.device, dtype=locs.dtype)
+        expanded_locs = (locs.unsqueeze(1) + offsets).reshape(-1)
+        batch.req_to_token_pool.write(
+            (expanded_req_pool_indices, expanded_locs),
+            out_cache_loc.to(torch.int32),
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     return out_cache_loc
 

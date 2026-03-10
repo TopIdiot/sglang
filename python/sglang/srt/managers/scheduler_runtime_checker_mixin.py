@@ -171,6 +171,7 @@ class SchedulerRuntimeCheckerMixin:
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
+        scale = self.tree_cache.scale_seq_factor
         ret = 0
         for req in batch.reqs:
             assert req.kv_committed_freed == req.kv_overallocated_freed
@@ -180,7 +181,7 @@ class SchedulerRuntimeCheckerMixin:
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
-                uncached_len = allocated_len - req.cache_protected_len
+                uncached_len = allocated_len * scale - req.cache_protected_len
 
             ret += uncached_len
 

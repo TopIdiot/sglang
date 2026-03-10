@@ -153,45 +153,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
         if getattr(batch, "n_gram_input_ids", None) is not None:
-            gram2 = torch.empty_like(self.draft_token)
-            gram3 = torch.empty_like(self.draft_token)
-            gram4 = torch.empty_like(self.draft_token)
-            build_ngram_with_target_verify(
-                gram2,
-                batch.n_gram_input_ids.input_ids_buffer,
-                self.draft_token,
-                self.custom_mask,
-                self.positions,
-                batch.seq_lens,
-                2,
-                self.draft_token_num,
-                batch.n_gram_input_ids.buffer_size,
-            )
-            build_ngram_with_target_verify(
-                gram3,
-                batch.n_gram_input_ids.input_ids_buffer,
-                self.draft_token,
-                self.custom_mask,
-                self.positions,
-                batch.seq_lens,
-                3,
-                self.draft_token_num,
-                batch.n_gram_input_ids.buffer_size,
-            )
-            build_ngram_with_target_verify(
-                gram4,
-                batch.n_gram_input_ids.input_ids_buffer,
-                self.draft_token,
-                self.custom_mask,
-                self.positions,
-                batch.seq_lens,
-                4,
-                self.draft_token_num,
-                batch.n_gram_input_ids.buffer_size,
-            )
-            batch.n_gram_input_ids.input_ids_gram2 = gram2
-            batch.n_gram_input_ids.input_ids_gram3 = gram3
-            batch.n_gram_input_ids.input_ids_gram4 = gram4
+            n_gram_tensors = [
+                torch.empty_like(self.draft_token)
+                for _ in batch.n_gram_input_ids.input_ids_grams
+            ]
+            for idx, gram_tensor in enumerate(n_gram_tensors):
+                n = idx + 2
+                build_ngram_with_target_verify(
+                    gram_tensor,
+                    batch.n_gram_input_ids.input_ids_buffer,
+                    self.draft_token,
+                    self.custom_mask,
+                    self.positions,
+                    batch.seq_lens,
+                    n,
+                    self.draft_token_num,
+                    batch.n_gram_input_ids.buffer_size,
+                )
+                batch.n_gram_input_ids.set_gram(n, gram_tensor)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
@@ -721,24 +700,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
         if hasattr(batch, "n_gram_input_ids") and batch.n_gram_input_ids is not None:
-            assign_ngram_input_ids_draft_extend(
-                batch.input_ids,
-                batch.n_gram_input_ids.input_ids_gram2,
-                batch.extend_lens,
-                2,
-            )
-            assign_ngram_input_ids_draft_extend(
-                batch.input_ids,
-                batch.n_gram_input_ids.input_ids_gram3,
-                batch.extend_lens,
-                3,
-            )
-            assign_ngram_input_ids_draft_extend(
-                batch.input_ids,
-                batch.n_gram_input_ids.input_ids_gram4,
-                batch.extend_lens,
-                4,
-            )
+            for idx, gram_tensor in enumerate(batch.n_gram_input_ids.input_ids_grams):
+                n = idx + 2
+                assign_ngram_input_ids_draft_extend(
+                    batch.input_ids,
+                    gram_tensor,
+                    batch.extend_lens,
+                    n,
+                )
             buffer = torch.empty(
                 batch.batch_size() * batch.n_gram_input_ids.buffer_size,
                 device=batch.input_ids.device,
@@ -808,22 +777,23 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.n_gram_input_ids is not None:
             buffer = batch.n_gram_input_ids.input_ids_buffer
             buffer_size = batch.n_gram_input_ids.buffer_size
-            n_gram2 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-            n_gram3 = torch.empty_like(batch.input_ids, dtype=torch.int64)
-            n_gram4 = torch.empty_like(batch.input_ids, dtype=torch.int64)
             accept_length = self.accept_length.to(torch.int32)
-            assign_ngram_input_ids_draft_extend_after_decode(
-                batch.input_ids, buffer, n_gram2, accept_length, 2, buffer_size, False
-            )
-            assign_ngram_input_ids_draft_extend_after_decode(
-                batch.input_ids, buffer, n_gram3, accept_length, 3, buffer_size, False
-            )
-            assign_ngram_input_ids_draft_extend_after_decode(
-                batch.input_ids, buffer, n_gram4, accept_length, 4, buffer_size, True
-            )
-            batch.n_gram_input_ids.input_ids_gram2 = n_gram2
-            batch.n_gram_input_ids.input_ids_gram3 = n_gram3
-            batch.n_gram_input_ids.input_ids_gram4 = n_gram4
+            num_grams = len(batch.n_gram_input_ids.input_ids_grams)
+            for idx in range(num_grams):
+                n = idx + 2
+                n_gram = torch.empty_like(batch.input_ids, dtype=torch.int64)
+                # Update the rolling buffer once, at the last n-gram assignment.
+                update_buffer = idx == num_grams - 1
+                assign_ngram_input_ids_draft_extend_after_decode(
+                    batch.input_ids,
+                    buffer,
+                    n_gram,
+                    accept_length,
+                    n,
+                    buffer_size,
+                    update_buffer,
+                )
+                batch.n_gram_input_ids.set_gram(n, n_gram)
 
     def generate_attn_arg_prefill(
         self,

@@ -386,6 +386,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+        self.scale_seq_factor = (
+            getattr(model_runner.model_config.hf_config, "scale_seq_times", 0) + 1
+        )
+        self.scale_seq_metadata = {}
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
@@ -495,7 +499,10 @@ class FlashAttentionBackend(AttentionBackend):
                 ]
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
-        elif forward_batch.forward_mode.is_target_verify():
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is not None
+        ):
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
@@ -624,6 +631,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
+        ) or (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is None
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -638,9 +648,14 @@ class FlashAttentionBackend(AttentionBackend):
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
 
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            if (
+                (
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and any(forward_batch.extend_prefix_lens_cpu)
+                )
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
+            ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -1622,6 +1637,33 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                 }
 
+        if self.scale_seq_factor > 1:
+            scale = self.scale_seq_factor
+            self.scale_seq_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * scale + 1,
+                    step=scale,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
+
         # Only allocate encoder metadata for encoder-decoder models
         if self.is_encoder_decoder:
             self.encoder_metadata = {
@@ -1751,7 +1793,43 @@ class FlashAttentionBackend(AttentionBackend):
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if spec_info is None and self.scale_seq_factor > 1:
+                # scale_seq decode: seq_lens already includes the scale increment
+                scale = self.scale_seq_factor
+                metadata.cache_seqlens_int32 = self.scale_seq_metadata["cache_seqlens"][
+                    :bs
+                ]
+                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+                metadata.max_seq_len_q = scale
+                metadata.max_seq_len_k = seq_lens.max().item()
+
+                metadata.cu_seqlens_q = self.scale_seq_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.scale_seq_metadata["cu_seqlens_k"][
+                    : (bs + 1)
+                ]
+
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                metadata.page_table = self.scale_seq_metadata["page_table"][:bs, :]
+                normal_decode_set_metadata(
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_k,
+                    metadata.page_table,
+                    self.req_to_token,
+                    req_pool_indices,
+                    self.scale_seq_metadata["strided_indices"],
+                    max_seq_pages,
+                    seq_lens,
+                    0,
+                    self.page_size,
+                )
+
+                self.scale_seq_metadata[bs] = metadata
+            elif self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -2001,7 +2079,28 @@ class FlashAttentionBackend(AttentionBackend):
                     bs,
                 )
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if spec_info is None and self.scale_seq_factor > 1:
+                # scale_seq decode replay
+                metadata = self.scale_seq_metadata[bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+                max_len = seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = max_len
+                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+                normal_decode_set_metadata(
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_k,
+                    metadata.page_table,
+                    self.req_to_token,
+                    req_pool_indices,
+                    self.scale_seq_metadata["strided_indices"],
+                    max_seq_pages,
+                    seq_lens,
+                    0,
+                    self.page_size,
+                )
+            elif self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
                 metadata.cache_seqlens_int32.copy_(
                     (seq_lens + self.speculative_num_draft_tokens)

@@ -557,18 +557,14 @@ class EAGLEWorker(TpModelWorker):
             forward_batch
         )
         if forward_batch.n_gram_input_ids is not None:
-            n_gram2 = torch.empty(
-                (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
-            )
-            n_gram3 = torch.empty(
-                (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
-            )
-            n_gram4 = torch.empty(
-                (spec_info.topk_index.numel()), dtype=torch.int64, device=self.device
-            )
-            forward_batch.n_gram_input_ids.input_ids_gram2 = n_gram2
-            forward_batch.n_gram_input_ids.input_ids_gram3 = n_gram3
-            forward_batch.n_gram_input_ids.input_ids_gram4 = n_gram4
+            for idx in range(len(forward_batch.n_gram_input_ids.input_ids_grams)):
+                n = idx + 2
+                n_gram = torch.empty(
+                    (spec_info.topk_index.numel()),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                forward_batch.n_gram_input_ids.set_gram(n, n_gram)
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch

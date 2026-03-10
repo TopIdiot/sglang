@@ -533,67 +533,34 @@ def select_top_k_tokens_ngram(
         return
 
     seq_lens = forward_batch.seq_lens
+    n_gram_tensors = n_gram_input_ids.input_ids_grams
     if i == 0:
-        assign_ngram_input_ids_draft_decode_first_token(
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.input_ids_gram2,
-            seq_lens,
-            2,
-            topk,
-            n_gram_input_ids.buffer_size,
-        )
-        assign_ngram_input_ids_draft_decode_first_token(
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.input_ids_gram3,
-            seq_lens,
-            3,
-            topk,
-            n_gram_input_ids.buffer_size,
-        )
-        assign_ngram_input_ids_draft_decode_first_token(
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.input_ids_gram4,
-            seq_lens,
-            4,
-            topk,
-            n_gram_input_ids.buffer_size,
-        )
+        for idx, gram_tensor in enumerate(n_gram_tensors):
+            n = idx + 2
+            assign_ngram_input_ids_draft_decode_first_token(
+                n_gram_input_ids.input_ids_buffer,
+                gram_tensor,
+                seq_lens,
+                n,
+                topk,
+                n_gram_input_ids.buffer_size,
+            )
     else:
         parent_tensor = torch.cat(parents_list, dim=1)
         token_tensor = torch.cat(token_list, dim=1)
-        build_ngram_with_tree(
-            n_gram_input_ids.input_ids_gram2,
-            parent_tensor,
-            token_tensor,
-            parents_list[-1],
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.buffer_size,
-            2,
-            topk,
-            i,
-        )
-        build_ngram_with_tree(
-            n_gram_input_ids.input_ids_gram3,
-            parent_tensor,
-            token_tensor,
-            parents_list[-1],
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.buffer_size,
-            3,
-            topk,
-            i,
-        )
-        build_ngram_with_tree(
-            n_gram_input_ids.input_ids_gram4,
-            parent_tensor,
-            token_tensor,
-            parents_list[-1],
-            n_gram_input_ids.input_ids_buffer,
-            n_gram_input_ids.buffer_size,
-            4,
-            topk,
-            i,
-        )
+        for idx, gram_tensor in enumerate(n_gram_tensors):
+            n = idx + 2
+            build_ngram_with_tree(
+                gram_tensor,
+                parent_tensor,
+                token_tensor,
+                parents_list[-1],
+                n_gram_input_ids.input_ids_buffer,
+                n_gram_input_ids.buffer_size,
+                n,
+                topk,
+                i,
+            )
 
 
 def generate_simulated_accept_index(

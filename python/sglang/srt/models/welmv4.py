@@ -16,9 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
-import gc
 import logging
-import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -87,11 +85,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
-def log(*args):
-    if torch.cuda.current_device() == 0:
-        print(*args)
-
-
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
     ids = input_ids.to(torch.int64)
     result = ids * 2654435761
@@ -119,86 +112,6 @@ class KVMirrorManager:
         if clear:
             KVMirrorManager.activations_dict_kv.clear()
         return kv_activation
-
-
-def remove_all_references(obj: Any, verbose: bool = False) -> int:
-    removed_count = 0
-    referrers = gc.get_referrers(obj)
-
-    if verbose:
-        print(f"找到 {len(referrers)} 个引用者")
-
-    for ref in referrers:
-        try:
-            # 跳过 gc.get_referrers 返回的列表本身
-            if ref is referrers:
-                continue
-
-            # 1. 如果是字典，查找并删除键值对
-            if isinstance(ref, dict):
-                keys_to_delete = []
-                for key, value in ref.items():
-                    if value is obj:
-                        keys_to_delete.append(key)
-
-                for key in keys_to_delete:
-                    try:
-                        del ref[key]
-                        removed_count += 1
-                        if verbose:
-                            print(f"  从字典中删除键: {key}")
-                    except (TypeError, KeyError):
-                        pass  # 可能是只读字典
-
-            # 2. 如果是列表，尝试替换或删除元素
-            elif isinstance(ref, list):
-                try:
-                    indices = [i for i, item in enumerate(ref) if item is obj]
-                    # 从后往前删除，避免索引变化
-                    for i in reversed(indices):
-                        ref.pop(i)
-                        removed_count += 1
-                        if verbose:
-                            print(f"  从列表中删除索引: {i}")
-                except (TypeError, AttributeError):
-                    pass  # 可能是只读列表
-
-            # 3. 如果是对象，尝试删除属性
-            elif hasattr(ref, "__dict__"):
-                attrs_to_delete = []
-                for attr_name, attr_value in ref.__dict__.items():
-                    if attr_value is obj:
-                        attrs_to_delete.append(attr_name)
-
-                for attr_name in attrs_to_delete:
-                    try:
-                        delattr(ref, attr_name)
-                        removed_count += 1
-                        if verbose:
-                            print(
-                                f"  从对象 {type(ref).__name__} 中删除属性: {attr_name}"
-                            )
-                    except (AttributeError, TypeError):
-                        pass
-
-            # 4. 如果是元组或不可变类型，无法删除
-            elif isinstance(ref, (tuple, frozenset)):
-                if verbose:
-                    print(f"  跳过不可变类型: {type(ref).__name__}")
-
-        except Exception as e:
-            if verbose:
-                print(f"  处理引用时出错: {type(ref).__name__} - {e}")
-            continue
-
-    # 强制垃圾回收
-    gc.collect()
-
-    if verbose:
-        remaining_refs = sys.getrefcount(obj) - 1
-        print(f"删除后剩余引用数: {remaining_refs}")
-
-    return removed_count
 
 
 class LayerManager:
@@ -260,13 +173,6 @@ class LayerManager:
                 imitated_layer_attn.qkv_proj_bias = None
                 mirror_layer_attn.qkv_proj_bias = None
 
-            # if mirror_layer_id not in LayerManager.num_nextn_predict_layer_idx:
-            #     remove_all_references(mirror_layer_attn.qkv_proj)
-            #     remove_all_references(mirror_qkv_proj_weight)
-            #     remove_all_references(mirror_qkv_proj_bias)
-            #     remove_all_references(imitated_layer_attn.qkv_proj)
-            #     remove_all_references(imitated_qkv_proj_weight)
-            #     remove_all_references(imitated_qkv_proj_bias)
         torch.cuda.empty_cache()
 
 
@@ -770,34 +676,14 @@ class WeLMV4MoeAttention(nn.Module):
         self.kv_mirror_layers = kv_mirror_layers
         self.kv_mirror_imitated_layers = kv_mirror_imitated_layers
         self.layer_idx = layer_idx
-        print(
-            "self.layer_idx:{}".format(layer_idx),
-            "self.kv_mirror_layers:",
-            self.kv_mirror_layers,
-            "self.kv_mirror_imitated_layers:",
-            self.kv_mirror_imitated_layers,
-            flush=True,
-        )
         if len(sliding_window_size_layerwise) > layer_idx:
             self.sliding_window_size = sliding_window_size_layerwise[layer_idx]
         else:
             self.sliding_window_size = -1
-        print(
-            "self.layer_idx:{}".format(layer_idx),
-            "self.sliding_window_size:",
-            self.sliding_window_size,
-            flush=True,
-        )
         if len(enable_attn_sink_layerwise) > layer_idx:
             self.enable_attention_sink = enable_attn_sink_layerwise[layer_idx]
         else:
             self.enable_attention_sink = False
-        print(
-            "self.layer_idx:{}".format(layer_idx),
-            "self.enable_attention_sink:",
-            self.enable_attention_sink,
-            flush=True,
-        )
         if self.enable_attention_sink == True:
             self.attn_sink = nn.Parameter(
                 torch.empty(self.num_heads), requires_grad=False
@@ -965,21 +851,6 @@ class WeLMV4MoeAttention(nn.Module):
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
-                # optim: mirror rope embedding optim @kavioyu
-                # q_pe_proxy = torch.empty(
-                #     (k_pe.shape[0],) + q_pe.shape[1:],
-                #     dtype=q_pe.dtype,
-                #     device=q_pe.device,
-                # )
-                # k_pe_proxy = torch.empty(
-                #     (q_pe.shape[0],) + k_pe.shape[1:],
-                #     dtype=k_pe.dtype,
-                #     device=k_pe.device,
-                # )
-                # _, k_pe = self.rotary_emb(positions, q_pe_proxy, k_pe)
-                # q_pe, _ = self.rotary_emb(
-                #     positions[forward_batch.custom_last_index], q_pe, k_pe_proxy
-                # )
                 self.rotary_emb.forward_cuda(
                     positions, q, k, last_index=forward_batch.custom_last_index
                 )
@@ -996,7 +867,6 @@ class WeLMV4MoeAttention(nn.Module):
             gate = self.gate_proj(hidden_states)[0].unsqueeze(
                 -1
             )  # (bs * seq_len, num_heads, 1)
-            # fuse: implement a fused sigmoid mul, maybe could use torch.compile
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
@@ -1024,6 +894,9 @@ class WeLMV4MoeDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        scale_seq_times = getattr(config, "scale_seq_times", 0)
+        if scale_seq_times > 0:
+            max_position_embeddings = max_position_embeddings * (scale_seq_times + 1)
         if getattr(config, "qkv_bias", None) is not None:
             qkv_bias = getattr(config, "qkv_bias")
         elif getattr(config, "qkv_proj_bias", None) is not None:
@@ -1054,14 +927,6 @@ class WeLMV4MoeDecoderLayer(nn.Module):
         self.ppln = getattr(config, "ppln", False)
         o_norm = getattr(config, "o_norm", False)
         self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
-        print(
-            "self.ppln:",
-            self.ppln,
-            "o_norm:",
-            o_norm,
-            "self.prenorm_layer_idx:",
-            self.prenorm_layer_idx,
-        )
         total_layer_num = config.num_hidden_layers
 
         self.self_attn = WeLMV4MoeAttention(
@@ -1126,10 +991,6 @@ class WeLMV4MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.post_attention_layernorm = RMSNorm(
-        #     config.hidden_size, eps=config.rms_norm_eps
-        # )
         self.input_layernorm = WelmV4FusedRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1152,19 +1013,12 @@ class WeLMV4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # mtp 这里需要prenorm这里处理的对吗？需要确认一下@kavioyu
-        # fuse: input layer norm and copy residual
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
         hidden_states, residual = self.input_layernorm(
             hidden_states, residual, residual_after_layernorm=residual_after_layernorm
         )
-        # if residual is None:
-        #     residual = hidden_states
-        #     hidden_states = self.input_layernorm(hidden_states)
-        # else:
-        #     hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.ppln and self.layer_id not in self.prenorm_layer_idx:
             residual = hidden_states.clone().to(
@@ -1182,8 +1036,6 @@ class WeLMV4MoeDecoderLayer(nn.Module):
             and self.layer_id == self.kv_mirror_layers[-1]
         ):
             residual = residual[forward_batch.custom_last_index]
-        # fuse: implement a post_attention_layernorm with cast to float32 to avoid cast before moe router
-        # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states, residual, hidden_states_fp32 = self.post_attention_layernorm(
             hidden_states, residual, clone_fp32_out=True
         )
@@ -1215,6 +1067,7 @@ class WeLMV4MoeModel(nn.Module):
         self.oe_dim = config.oe_dim
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
+        self.scale_seq_times = getattr(config, "scale_seq_times", 0)
 
         if len(self.oe_vocab_sizes) > 0:
             self.oe_embed = nn.ModuleList(
@@ -1232,6 +1085,44 @@ class WeLMV4MoeModel(nn.Module):
                 bias=False,
                 quant_config=None,
             )
+
+        # Scale sequence length embeddings: N additional embedding groups
+        if self.scale_seq_times > 0:
+            self.scale_seq_embed_tokens_list = nn.ModuleList(
+                [
+                    VocabParallelEmbedding(
+                        config.vocab_size,
+                        config.hidden_size,
+                        use_attn_tp_group=is_dp_attention_enabled(),
+                    )
+                    for _ in range(self.scale_seq_times)
+                ]
+            )
+            if len(self.oe_vocab_sizes) > 0:
+                self.scale_seq_oe_embed_list = nn.ModuleList(
+                    [
+                        nn.ModuleList(
+                            [
+                                VocabParallelEmbedding(
+                                    self.oe_vocab_sizes[j], self.oe_dim
+                                )
+                                for j in range(len(self.oe_vocab_sizes))
+                            ]
+                        )
+                        for _ in range(self.scale_seq_times)
+                    ]
+                )
+                self.scale_seq_oe_up_proj_list = nn.ModuleList(
+                    [
+                        ReplicatedLinear(
+                            self.oe_dim * len(self.oe_vocab_sizes),
+                            config.hidden_size,
+                            bias=False,
+                            quant_config=None,
+                        )
+                        for _ in range(self.scale_seq_times)
+                    ]
+                )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1272,6 +1163,72 @@ class WeLMV4MoeModel(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def _compute_oe_embedding(
+        self,
+        input_ids,
+        forward_batch,
+        base_hidden_states,
+        oe_embed_modules=None,
+        oe_up_proj_module=None,
+    ):
+        """Compute over-encoding embedding and combine with base hidden states.
+        If oe_embed_modules/oe_up_proj_module are None, use the main OE modules."""
+        if oe_embed_modules is None:
+            oe_embed_modules = self.oe_embed
+        if oe_up_proj_module is None:
+            oe_up_proj_module = self.oe_gate_up_proj
+
+        input_ids_ngram = []
+        input_ids_ngram_tmp = input_ids
+        for g in range(1, max(self.oe_grams)):
+            gram_tensor = forward_batch.n_gram_input_ids.get_gram(g + 1)
+            if gram_tensor is not None:
+                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
+                    self.vocab_size**g
+                )
+            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+
+        emb_ngram = []
+        for i, vs in enumerate(self.oe_vocab_sizes):
+            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+            emb_ngram.append(emb_ngram_tmp)
+        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+        return (base_hidden_states + emb_new) / 2.0
+
+    def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
+        """Expand hidden_states from (T, D) to (T * scale, D) by interleaving
+        main embedding with scale_seq embeddings.
+
+        Layout per original token i:
+          [main_emb_i, scale_seq_1_emb_i, ..., scale_seq_N_emb_i]
+        """
+        scale = self.scale_seq_times + 1
+        T = hidden_states.shape[0]
+        D = hidden_states.shape[1]
+
+        # (T, D) -> (T, 1, D)
+        hidden_states = hidden_states.unsqueeze(1)
+        hidden_states_list = [hidden_states]
+
+        for s in range(self.scale_seq_times):
+            hs_s = self.scale_seq_embed_tokens_list[s](input_ids)  # (T, D)
+            if len(self.oe_grams) > 0:
+                hs_s = self._compute_oe_embedding(
+                    input_ids,
+                    forward_batch,
+                    hs_s,
+                    oe_embed_modules=self.scale_seq_oe_embed_list[s],
+                    oe_up_proj_module=self.scale_seq_oe_up_proj_list[s],
+                )
+            hs_s = hs_s.unsqueeze(1)  # (T, 1, D)
+            hidden_states_list.append(hs_s)
+
+        # (T, scale, D) -> (T * scale, D)
+        hidden_states = torch.cat(hidden_states_list, dim=1)
+        hidden_states = hidden_states.reshape(T * scale, D).contiguous()
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1287,35 +1244,14 @@ class WeLMV4MoeModel(nn.Module):
                 hidden_states = input_embeds
 
             if len(self.oe_grams) > 0:
-                input_ids_ngram = []
-                input_ids_ngram_tmp = input_ids
-                if getattr(forward_batch, "n_gram_input_ids", None) is not None:
-                    input_ids_gram_n = [
-                        forward_batch.n_gram_input_ids.input_ids_gram2,
-                        forward_batch.n_gram_input_ids.input_ids_gram3,
-                        forward_batch.n_gram_input_ids.input_ids_gram4,
-                    ]
-                else:
-                    zero_ids = torch.zeros_like(input_ids)
-                    input_ids_gram_n = [zero_ids, zero_ids, zero_ids]
-                for g in range(1, max(self.oe_grams)):
-                    input_ids_ngram_tmp = input_ids_ngram_tmp + input_ids_gram_n[
-                        g - 1
-                    ] * (self.vocab_size**g)
-                    input_ids_ngram.append(
-                        hash_input_ids_vectorized(input_ids_ngram_tmp)
-                    )
+                hidden_states = self._compute_oe_embedding(
+                    input_ids, forward_batch, hidden_states
+                )
 
-                emb_ngram = []
-                for i, vs in enumerate(self.oe_vocab_sizes):
-                    input_ids_ngram_hashed_tmp = (
-                        input_ids_ngram[self.oe_grams[i] - 2] % vs
-                    )
-                    emb_ngram_tmp = self.oe_embed[i](input_ids_ngram_hashed_tmp)
-                    emb_ngram.append(emb_ngram_tmp)
-                emb_new, _ = self.oe_gate_up_proj(torch.cat(emb_ngram, dim=-1))
-                hidden_states = (hidden_states + emb_new) / 2.0
-
+            if self.scale_seq_times > 0:
+                hidden_states = self._expand_scale_seq(
+                    input_ids, forward_batch, hidden_states
+                )
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -1417,6 +1353,34 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
+            if self.model.scale_seq_times > 0:
+                # Contract expanded hidden_states back to logical size for logits.
+                # Transformer layers have already processed all T*scale states and
+                # written KV cache.  For logits we only need the last state in each
+                # scale group (matches MMQ's [:, -1, :] semantic).
+                scale = self.model.scale_seq_times + 1
+                # Select every scale-th element (last of each group)
+                indices = torch.arange(
+                    scale - 1,
+                    hidden_states.shape[0],
+                    scale,
+                    device=hidden_states.device,
+                )
+                hidden_states = hidden_states[indices]
+                if forward_batch.extend_seq_lens is not None:
+                    # Restore forward_batch metadata to logical space so that
+                    # LogitsProcessor sees the un-expanded lengths.
+                    forward_batch.extend_seq_lens = (
+                        forward_batch.extend_seq_lens // scale
+                    )
+                    if forward_batch.extend_seq_lens_cpu is not None:
+                        forward_batch.extend_seq_lens_cpu = [
+                            x // scale for x in forward_batch.extend_seq_lens_cpu
+                        ]
+                    forward_batch.extend_num_tokens = (
+                        forward_batch.extend_num_tokens // scale
+                    )
+
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
@@ -1440,6 +1404,16 @@ class WeLMV4MoeForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
 
+            if len(self.model.oe_grams) > 0:
+                forward_batch.hidden_states = self.model._compute_oe_embedding(
+                    input_ids, forward_batch, forward_batch.hidden_states
+                )
+
+            if self.model.scale_seq_times > 0:
+                forward_batch.hidden_states = self.model._expand_scale_seq(
+                    input_ids, forward_batch, forward_batch.hidden_states
+                )
+
         # decoder layer
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1457,6 +1431,29 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 forward_batch.hidden_states, forward_batch.residual
             )
             forward_batch.hidden_states = hidden_states
+
+            if self.model.scale_seq_times > 0:
+                # Contract expanded hidden_states back to logical size
+                scale = self.model.scale_seq_times + 1
+                indices = torch.arange(
+                    scale - 1,
+                    hidden_states.shape[0],
+                    scale,
+                    device=hidden_states.device,
+                )
+                forward_batch.hidden_states = hidden_states[indices]
+                if forward_batch.extend_seq_lens is not None:
+                    forward_batch.extend_seq_lens = (
+                        forward_batch.extend_seq_lens // scale
+                    )
+                    if forward_batch.extend_seq_lens_cpu is not None:
+                        forward_batch.extend_seq_lens_cpu = [
+                            x // scale for x in forward_batch.extend_seq_lens_cpu
+                        ]
+                    forward_batch.extend_num_tokens = (
+                        forward_batch.extend_num_tokens // scale
+                    )
+
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -1570,6 +1567,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
+                if weight_name == "up_proj" and "scale_seq_oe_up_proj" in name:
+                    continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
                 # we need to skip here BEFORE we update the name, otherwise
@@ -1682,6 +1681,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None,
         )
+
+    @classmethod
+    def get_num_n_gram(cls, config) -> int:
+        """Return the number of n-grams needed for over encoding."""
+        oe_grams = getattr(config, "oe_grams", [])
+        return max(oe_grams) if oe_grams else 0
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:

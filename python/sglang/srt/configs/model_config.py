@@ -233,6 +233,14 @@ class ModelConfig:
             self.hf_config, "is_matryoshka", False
         )
 
+        # Get num_n_gram for over encoding
+        self.num_n_gram = self._get_num_n_gram()
+
+    def _get_num_n_gram(self) -> int:
+        """Get the number of n-grams for over encoding from hf_config."""
+        oe_grams = getattr(self.hf_config, "oe_grams", [])
+        return max(oe_grams) if oe_grams else 0
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,

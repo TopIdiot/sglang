@@ -16,11 +16,12 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import tqdm
@@ -77,9 +78,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
-    input_ids_gram2: Optional[torch.Tensor] = None
-    input_ids_gram3: Optional[torch.Tensor] = None
-    input_ids_gram4: Optional[torch.Tensor] = None
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
 
 
 @contextmanager
@@ -238,15 +237,14 @@ class PiecewiseCudaGraphRunner:
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            self.prepare_n_gram_inputs = model_runner.server_args.prepare_n_gram_inputs
-            if self.prepare_n_gram_inputs:
-                input_ids_gram2 = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                input_ids_gram3 = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                input_ids_gram4 = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            self.num_n_gram = getattr(model_runner.model_config, "num_n_gram", 0)
+            if self.num_n_gram > 0:
+                input_ids_grams = [
+                    torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                    for _ in range(self.num_n_gram - 1)
+                ]
             else:
-                input_ids_gram2 = None
-                input_ids_gram3 = None
-                input_ids_gram4 = None
+                input_ids_grams = []
 
             if (
                 self.is_multimodal
@@ -275,9 +273,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
-            input_ids_gram2=input_ids_gram2,
-            input_ids_gram3=input_ids_gram3,
-            input_ids_gram4=input_ids_gram4,
+            input_ids_grams=input_ids_grams,
         )
         self.buffers.share_buffers()
 
@@ -405,11 +401,10 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
             )
 
-        if self.prepare_n_gram_inputs:
+        if len(buffers.input_ids_grams) > 0:
             forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
-                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
-                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
+                input_ids_grams=[gram[:num_tokens] for gram in buffers.input_ids_grams],
+                buffer_size=len(buffers.input_ids_grams) + 1,
             )
 
         # Attention backend
@@ -520,8 +515,6 @@ class PiecewiseCudaGraphRunner:
         global_dp_buffer_len = None
 
         if self.model_runner.server_args.enable_lora:
-            # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
-            # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
             lora_ids = [None] * bs
         else:
             lora_ids = None
@@ -570,11 +563,10 @@ class PiecewiseCudaGraphRunner:
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
-        if self.prepare_n_gram_inputs:
+        if len(buffers.input_ids_grams) > 0:
             forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
-                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
-                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
+                input_ids_grams=[gram[:num_tokens] for gram in buffers.input_ids_grams],
+                buffer_size=len(buffers.input_ids_grams) + 1,
             )
 
         if lora_ids is not None:
@@ -640,10 +632,8 @@ class PiecewiseCudaGraphRunner:
                 buffers.input_embeds[:, num_tokens:static_num_tokens].zero_()
             if forward_batch.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
-            if self.prepare_n_gram_inputs:
-                buffers.input_ids_gram2[num_tokens:static_num_tokens].zero_()
-                buffers.input_ids_gram3[num_tokens:static_num_tokens].zero_()
-                buffers.input_ids_gram4[num_tokens:static_num_tokens].zero_()
+            for gram in buffers.input_ids_grams:
+                gram[num_tokens:static_num_tokens].zero_()
 
         bs = forward_batch.batch_size
 
@@ -651,22 +641,19 @@ class PiecewiseCudaGraphRunner:
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         if buffers.out_cache_loc_swa is not None:
-            buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
+            buffers.out_cache_loc_swa[:num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
 
-        if self.prepare_n_gram_inputs and forward_batch.n_gram_input_ids is not None:
-            buffers.input_ids_gram2[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram2
-            )
-            buffers.input_ids_gram3[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram3
-            )
-            buffers.input_ids_gram4[:num_tokens].copy_(
-                forward_batch.n_gram_input_ids.input_ids_gram4
-            )
+        if (
+            forward_batch.n_gram_input_ids is not None
+            and len(buffers.input_ids_grams) > 0
+        ):
+            for i, gram in enumerate(forward_batch.n_gram_input_ids.input_ids_grams):
+                if i < len(buffers.input_ids_grams):
+                    buffers.input_ids_grams[i][:num_tokens].copy_(gram)
 
         if (
             buffers.mamba_track_indices is not None
@@ -775,11 +762,12 @@ class PiecewiseCudaGraphRunner:
             dimensions=forward_batch.dimensions,
         )
 
-        if self.prepare_n_gram_inputs:
+        if len(buffers.input_ids_grams) > 0:
             static_forward_batch.n_gram_input_ids = NGramInputIds(
-                input_ids_gram2=buffers.input_ids_gram2[:static_num_tokens],
-                input_ids_gram3=buffers.input_ids_gram3[:static_num_tokens],
-                input_ids_gram4=buffers.input_ids_gram4[:static_num_tokens],
+                input_ids_grams=[
+                    gram[:static_num_tokens] for gram in buffers.input_ids_grams
+                ],
+                buffer_size=len(buffers.input_ids_grams) + 1,
             )
 
         return static_forward_batch

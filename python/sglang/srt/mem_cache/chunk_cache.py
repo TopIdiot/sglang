@@ -31,6 +31,9 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
+        # Each logical token maps to scale_seq_factor physical KV slots.
+        # Overridden by scheduler after init via tree_cache.scale_seq_factor = N.
+        self.scale_seq_factor = 1
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
@@ -63,7 +66,8 @@ class ChunkCache(BasePrefixCache):
         return InsertResult(prefix_len=0)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
+        scale = self.scale_seq_factor
+        kv_committed_len = req.pop_committed_kv_cache() * scale
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -71,8 +75,9 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        scale = self.scale_seq_factor
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : len(req.fill_ids) * scale
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
