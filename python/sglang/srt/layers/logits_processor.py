@@ -148,6 +148,9 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # For KV Mirror
+    enable_kv_mirror: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
@@ -200,6 +203,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            enable_kv_mirror=forward_batch.enable_kv_mirror,
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
@@ -411,6 +415,10 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or (
+                logits_metadata.enable_kv_mirror
+                and logits_metadata.forward_mode.is_extend_without_speculative()
+            )
         ):
             pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm

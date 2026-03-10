@@ -54,6 +54,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.managers.schedule_batch import NGramInputIds
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -113,6 +114,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
+    input_ids_gram2: Optional[torch.Tensor] = None
+    input_ids_gram3: Optional[torch.Tensor] = None
+    input_ids_gram4: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -133,6 +137,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        prepare_n_gram_inputs: bool,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -151,6 +156,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_num_token, vocab_size),
                 dtype=torch.float,
             )
+            if prepare_n_gram_inputs:
+                input_ids_gram2 = torch.zeros((max_num_token,), dtype=torch.int64)
+                input_ids_gram3 = torch.zeros((max_num_token,), dtype=torch.int64)
+                input_ids_gram4 = torch.zeros((max_num_token,), dtype=torch.int64)
+            else:
+                input_ids_gram2 = None
+                input_ids_gram3 = None
+                input_ids_gram4 = None
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -210,6 +223,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
+            input_ids_gram2=input_ids_gram2,
+            input_ids_gram3=input_ids_gram3,
+            input_ids_gram4=input_ids_gram4,
         )
 
     def populate_from_forward_batch(
@@ -240,6 +256,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        if (
+            forward_batch.n_gram_input_ids is not None
+            and self.input_ids_gram2 is not None
+        ):
+            self.input_ids_gram2[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram2
+            )
+            self.input_ids_gram3[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram3
+            )
+            self.input_ids_gram4[:raw_num_token].copy_(
+                forward_batch.n_gram_input_ids.input_ids_gram4
+            )
 
         if (
             self.mamba_track_indices is not None
@@ -549,6 +578,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            prepare_n_gram_inputs=self.model_runner.server_args.prepare_n_gram_inputs,
         )
         self.buffers.share_buffers()
 
@@ -877,6 +907,12 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if self.model_runner.server_args.prepare_n_gram_inputs:
+            forward_batch.n_gram_input_ids = NGramInputIds(
+                input_ids_gram2=buffers.input_ids_gram2[:num_tokens],
+                input_ids_gram3=buffers.input_ids_gram3[:num_tokens],
+                input_ids_gram4=buffers.input_ids_gram4[:num_tokens],
+            )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:

@@ -708,6 +708,11 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For Over Encoding
+    enable_over_encoding: bool = False
+    enable_kv_mirror: bool = False
+    prepare_n_gram_inputs: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -1266,6 +1271,9 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch in ["WeLMV4MoeForCausalLM"]:
+            self.prepare_n_gram_inputs = True
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -2599,6 +2607,7 @@ class ServerArgs:
                 "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
+                "WeLMV4MoeForCausalLM",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -5301,6 +5310,28 @@ class ServerArgs:
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
+        # For Over Encoding
+        parser.add_argument(
+            "--enable-over-encoding",
+            action="store_true",
+            default=ServerArgs.enable_over_encoding,
+            help="Enable over-encoding.",
+        )
+
+        parser.add_argument(
+            "--enable-kv-mirror",
+            action="store_true",
+            default=ServerArgs.enable_kv_mirror,
+            help="Enable KV mirror.",
+        )
+
+        parser.add_argument(
+            "--prepare-n-gram-inputs",
+            action="store_true",
+            default=ServerArgs.prepare_n_gram_inputs,
+            help="Prepare n-gram input tensors for models that require over-encoding.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -5310,8 +5341,17 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        kwargs = {}
+        for attr in dataclasses.fields(cls):
+            if hasattr(args, attr.name):
+                kwargs[attr.name] = getattr(args, attr.name)
+            elif attr.default is not dataclasses.MISSING:
+                kwargs[attr.name] = attr.default
+            elif attr.default_factory is not dataclasses.MISSING:
+                kwargs[attr.name] = attr.default_factory()
+            else:
+                raise AttributeError(f"Namespace object has no attribute '{attr.name}'")
+        return cls(**kwargs)
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -5994,6 +6034,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
+        "WeLMV4MoeForCausalLM",
     ]:
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:

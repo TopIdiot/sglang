@@ -6,6 +6,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.jit_kernel.ngram_ops import (
+    assign_ngram_input_ids_draft_extend_after_decode,
+    build_ngram_with_target_verify,
+)
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -40,6 +44,10 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_buffer,
+    assign_ngram_input_ids_draft_extend,
+)
 
 if is_cuda():
     from sgl_kernel import (
@@ -144,6 +152,46 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.out_cache_loc,
             bs,
         )
+        if getattr(batch, "n_gram_input_ids", None) is not None:
+            gram2 = torch.empty_like(self.draft_token)
+            gram3 = torch.empty_like(self.draft_token)
+            gram4 = torch.empty_like(self.draft_token)
+            build_ngram_with_target_verify(
+                gram2,
+                batch.n_gram_input_ids.input_ids_buffer,
+                self.draft_token,
+                self.custom_mask,
+                self.positions,
+                batch.seq_lens,
+                2,
+                self.draft_token_num,
+                batch.n_gram_input_ids.buffer_size,
+            )
+            build_ngram_with_target_verify(
+                gram3,
+                batch.n_gram_input_ids.input_ids_buffer,
+                self.draft_token,
+                self.custom_mask,
+                self.positions,
+                batch.seq_lens,
+                3,
+                self.draft_token_num,
+                batch.n_gram_input_ids.buffer_size,
+            )
+            build_ngram_with_target_verify(
+                gram4,
+                batch.n_gram_input_ids.input_ids_buffer,
+                self.draft_token,
+                self.custom_mask,
+                self.positions,
+                batch.seq_lens,
+                4,
+                self.draft_token_num,
+                batch.n_gram_input_ids.buffer_size,
+            )
+            batch.n_gram_input_ids.input_ids_gram2 = gram2
+            batch.n_gram_input_ids.input_ids_gram3 = gram3
+            batch.n_gram_input_ids.input_ids_gram4 = gram4
 
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
@@ -580,6 +628,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
                     )
+                if batch.n_gram_input_ids:
+                    batch.n_gram_input_ids.filter_buffer(unfinished_index_device)
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
@@ -670,6 +720,38 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             pt += extend_len
 
+        if hasattr(batch, "n_gram_input_ids") and batch.n_gram_input_ids is not None:
+            assign_ngram_input_ids_draft_extend(
+                batch.input_ids,
+                batch.n_gram_input_ids.input_ids_gram2,
+                batch.extend_lens,
+                2,
+            )
+            assign_ngram_input_ids_draft_extend(
+                batch.input_ids,
+                batch.n_gram_input_ids.input_ids_gram3,
+                batch.extend_lens,
+                3,
+            )
+            assign_ngram_input_ids_draft_extend(
+                batch.input_ids,
+                batch.n_gram_input_ids.input_ids_gram4,
+                batch.extend_lens,
+                4,
+            )
+            buffer = torch.empty(
+                batch.batch_size() * batch.n_gram_input_ids.buffer_size,
+                device=batch.input_ids.device,
+                dtype=batch.input_ids.dtype,
+            )
+            assign_ngram_buffer(
+                batch.input_ids,
+                buffer,
+                batch.seq_lens,
+                batch.n_gram_input_ids.buffer_size,
+            )
+            batch.n_gram_input_ids.input_ids_buffer = buffer
+
     @classmethod
     def create_idle_input(
         cls,
@@ -721,6 +803,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
+
+        batch.input_ids = batch.input_ids.to(torch.int64)
+        if batch.n_gram_input_ids is not None:
+            buffer = batch.n_gram_input_ids.input_ids_buffer
+            buffer_size = batch.n_gram_input_ids.buffer_size
+            n_gram2 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            n_gram3 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            n_gram4 = torch.empty_like(batch.input_ids, dtype=torch.int64)
+            accept_length = self.accept_length.to(torch.int32)
+            assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram2, accept_length, 2, buffer_size, False
+            )
+            assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram3, accept_length, 3, buffer_size, False
+            )
+            assign_ngram_input_ids_draft_extend_after_decode(
+                batch.input_ids, buffer, n_gram4, accept_length, 4, buffer_size, True
+            )
+            batch.n_gram_input_ids.input_ids_gram2 = n_gram2
+            batch.n_gram_input_ids.input_ids_gram3 = n_gram3
+            batch.n_gram_input_ids.input_ids_gram4 = n_gram4
 
     def generate_attn_arg_prefill(
         self,

@@ -88,6 +88,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.over_encoding_utils import filter_buffer
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -480,6 +481,42 @@ class MultimodalInputs:
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
+
+
+@dataclasses.dataclass
+class NGramInputIds:
+    input_ids_gram2: Optional[torch.Tensor] = None
+    input_ids_gram3: Optional[torch.Tensor] = None
+    input_ids_gram4: Optional[torch.Tensor] = None
+    input_ids_buffer: Optional[torch.Tensor] = None
+    buffer_size: int = 4
+    filtered: bool = False
+
+    @staticmethod
+    def get_token_ids_gram_n(req_input_ids: List[int], n: int):
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        result_id[n:] = req_input_ids[:-n]
+        return result_id
+
+    def get_token_ids_buffer(self, req_input_ids: List[int]):
+        seq_len = len(req_input_ids)
+        result_id = [0] * self.buffer_size
+        start_idx = min(seq_len, self.buffer_size)
+        result_id[-start_idx:] = req_input_ids[-start_idx:]
+        return result_id
+
+    def filter_buffer(self, unfinished_index_device: torch.Tensor):
+        if self.input_ids_buffer is not None and not self.filtered:
+            self.input_ids_buffer = filter_buffer(
+                self.input_ids_buffer, unfinished_index_device, self.buffer_size
+            )
+            self.filtered = True
+
+    def start_new_step(self):
+        self.filtered = False
 
 
 class Req(ReqDllmMixin):
@@ -1291,6 +1328,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # For Over Encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None
+
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
@@ -1453,6 +1493,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         ).to(self.device, non_blocking=True)
+
+        if get_global_server_args().prepare_n_gram_inputs:
+            input_ids_gram2 = []
+            input_ids_gram3 = []
+            input_ids_gram4 = []
+            for r in reqs:
+                prefix_len = len(r.prefix_indices)
+                input_ids_gram2.append(
+                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 1)[prefix_len:]
+                )
+                input_ids_gram3.append(
+                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 2)[prefix_len:]
+                )
+                input_ids_gram4.append(
+                    NGramInputIds.get_token_ids_gram_n(r.fill_ids, 3)[prefix_len:]
+                )
+
+            self.n_gram_input_ids = NGramInputIds(
+                input_ids_gram2=torch.tensor(
+                    sum(input_ids_gram2, []), dtype=torch.int64, pin_memory=_pin
+                ).to(self.device, non_blocking=True),
+                input_ids_gram3=torch.tensor(
+                    sum(input_ids_gram3, []), dtype=torch.int64, pin_memory=_pin
+                ).to(self.device, non_blocking=True),
+                input_ids_gram4=torch.tensor(
+                    sum(input_ids_gram4, []), dtype=torch.int64, pin_memory=_pin
+                ).to(self.device, non_blocking=True),
+            )
+        else:
+            self.n_gram_input_ids = None
+
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1963,6 +2034,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = self.output_ids
         self.output_ids = None
 
+        if get_global_server_args().prepare_n_gram_inputs:
+            input_ids_gram2 = []
+            input_ids_gram3 = []
+            input_ids_gram4 = []
+            for r in self.reqs:
+                ids = r.origin_input_ids + r.output_ids
+                input_ids_gram2.append(ids[-2] if len(ids) > 1 else 0)
+                input_ids_gram3.append(ids[-3] if len(ids) > 2 else 0)
+                input_ids_gram4.append(ids[-4] if len(ids) > 3 else 0)
+
+            self.n_gram_input_ids = NGramInputIds(
+                input_ids_gram2=torch.tensor(input_ids_gram2, dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                ),
+                input_ids_gram3=torch.tensor(input_ids_gram3, dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                ),
+                input_ids_gram4=torch.tensor(input_ids_gram4, dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                ),
+            )
+
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
@@ -2102,6 +2195,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+        if self.n_gram_input_ids:
+            self.n_gram_input_ids.filter_buffer(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
@@ -2155,6 +2250,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+
+        if (
+            self.n_gram_input_ids
+            and other.n_gram_input_ids
+            and self.n_gram_input_ids.input_ids_buffer is not None
+            and other.n_gram_input_ids.input_ids_buffer is not None
+        ):
+            self.n_gram_input_ids.input_ids_buffer = torch.cat(
+                [
+                    self.n_gram_input_ids.input_ids_buffer,
+                    other.n_gram_input_ids.input_ids_buffer,
+                ]
+            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
@@ -2225,6 +2333,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            n_gram_input_ids=self.n_gram_input_ids,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
@@ -2254,6 +2363,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            n_gram_input_ids=self.n_gram_input_ids,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
@@ -2403,6 +2513,9 @@ class ModelWorkerBatch:
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # For Over Encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False

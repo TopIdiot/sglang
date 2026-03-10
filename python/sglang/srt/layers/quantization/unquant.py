@@ -77,14 +77,26 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
+        if extra_weight_attrs.get("host_tensor", False):
+            from sglang.jit_kernel.memory_allocator import custom_empty
+
+            weight = Parameter(
+                custom_empty(
+                    (sum(output_partition_sizes), input_size_per_partition),
+                    dtype=params_dtype,
+                    device_id=torch.cuda.current_device(),
+                ),
+                requires_grad=False,
+            )
+        else:
+            weight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
