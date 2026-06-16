@@ -228,6 +228,30 @@ class LayerManager:
             mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
             imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
             imitated_qkv_proj_bias = getattr(imitated_layer_attn.qkv_proj, "bias", None)
+
+
+            _quantized_dtypes = (torch.int8, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            if mirror_qkv_proj_weight.dtype in _quantized_dtypes:
+                mirror_weight_scale = getattr(mirror_layer_attn.qkv_proj, "weight_scale", None)
+                if mirror_weight_scale is not None:
+
+                    if mirror_qkv_proj_weight.shape[0] == mirror_weight_scale.shape[0]:
+                        # Not transposed yet: (output_size, input_size) * (output_size, 1)
+                        mirror_qkv_proj_weight = mirror_qkv_proj_weight.to(torch.bfloat16) * mirror_weight_scale.to(torch.bfloat16)
+                    else:
+                        # Already transposed: (input_size, output_size), need .t() then scale
+                        mirror_qkv_proj_weight = mirror_qkv_proj_weight.t().to(torch.bfloat16) * mirror_weight_scale.to(torch.bfloat16)
+                else:
+                    mirror_qkv_proj_weight = mirror_qkv_proj_weight.to(torch.bfloat16)
+            if imitated_qkv_proj_weight.dtype in _quantized_dtypes:
+                imitated_weight_scale = getattr(imitated_layer_attn.qkv_proj, "weight_scale", None)
+                if imitated_weight_scale is not None:
+                    if imitated_qkv_proj_weight.shape[0] == imitated_weight_scale.shape[0]:
+                        imitated_qkv_proj_weight = imitated_qkv_proj_weight.to(torch.bfloat16) * imitated_weight_scale.to(torch.bfloat16)
+                    else:
+                        imitated_qkv_proj_weight = imitated_qkv_proj_weight.t().to(torch.bfloat16) * imitated_weight_scale.to(torch.bfloat16)
+                else:
+                    imitated_qkv_proj_weight = imitated_qkv_proj_weight.to(torch.bfloat16)
             assert (mirror_qkv_proj_bias is not None) == (
                 imitated_qkv_proj_bias is not None
             )
@@ -1035,6 +1059,7 @@ class Qwen2MoeAttention(nn.Module):
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if hasattr(self, "qkv_proj_weight"):
+                # TODO quant_method refactor 
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
                 q, k, v, mirror_k, mirror_v = qkv.split(
                     [
@@ -1075,6 +1100,7 @@ class Qwen2MoeAttention(nn.Module):
                 k, v = KVMirrorManager.get_kv_activation(
                     mirror_layer_number, clear=self.need_clear_kv_cache
                 )
+                # TODO quant_method refactor 
                 q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         else:
             qkv, _ = self.qkv_proj(hidden_states)

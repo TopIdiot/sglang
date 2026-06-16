@@ -60,6 +60,7 @@ class GPTQMarlinState(Enum):
 __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
+    "CompressedTensorsW8A8Int8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
 ]
 
@@ -87,6 +88,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+        elif (quant_config._is_dynamic_token_w8a8(weight_quant, input_quant)
+              or quant_config._is_static_tensor_w8a8(weight_quant, input_quant)):
+            logger.info_once("Using CompressedTensorsW8A8Int8MoEMethod")
+            return CompressedTensorsW8A8Int8MoEMethod(quant_config)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -357,6 +362,178 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
             return self.runner.run(dispatch_output, quant_info)
 
+
+
+class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
+    """MoE method for W8A8 INT8 quantization (channel weight + dynamic token activation)."""
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        self.quant_config = quant_config
+        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
+        self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
+            "input_activations"
+        )
+        self.static_input_scales = not self.input_quant.dynamic
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # INT8 weights
+        params_dtype = torch.int8
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            weight_quant_method = FusedMoeWeightScaleSupported.TENSOR.value
+        elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+                requires_grad=False,
+            )
+            weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        else:
+            raise ValueError(
+                f"Unsupported weight quantization strategy: {self.weight_quant.strategy}"
+            )
+
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        extra_weight_attrs.update({"quant_method": weight_quant_method})
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # INPUT_SCALES
+        if self.static_input_scales:
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        # For static input scales, take the max across experts
+        if self.static_input_scales:
+            if layer.w13_input_scale is None or layer.w2_input_scale is None:
+                raise ValueError(
+                    "QuantConfig has static quantization, but found "
+                    "activation scales are None."
+                )
+            if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
+                layer.w2_input_scale
+            ):
+                logger.warning(
+                    "Found input_scales that are not equal for "
+                    "int8 MoE layer. Using the maximum across experts "
+                    "for each layer."
+                )
+            layer.w13_input_scale = torch.nn.Parameter(
+                layer.w13_input_scale.max(), requires_grad=False
+            )
+            layer.w2_input_scale = torch.nn.Parameter(
+                layer.w2_input_scale.max(), requires_grad=False
+            )
+
+        # For per-tensor weight quantization, merge w1/w3 scales
+        if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+            assert layer.w13_weight_scale is not None
+            shard_size = layer.intermediate_size_per_partition
+            max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+            for expert_id in range(layer.num_local_experts):
+                start = 0
+                for shard_id in range(2):
+                    # dequantize and requantize with unified scale
+                    dq_weight = layer.w13_weight[expert_id][start : start + shard_size, :].to(torch.float32) * layer.w13_weight_scale[expert_id][shard_id]
+                    layer.w13_weight[expert_id][start : start + shard_size, :] = (dq_weight / max_w13_scales[expert_id]).clamp(-128, 127).to(torch.int8)
+                    start += shard_size
+
+            layer.w13_weight_scale = torch.nn.Parameter(
+                max_w13_scales, requires_grad=False
+            )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_int8_w8a8=True,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
