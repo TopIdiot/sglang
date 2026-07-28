@@ -1,4 +1,4 @@
 interface:
-  display_name: "SGLang New Eval Accuracy"
-  short_description: "Run 80b_v4d5 new_eval accuracy regression for all or selected datasets."
-  default_prompt: "SGLang 推理服务运行在 http://127.0.0.1:8000，使用 new_eval 跑 80b_v4d5 精度回测，并发设置为 24，数据集用 gpqa-diamond。"
+  display_name: "SGLang New Eval Accuracy & Speed"
+  short_description: "Run 80b_v4d5 new_eval accuracy regression with rollout throughput and latency."
+  default_prompt: "SGLang 推理服务运行在 http://127.0.0.1:8000，使用 new_eval 跑 80b_v4d5 精度和速度回测，并发设置为 24，数据集用 gpqa-diamond。"

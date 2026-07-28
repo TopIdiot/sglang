@@ -86,7 +86,9 @@ if [[ ! -f "${JUDGE_CONFIG}" ]]; then
   exit 2
 fi
 
-NEW_EVAL_URL="https://mirrors.tencent.com/repository/generic/welm/new_eval/bin/20260702/new_eval-linux-amd64-36dedda2"
+NEW_EVAL_URL="https://mirrors.tencent.com/repository/generic/welm/new_eval/bin/20260728/new_eval-linux-amd64-efa9b634"
+NEW_EVAL_SHA256="efa9b634a81a379e1cef8760d4c72b032a1ee3fd1e6d02834d3b18b146f43b95"
+NEW_EVAL_GIT_COMMIT="39cdc0e76de51f79d70a63a6bbb4c7f9fb427c93"
 
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_pid$$"
 RUN_DIR="${RUN_ROOT%/}/${RUN_ID}"
@@ -112,6 +114,7 @@ fi
 MODEL_ID="${MODEL_ID:-welmv4}"
 
 export RUN_DIR API_BASE MODEL_ID CONCURRENCY SELECTED_TASKS_RAW JUDGE_CONFIG
+export NEW_EVAL_URL NEW_EVAL_SHA256 NEW_EVAL_GIT_COMMIT
 python3 - <<'PY'
 import json
 import os
@@ -228,8 +231,11 @@ if [[ "${PREPARE_ONLY}" -eq 1 ]]; then
 fi
 
 curl -L --fail --retry 3 --noproxy '*' -o "${BIN}" "${NEW_EVAL_URL}"
+printf '%s  %s\n' "${NEW_EVAL_SHA256}" "${BIN}" | sha256sum --check
 chmod +x "${BIN}"
 sha256sum "${BIN}" | tee "${BIN_DIR}/new_eval.sha256"
+printf '%s\n' "${NEW_EVAL_URL}" > "${BIN_DIR}/new_eval.url.txt"
+printf '%s\n' "${NEW_EVAL_GIT_COMMIT}" > "${BIN_DIR}/new_eval.git-commit.txt"
 "${BIN}" --help > "${BIN_DIR}/new_eval.help.txt"
 
 RUN_ARGS=(run --config "${RUN_DIR}/config.yaml")
@@ -262,6 +268,7 @@ for item in json.loads((RUN_DIR / "selected_tasks.json").read_text()):
 PY
 
 export RUN_DIR API_BASE MODEL_ID CONCURRENCY BASELINE_SOURCE_DIR
+export NEW_EVAL_URL NEW_EVAL_SHA256 NEW_EVAL_GIT_COMMIT
 python3 - <<'PY'
 import csv
 import json
@@ -295,6 +302,24 @@ def as_float(value, default=0.0):
     except Exception:
         return default
 
+def as_optional_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+def as_optional_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def format_speed_float(value):
+    return "N/A" if value is None else f"{value:.2f}"
+
+def format_speed_int(value):
+    return "N/A" if value is None else str(value)
+
 def count_correct_from_output(job, task, sample_count, score):
     output_path = RUN_DIR / "outputs" / job / "output" / task / f"{task}_output.json"
     if not output_path.exists():
@@ -326,6 +351,7 @@ except Exception:
 
 rows = []
 fail_reasons = []
+speed_notes = []
 if exit_code != 0:
     fail_reasons.append(f"new_eval exited with code {exit_code}")
 
@@ -345,6 +371,12 @@ for task, job, metrics_name in TASKS:
         actual = {}
     else:
         actual = load_metrics(actual_path)
+
+    bench_metrics = actual.get("bench_metrics")
+    if not isinstance(bench_metrics, dict) or not bench_metrics:
+        bench_metrics = {}
+        if actual_path.exists():
+            speed_notes.append(f"{task}: missing metrics.bench_metrics")
 
     baseline_score = as_float(baseline.get("score"))
     baseline_samples = as_int(baseline.get("sample_count"))
@@ -385,6 +417,24 @@ for task, job, metrics_name in TASKS:
         "failed_count": failed,
         "empty_predict_count": empty,
         "judge_parse_failed_count": judge_fail,
+        "speed_metrics_available": bool(bench_metrics),
+        "duration_scope": str(bench_metrics.get("duration_scope") or ""),
+        "duration_sec": as_optional_float(bench_metrics.get("duration_sec")),
+        "successful_requests": as_optional_int(bench_metrics.get("successful_requests")),
+        "failed_requests": as_optional_int(bench_metrics.get("failed_requests")),
+        "total_prompt_tokens": as_optional_int(bench_metrics.get("total_prompt_tokens")),
+        "total_completion_tokens": as_optional_int(bench_metrics.get("total_completion_tokens")),
+        "request_rate_per_s": as_optional_float(bench_metrics.get("request_rate_per_s")),
+        "prompt_tokens_per_s": as_optional_float(bench_metrics.get("prompt_tokens_per_s")),
+        "output_tokens_per_s": as_optional_float(bench_metrics.get("output_tokens_per_s")),
+        "completion_tokens_avg": as_optional_float(bench_metrics.get("completion_tokens_avg")),
+        "ttft_avg_ms": as_optional_float(bench_metrics.get("ttft_avg_ms")),
+        "ttft_p50_ms": as_optional_float(bench_metrics.get("ttft_p50_ms")),
+        "ttft_p99_ms": as_optional_float(bench_metrics.get("ttft_p99_ms")),
+        "itl_avg_ms": as_optional_float(bench_metrics.get("itl_avg_ms")),
+        "itl_p50_ms": as_optional_float(bench_metrics.get("itl_p50_ms")),
+        "itl_p99_ms": as_optional_float(bench_metrics.get("itl_p99_ms")),
+        "e2e_avg_ms": as_optional_float(bench_metrics.get("e2e_avg_ms")),
         "reasons": task_reasons,
     })
 
@@ -395,12 +445,16 @@ summary = {
     "api_base": os.environ.get("API_BASE", ""),
     "model": os.environ.get("MODEL_ID", ""),
     "concurrency": as_int(os.environ.get("CONCURRENCY", 0)),
+    "new_eval_url": os.environ.get("NEW_EVAL_URL", ""),
+    "new_eval_sha256": os.environ.get("NEW_EVAL_SHA256", ""),
+    "new_eval_git_commit": os.environ.get("NEW_EVAL_GIT_COMMIT", ""),
     "selected_tasks": [row["task"] for row in rows],
     "baseline_dir": str(BASELINE_DIR),
     "baseline_source_dir": str(BASELINE_SOURCE_DIR),
     "score_tolerance": TOL,
     "new_eval_exit_code": exit_code,
     "fail_reasons": fail_reasons,
+    "speed_notes": speed_notes,
     "tasks": rows,
 }
 
@@ -410,7 +464,13 @@ with (RUN_DIR / "summary.csv").open("w", newline="") as f:
     fields = [
         "task", "status", "score", "baseline_score", "delta", "threshold",
         "sample_count", "expected_sample_count", "baseline_sample_count", "correct_count", "wrong_count",
-        "failed_count", "empty_predict_count", "judge_parse_failed_count", "reasons",
+        "failed_count", "empty_predict_count", "judge_parse_failed_count",
+        "speed_metrics_available", "duration_scope", "duration_sec",
+        "successful_requests", "failed_requests", "total_prompt_tokens", "total_completion_tokens",
+        "request_rate_per_s", "prompt_tokens_per_s", "output_tokens_per_s", "completion_tokens_avg",
+        "ttft_avg_ms", "ttft_p50_ms", "ttft_p99_ms",
+        "itl_avg_ms", "itl_p50_ms", "itl_p99_ms", "e2e_avg_ms",
+        "reasons",
     ]
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
@@ -426,6 +486,9 @@ lines = [
     f"API base: `{os.environ.get('API_BASE', '')}`",
     f"Model: `{os.environ.get('MODEL_ID', '')}`",
     f"Concurrency: `{os.environ.get('CONCURRENCY', '')}`",
+    f"new_eval artifact: `{os.path.basename(os.environ.get('NEW_EVAL_URL', ''))}`",
+    f"new_eval commit: `{os.environ.get('NEW_EVAL_GIT_COMMIT', '')}`",
+    f"new_eval SHA256: `{os.environ.get('NEW_EVAL_SHA256', '')}`",
     f"Selected tasks: `{', '.join(row['task'] for row in rows)}`",
     f"Baseline dir: `{BASELINE_DIR}`",
     f"Baseline source: `{BASELINE_SOURCE_DIR}`",
@@ -435,6 +498,11 @@ lines = [
 if fail_reasons:
     lines += ["## Fail Reasons", ""]
     lines += [f"- {reason}" for reason in fail_reasons]
+    lines += [""]
+
+if speed_notes:
+    lines += ["## Speed Notes", ""]
+    lines += [f"- {note}" for note in speed_notes]
     lines += [""]
 
 lines += [
@@ -451,6 +519,46 @@ for row in rows:
         f"{row['expected_sample_count']} | "
         f"{row['correct_count']} | {row['wrong_count']} | {row['failed_count']} | "
         f"{row['empty_predict_count']} | {row['judge_parse_failed_count']} |"
+    )
+
+lines += [
+    "",
+    "## Speed - Throughput",
+    "",
+    "Rollout timing only; judge time is excluded. Speed metrics are informational and do not affect accuracy PASS/FAIL.",
+    "",
+    "| task | scope | duration_s | success | failed | req/s | prompt tok/s | output tok/s | completion tok/req |",
+    "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+]
+for row in rows:
+    lines.append(
+        f"| {row['task']} | {row['duration_scope'] or 'N/A'} | "
+        f"{format_speed_float(row['duration_sec'])} | "
+        f"{format_speed_int(row['successful_requests'])} | "
+        f"{format_speed_int(row['failed_requests'])} | "
+        f"{format_speed_float(row['request_rate_per_s'])} | "
+        f"{format_speed_float(row['prompt_tokens_per_s'])} | "
+        f"{format_speed_float(row['output_tokens_per_s'])} | "
+        f"{format_speed_float(row['completion_tokens_avg'])} |"
+    )
+
+lines += [
+    "",
+    "## Speed - Latency",
+    "",
+    "| task | TTFT avg ms | TTFT p50 ms | TTFT p99 ms | ITL avg ms | ITL p50 ms | ITL p99 ms | E2E avg ms |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|",
+]
+for row in rows:
+    lines.append(
+        f"| {row['task']} | "
+        f"{format_speed_float(row['ttft_avg_ms'])} | "
+        f"{format_speed_float(row['ttft_p50_ms'])} | "
+        f"{format_speed_float(row['ttft_p99_ms'])} | "
+        f"{format_speed_float(row['itl_avg_ms'])} | "
+        f"{format_speed_float(row['itl_p50_ms'])} | "
+        f"{format_speed_float(row['itl_p99_ms'])} | "
+        f"{format_speed_float(row['e2e_avg_ms'])} |"
     )
 
 (RUN_DIR / "summary.md").write_text("\n".join(lines) + "\n")
