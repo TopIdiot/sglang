@@ -84,6 +84,27 @@ def _get_welmv4_mtp_mirror_layers(model_runner) -> List[int]:
     num_nextn_predict_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
     mirror_layers = getattr(hf_config, "kv_mirror_layers", []) or []
     imitated_layers = getattr(hf_config, "kv_mirror_imitated_layers", []) or []
+    archs = getattr(hf_config, "architectures", None) or []
+    if archs[:1] == ["WeLMV4MoeForCausalLMNextN"]:
+        # The draft ModelConfig rewrite (configs/model_config.py) shrinks
+        # num_hidden_layers to num_nextn_predict_layers while kv_mirror_layers
+        # keep base-model numbering. Use the preserved base layer count; fall
+        # back to the highest mirror index (the last nextn layer is always a
+        # mirror layer) for configs built without the rewrite.
+        base_num_hidden_layers = int(
+            getattr(hf_config, "num_target_hidden_layers", 0) or 0
+        )
+        if (
+            base_num_hidden_layers <= 0
+            and mirror_layers
+            and num_nextn_predict_layers > 0
+            and num_hidden_layers == num_nextn_predict_layers
+        ):
+            base_num_hidden_layers = (
+                int(max(int(m) for m in mirror_layers)) + 1 - num_nextn_predict_layers
+            )
+        if base_num_hidden_layers > num_hidden_layers:
+            num_hidden_layers = base_num_hidden_layers
     layers = []
     for mirror, imitated in zip(mirror_layers, imitated_layers):
         mirror = int(mirror)

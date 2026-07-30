@@ -20,6 +20,18 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
+    # DeepGEMM renamed the bf16 masked grouped-GEMM entrypoint across
+    # releases: older packages expose `m_grouped_bf16_gemm_nt_masked`,
+    # DeepGEMM >= v0.1.1 exposes `bf16_m_grouped_gemm_nt_masked`. The DeepEP
+    # low-latency bf16 MoE path (SGLANG_DEEPEP_BF16_DISPATCH) requires
+    # DeepGEMM >= v0.1.1; resolve whichever name the installed package
+    # provides so both environments work.
+    _BF16_M_GROUPED_GEMM_NT_MASKED = getattr(
+        deep_gemm, "bf16_m_grouped_gemm_nt_masked", None
+    ) or getattr(deep_gemm, "m_grouped_bf16_gemm_nt_masked", None)
+else:
+    _BF16_M_GROUPED_GEMM_NT_MASKED = None
+
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
@@ -97,10 +109,16 @@ def grouped_gemm_nt_bf16_masked(
     _, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
 
+    if _BF16_M_GROUPED_GEMM_NT_MASKED is None:
+        raise AttributeError(
+            "deep_gemm provides neither bf16_m_grouped_gemm_nt_masked "
+            "(DeepGEMM >= v0.1.1, required for DeepEP bf16 dispatch) nor "
+            "m_grouped_bf16_gemm_nt_masked"
+        )
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+        return _BF16_M_GROUPED_GEMM_NT_MASKED(
             a,
             b,
             d,

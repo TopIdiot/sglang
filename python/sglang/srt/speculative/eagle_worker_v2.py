@@ -2533,6 +2533,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 "global_num_tokens_cpu",
                 "global_num_tokens_for_logprob_cpu",
                 "_welm_mtp_contract_global_num_tokens_cpu",
+                "num_token_non_padded",
+                "num_token_non_padded_cpu",
                 "lora_ids",
                 "attn_backend",
                 "forward_mode",
@@ -3329,6 +3331,34 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run draft
         if use_welmv4_mtp_draft_proposal:
+            if (
+                self._should_use_welmv4_mtp_oe_hash_kernel()
+                and getattr(draft_input, "welm_mtp_oe_history_state", None) is None
+            ):
+                # PD decode bootstrap reaches the proposal branch without an OE
+                # history state (no draft prefill ran here), but the fused
+                # target-verify hash kernel has no CPU fallback. Rebuild it
+                # from the context's CPU prefixes; when the context carries
+                # none, derive them from request token history (skip the tail:
+                # the transferred bonus token is already in output_ids and is
+                # pushed separately via first_token_ids).
+                oe_context = getattr(model_worker_batch, "oe_context", None)
+                if oe_context is not None:
+                    prefix_rows = getattr(oe_context, "hash_prefixes", None)
+                    if prefix_rows is None:
+                        prefix_rows = self._welmv4_mtp_prefix_rows_from_reqs(
+                            model_worker_batch.reqs,
+                            self._welmv4_mtp_oe_prefix_width(),
+                            skip_latest_output=True,
+                        )
+                    history_state = self._init_welmv4_mtp_oe_history_from_context(
+                        oe_context,
+                        device=draft_input.bonus_tokens.device,
+                        first_token_ids=draft_input.bonus_tokens,
+                        prefix_rows=prefix_rows,
+                    )
+                    if history_state is not None:
+                        draft_input.welm_mtp_oe_history_state = history_state
             parent_list, top_scores_index, draft_tokens = (
                 self._build_welmv4_mtp_draft_proposal_results(draft_input)
             )
@@ -3882,7 +3912,15 @@ class EagleDraftWorker(BaseDraftWorker):
             next_draft_input.num_accept_tokens_cpu or []
         )
         draft_input.num_tokens_for_logprob_per_req = 1
-        draft_input.mirrored_kv_indices = next_draft_input.mirrored_kv_indices
+        # topk=1 verify never packs mirrored_kv_indices, so idle cycles would
+        # hit the proposal-graph mirror-state copy with indices=None and no
+        # verify states (idle verify runs no forward) and trip its raise. An
+        # empty index tensor routes it into the zero-fill padding branch.
+        draft_input.mirrored_kv_indices = (
+            empty_i64
+            if next_draft_input.mirrored_kv_indices is None
+            else next_draft_input.mirrored_kv_indices
+        )
         draft_input.model_specific_states = next_draft_input.model_specific_states
 
         batch.spec_info = draft_input

@@ -1568,9 +1568,8 @@ def select_experts(
                 scoring_func=scoring_func,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
+        # The custom routing function may evaluate padded rows, but the common
+        # post-processing below masks their expert IDs to -1 before dispatch.
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(

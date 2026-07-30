@@ -324,6 +324,36 @@ uv pip install --python "${VENV_PATH}/bin/python" \
     --force-reinstall
 BASH
 
+# DeepEP v1.2.1 is prebuilt for CPython 3.12, x86_64, CUDA 12, and SM90.
+# deep_ep declares no dependencies, so its NVSHMEM runtime must be installed
+# explicitly. The assertion below verifies that the wheel retains NVSHMEM
+# linkage required by the internode/low-latency kernels.
+RUN --mount=type=bind,source=3rdparty/deep_ep_wheel/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl,target=/tmp/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl \
+    --mount=type=cache,target=/root/.cache/uv <<'BASH'
+set -euo pipefail
+DEEP_EP_WHEEL=/tmp/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl
+echo "28e6f24c2d9de18d3eb0640421d96ff8d1f8744830ee5ed83d3af0a6fdaf8bcb  ${DEEP_EP_WHEEL}" | sha256sum --check
+uv pip install --python "${VENV_PATH}/bin/python" \
+    nvidia-nvshmem-cu12==3.4.5 \
+    "${DEEP_EP_WHEEL}"
+"${VENV_PATH}/bin/python" - <<'PY'
+import pathlib
+import subprocess
+
+import deep_ep
+from deep_ep import Buffer  # noqa: F401
+
+site = pathlib.Path(deep_ep.__file__).resolve().parent.parent
+so = next(site.glob("deep_ep_cpp*.so"))
+linked = subprocess.run(["ldd", str(so)], capture_output=True, text=True).stdout
+if "libnvshmem_host" not in linked:
+    raise SystemExit(
+        "deep_ep was built WITHOUT NVSHMEM (internode/low-latency disabled)"
+    )
+print(f"deep_ep={deep_ep.__version__ if hasattr(deep_ep, '__version__') else '1.2.1'}, nvshmem linkage OK")
+PY
+BASH
+
 # MK compiles CUDA kernels at runtime. Keep its source tree in the image so the
 # editable package can resolve the JIT headers under csrcs/include.
 COPY 3rdparty/mk/pyproject.toml 3rdparty/mk/README.md /sgl-workspace/3rdparty/mk/
@@ -418,6 +448,7 @@ import pathlib
 import sys
 import sysconfig
 
+import deep_ep
 import deep_gemm
 import decord
 import sglang
@@ -447,6 +478,7 @@ print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
 print(f"decord_module={decord.__file__}")
 print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
+print(f"deep_ep={version('deep-ep')}, nvshmem={version('nvidia-nvshmem-cu12')}")
 print(f"sglang_module={sglang.__file__}")
 PY
 

@@ -325,12 +325,30 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 new_seq_lens=self.seq_lens,
             )
             if is_welm_mtp_pd_decode:
-                spec_info.welm_mtp_deferred_prefill_draft = True
-                spec_info.welm_mtp_deferred_prefill_draft_mask = torch.ones(
-                    (len(self.reqs),),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
+                # local import to avoid circular import
+                from sglang.srt.disaggregation.decode import _is_fake_transfer
+
+                if server_args.speculative_eagle_topk == 1 and all(
+                    _is_fake_transfer(req, server_args) for req in self.reqs
+                ):
+                    # Fake-transfer requests (request-level 2.2.2.2 bootstrap or
+                    # global fake backend): no prefill peer produced draft KV or
+                    # mirror states, and the deferred draft prefill deadlocks
+                    # under dp-attention (idle DP ranks never join the
+                    # out-of-band extend's collectives). The prebuilt
+                    # topk_p/topk_index above already satisfy the linear
+                    # draft-proposal contract, so enter steady-state verify
+                    # directly. get_new_prebuilt_batch keeps prebuilt batches
+                    # uniform in fakeness, so all() cannot see a mixed batch.
+                    spec_info.welm_mtp_deferred_prefill_draft = False
+                    spec_info.welm_mtp_deferred_prefill_draft_mask = None
+                else:
+                    spec_info.welm_mtp_deferred_prefill_draft = True
+                    spec_info.welm_mtp_deferred_prefill_draft_mask = torch.ones(
+                        (len(self.reqs),),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
                 spec_info.num_tokens_per_req = 1
                 spec_info.num_tokens_for_logprob_per_req = 1
             else:

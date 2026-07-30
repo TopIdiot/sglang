@@ -2378,6 +2378,15 @@ class SchedulerDisaggregationDecodeMixin:
         waiting_queue: List[Req] = []
 
         deferred_enabled = _welm_deferred_decode_enabled(self.server_args)
+        # WeLM MTP prebuilt batches must be uniform in request-level fake
+        # transfer: the deferred draft-prefill mask is all-or-nothing (mixed
+        # rows are rejected in draft()), so pin the batch to the first
+        # request's fakeness and requeue the rest.
+        welm_mtp_uniform_fake = (
+            self._should_isolate_welm_mtp_prebuilt()
+            and self.server_args.speculative_eagle_topk == 1
+        )
+        batch_is_fake: Optional[bool] = None
         for req in self.waiting_queue:
             deferred_state = vars(req).get("welm_deferred_decode_state")
             if deferred_enabled:
@@ -2400,6 +2409,13 @@ class SchedulerDisaggregationDecodeMixin:
 
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if len(can_run_list) < num_not_used_batch:
+                if welm_mtp_uniform_fake:
+                    req_is_fake = _is_fake_transfer(req, self.server_args)
+                    if batch_is_fake is None:
+                        batch_is_fake = req_is_fake
+                    elif req_is_fake is not batch_is_fake:
+                        waiting_queue.append(req)
+                        continue
                 can_run_list.append(req)
                 # Decode-radix path: do NOT re-match prefix here.
                 # `pop_preallocated` already took a tree snapshot and used it

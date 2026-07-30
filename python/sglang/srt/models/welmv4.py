@@ -94,6 +94,7 @@ from sglang.srt.layers.moe.mk_moe_router import (
     get_mk_moe_router_mode,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.prefill_cp_logits import route_cp_prefill_hidden_states
 from sglang.srt.layers.attntp_fused_norm import (
     get_prefill_cp_attntp_fused_norm_manager,
@@ -672,6 +673,81 @@ def _welm_needs_input_logprobs(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _welm_kv_mirror_row_alignment() -> int:
+    """Row alignment required for the contracted hidden-state domain.
+
+    With DeepEP + DP-attention the MLP layout is SCATTERED, so every layer's
+    prepare_mlp reduce-scatters (and the next layer's prepare_attn all-gathers)
+    across the attn-TP group. Those collectives need row counts divisible by
+    attn_tp, but KV-mirror contraction shrinks prefill rows to per-request
+    counts. Aligning the contracted domain to attn_tp keeps the collectives
+    well-formed; the pad rows are zero-filled by _welm_scatter_kv_mirror_rows
+    and stripped again before the logits processor. Every other backend keeps
+    alignment 1, i.e. bitwise-identical behavior.
+    """
+    if is_deepep_class_backend() and is_dp_attention_enabled():
+        return get_attention_tp_size()
+    return 1
+
+
+def _welm_ceil_align(value: int, align: int) -> int:
+    if align <= 1:
+        return value
+    return (value + align - 1) // align * align
+
+
+def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
+    """Decide once per forward whether padded contraction is unambiguous.
+
+    The contracted-domain discriminator throughout this file is a row-count
+    comparison against kv_mirror_output_size. If the aligned request count
+    equals the (already attn_tp-padded) input token count on any slot that
+    will contract, full-T and contracted tensors become indistinguishable
+    there, so we skip contraction for the whole batch (in that regime nearly
+    every token is a last token and contraction saves almost nothing anyway).
+    Slots that keep their rows (decode slots in a mixed batch, see
+    welm_kv_mirror_contract_flags) never re-discriminate, so they are ignored
+    when flags are available. The verdict is computed from the replicated CPU
+    DP metadata, so it is identical on all ranks, and it is cached on
+    forward_batch because the DP-metadata update at the first mirror layer
+    mutates global_num_tokens_cpu.
+    """
+    cached = getattr(forward_batch, "_welm_kv_mirror_pad_contract_safe", None)
+    if cached is not None:
+        return cached
+    align = _welm_kv_mirror_row_alignment()
+    if align <= 1:
+        safe = True
+    else:
+        tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+        reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
+        contract_flags = getattr(
+            forward_batch, "welm_kv_mirror_contract_flags", None
+        )
+        if (
+            contract_flags is not None
+            and tokens is not None
+            and len(contract_flags) != len(tokens)
+        ):
+            contract_flags = None
+        safe = (
+            tokens is not None
+            and reqs is not None
+            and len(tokens) == len(reqs)
+            and all(
+                _welm_ceil_align(int(r), align) < int(t)
+                for slot, (t, r) in enumerate(zip(tokens, reqs))
+                if int(t) > 0
+                and (contract_flags is None or contract_flags[slot])
+            )
+        )
+    # Known limitation: persistent CUDA-graph forward batches carry GPU-only
+    # DP metadata, so this caches False there and captured graphs (e.g. the
+    # MTP draft proposal graph) always run the un-contracted path.
+    forward_batch._welm_kv_mirror_pad_contract_safe = safe
+    return safe
+
+
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.enable_welm_kv_mirror_opt
@@ -681,6 +757,7 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
             or getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
         )
         and not _welm_needs_input_logprobs(forward_batch)
+        and _welm_kv_mirror_pad_contract_safe(forward_batch)
     )
 
 
@@ -700,6 +777,9 @@ def _welm_should_sync_kv_mirror_dp_metadata(
         and is_dp_attention_enabled()
         and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
         and getattr(forward_batch, "global_num_reqs_cpu", None) is not None
+        # Must match the contracting ranks' contract-or-not verdict, or the DP
+        # metadata desyncs across ranks (same replicated inputs -> same verdict).
+        and _welm_kv_mirror_pad_contract_safe(forward_batch)
     )
 
 
@@ -1430,6 +1510,10 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
         )
         output_size = int(last_q_indices.numel())
         forward_batch.welm_cp_prefill_kv_mirror_has_global_q = has_global_q
+        # Phase-2 CP prefill keeps its own <=1-row-per-rank layout; attn-TP row
+        # alignment (DeepEP + DP-attention) is not applied there because the
+        # two deployments are never combined today.
+        forward_batch._welm_kv_mirror_row_pad = 0
     else:
         last_q_indices = getattr(
             forward_batch, "welm_kv_mirror_last_q_indices", None
@@ -1447,6 +1531,18 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
         else:
             active_batch_indices = forward_batch.welm_kv_mirror_active_batch_indices
             output_size = forward_batch.welm_kv_mirror_output_size
+        # DeepEP + DP-attention: align the contracted domain to attn_tp so the
+        # per-layer attn-TP reduce-scatter/all-gather stay well-formed. Covers
+        # BOTH init branches (cumsum fallback and scheduler-provided metadata,
+        # the normal path for real extend batches). The pad rows are zero-
+        # filled by _welm_scatter_kv_mirror_rows (active indices only cover
+        # real rows, so pad rows behave exactly like an unfinished chunked
+        # request's row) and stripped before the logits processor.
+        padded_output_size = _welm_ceil_align(
+            output_size, _welm_kv_mirror_row_alignment()
+        )
+        forward_batch._welm_kv_mirror_row_pad = padded_output_size - output_size
+        output_size = padded_output_size
 
     forward_batch.custom_last_index = last_q_indices
     forward_batch.kv_mirror_active_batch_indices = active_batch_indices
@@ -1508,6 +1604,8 @@ def _welm_scatter_kv_mirror_rows(
         output_size is None
         or active_indices is None
         or active_indices.numel() == output_size
+        # Already in the (possibly attn_tp-padded) output domain.
+        or tensor.shape[0] == output_size
     ):
         return tensor
 
@@ -1607,6 +1705,7 @@ def _welm_update_contracted_dp_metadata(
     *,
     marker_attr: Optional[str] = None,
     contract_to_request_counts: bool = False,
+    logprob_local_num_tokens: Optional[int] = None,
 ) -> None:
     if (
         not is_dp_attention_enabled()
@@ -1623,6 +1722,8 @@ def _welm_update_contracted_dp_metadata(
 
     from sglang.srt.layers.dp_attention import (
         get_attention_dp_rank,
+        get_attention_tp_rank,
+        get_attention_tp_size,
         set_dp_buffer_len,
         set_is_extend_in_batch,
     )
@@ -1650,6 +1751,13 @@ def _welm_update_contracted_dp_metadata(
         num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
         raw_global_num_tokens = None
         new_global_num_tokens_for_logprob = None
+        # Contracted local rows may carry attn-TP alignment padding
+        # (DeepEP + DP-attention), so contracted slots are sized/matched after
+        # applying the same alignment. The logprob metadata must keep the
+        # un-padded per-request counts: exactly one logits row per request
+        # reaches the logits processor because the pad rows are stripped
+        # before it runs.
+        row_align = _welm_kv_mirror_row_alignment()
 
         # In a normal mixed extend/decode batch, only extend ranks contract at
         # the first KV-mirror layer.  Decode ranks keep the row padding that was
@@ -1695,7 +1803,9 @@ def _welm_update_contracted_dp_metadata(
             for slot, will_contract in enumerate(contract_flags):
                 if will_contract:
                     contracted_rows = int(global_num_reqs[slot])
-                    mixed_global_num_tokens[slot] = contracted_rows
+                    mixed_global_num_tokens[slot] = _welm_ceil_align(
+                        contracted_rows, row_align
+                    )
                     mixed_logprob_counts[slot] = contracted_rows
                     has_contracting_slot = True
 
@@ -1718,14 +1828,21 @@ def _welm_update_contracted_dp_metadata(
                     continue
                 counts = [int(x) for x in counts]
                 candidate_count_values[name] = counts
-                if counts[dp_rank] == new_local_num_tokens:
-                    raw_global_num_tokens = counts
+                # Candidates hold un-padded counts while the local rows may be
+                # attn_tp-padded; compare in the padded domain.
+                if _welm_ceil_align(counts[dp_rank], row_align) == new_local_num_tokens:
+                    raw_global_num_tokens = [
+                        _welm_ceil_align(c, row_align) for c in counts
+                    ]
+                    if row_align > 1 and new_global_num_tokens_for_logprob is None:
+                        new_global_num_tokens_for_logprob = counts
                     break
         if raw_global_num_tokens is None:
             if candidate_count_values:
                 raise RuntimeError(
                     "WeLM DP metadata contraction mismatch: "
                     f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
+                    f"row_align={row_align}, "
                     f"candidate_counts={candidate_count_values}."
                 )
             raw_global_num_tokens = [new_local_num_tokens] * num_dp_slots
@@ -1734,6 +1851,7 @@ def _welm_update_contracted_dp_metadata(
             raise RuntimeError(
                 "WeLM DP metadata contraction mismatch: "
                 f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
+                f"row_align={row_align}, "
                 f"candidate_counts={candidate_count_values}."
             )
 
@@ -1766,6 +1884,16 @@ def _welm_update_contracted_dp_metadata(
         if forward_batch.global_num_tokens_for_logprob_gpu is not None:
             if new_global_num_tokens_for_logprob is None:
                 new_global_num_tokens_for_logprob = new_global_num_tokens
+            if logprob_local_num_tokens is not None:
+                # Caller-supplied un-padded logprob rows for this DP slot
+                # (e.g. the NextN draft strips attn-TP pad rows before logits).
+                new_global_num_tokens_for_logprob = list(
+                    new_global_num_tokens_for_logprob
+                )
+                if 0 <= dp_rank < len(new_global_num_tokens_for_logprob):
+                    new_global_num_tokens_for_logprob[dp_rank] = int(
+                        logprob_local_num_tokens
+                    )
             if copy_dp_counts_to_gpu(
                 forward_batch.global_num_tokens_for_logprob_gpu,
                 new_global_num_tokens_for_logprob,
@@ -1825,6 +1953,34 @@ def _welm_update_contracted_dp_metadata(
         new_global_num_tokens,
     )
     set_is_extend_in_batch(forward_batch.is_extend_in_batch)
+    if (
+        contract_to_request_counts
+        and forward_batch.num_token_non_padded is not None
+        and not _welm_cuda_graph_capture_active()
+    ):
+        # The DeepEP top-k mask consumes an attn-TP-rank-LOCAL non-padded
+        # count (see compute_local_num_token_non_padded in the capture path),
+        # so convert the per-DP real request rows to this rank's shard count.
+        # new_local_num_tokens is attn_tp-aligned by construction here.
+        # Replace instead of fill_ so caller-saved originals survive.
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded,
+        )
+
+        real_rows = max(
+            new_local_num_tokens
+            - getattr(forward_batch, "_welm_kv_mirror_row_pad", 0),
+            0,
+        )
+        forward_batch.num_token_non_padded = compute_local_num_token_non_padded(
+            forward_batch.num_token_non_padded.new_tensor(real_rows),
+            new_local_num_tokens,
+        )
+        attn_tp_rank = get_attention_tp_rank()
+        tokens_per_rank = new_local_num_tokens // max(get_attention_tp_size(), 1)
+        forward_batch.num_token_non_padded_cpu = min(
+            max(real_rows - tokens_per_rank * attn_tp_rank, 0), tokens_per_rank
+        )
     if marker_attr is not None:
         setattr(forward_batch, marker_attr, new_local_num_tokens)
 
@@ -2960,6 +3116,34 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
+        # Lockstep with _welm_shared_expert_parallel_kwargs(): with an a2a MoE
+        # backend the routed output is already complete per token after
+        # dispatch/combine and the shared expert above is replicated
+        # (tp_size=1), so the MLP-block TP all-reduce in forward() must be
+        # skipped even on the use_reduce_scatter=False (warmup/eager) path --
+        # re-aggregating complete values scales them by ~tp_size.
+        # Only DeepEP-family a2a backends produce a complete per-token routed
+        # output; megamoe & co. go through StandardDispatcher and still need
+        # the TP all-reduce, so reject them instead of silently mis-reducing.
+        _a2a_backend = get_moe_a2a_backend()
+        if not _a2a_backend.is_none() and not is_deepep_class_backend():
+            raise NotImplementedError(
+                "WeLM MoE supports --moe-a2a-backend none or the DeepEP family "
+                f"(deepep/mooncake/mori), got {_a2a_backend.value!r}."
+            )
+        self._shared_expert_replicated = is_deepep_class_backend()
+        if (
+            self._shared_expert_replicated
+            and self.shared_expert is not None
+            and self.layer_id == 0
+            and is_deepep_class_backend()
+            and is_dp_attention_enabled()
+        ):
+            logger.info(
+                "[welmv4] DeepEP+DP-attention detected: replicating shared "
+                "expert (tp_size=1) so its output stays complete per token, "
+                "matching the DeepEP-combined routed output."
+            )
 
         self.shared_expert_gate = None
         has_shared_expert_gate = getattr(
@@ -3041,6 +3225,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
 
+        # DeepEP consumes the per-rank SCATTERED token shard, so the local
+        # non-padded count is the correct top-k mask (padded rows get expert id
+        # -1 and are skipped by dispatch). The standard EP path sees a
+        # FULL-token layout; applying the local count there would mask real
+        # tokens owned by other attention-DP ranks, so it stays None there.
+        topk_num_token_non_padded = (
+            forward_batch.num_token_non_padded
+            if forward_batch is not None
+            and prefill_cp_router_context is None
+            and is_deepep_class_backend()
+            else None
+        )
         if router_hidden_states.shape[0] == 0:
             top_k = self.topk.topk_config.top_k
             router_logits = hidden_states.new_empty(
@@ -3076,7 +3272,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = F.linear(
                     router_hidden_states_fp32, self.gate.weight
                 )
-                topk_output = self.topk(router_hidden_states, router_logits)
+                topk_output = self.topk(
+                    router_hidden_states,
+                    router_logits,
+                    num_token_non_padded=topk_num_token_non_padded,
+                )
             else:
                 if self.use_mmq_router_linear_v2:
                     router_logits = mmq_style_router_linear_v2(
@@ -3088,7 +3288,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         self.gate.weight,
                         use_mxfp8=self.use_mxfp8,
                     )
-                topk_output = self.topk(router_hidden_states, router_logits)
+                topk_output = self.topk(
+                    router_hidden_states,
+                    router_logits,
+                    num_token_non_padded=topk_num_token_non_padded,
+                )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
             if self.router_score_func == "softmax":
@@ -3138,7 +3342,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not use_reduce_scatter
+            and not self._shared_expert_replicated
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
@@ -4470,6 +4678,52 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             if residual_after_layernorm:
                 residual = hidden_states.to(torch.float32)
+                # DeepEP fix: with an a2a MoE backend the MLP mode is SCATTERED,
+                # so every layer whose layer_input_mode is SCATTERED (all layers
+                # after the prenorm layer) declares its residual already
+                # scattered. But we just set residual to the TP_ATTN_FULL
+                # (attn-tp replicated) post-LN hidden, so prepare_mlp's
+                # _scatter_hidden_states_and_residual will NOT slice it (it only
+                # slices when residual_input_mode == TP_ATTN_FULL). Slice it
+                # here to this attn-TP rank's shard so it matches the SCATTERED
+                # hidden states consumed by prepare_mlp and carried between
+                # sparse layers. Layer 0 (input mode TP_ATTN_FULL) is untouched
+                # and is sliced in prepare_mlp.
+                if (
+                    self.layer_scatter_modes.layer_input_mode
+                    == ScatterMode.SCATTERED
+                    and self.self_attn.attn_tp_size > 1
+                ):
+                    # First contracting mirror layer with row alignment active
+                    # (DeepEP + DP-attention): residual here is the full
+                    # T-domain post-LN hidden, attn-TP replicated -- the only
+                    # point where the contracted residual can be built from
+                    # local data. Contract + pad it BEFORE the per-rank slice,
+                    # so between-layer residuals are the scattered slice of
+                    # the padded contracted domain (matching hidden). Without
+                    # this, the post-attn align would gather T-domain
+                    # custom_last indices out of a 1/attn_tp slice -> CUDA
+                    # index-out-of-bounds.
+                    if (
+                        _welm_kv_mirror_row_alignment() > 1
+                        and self.self_attn.kv_mirror_layer_idx
+                        in self.kv_mirror_layers
+                        and _welm_should_contract_kv_mirror(forward_batch)
+                    ):
+                        _welm_init_kv_mirror_last_q_indices(forward_batch)
+                        if (
+                            residual.shape[0]
+                            != forward_batch.kv_mirror_output_size
+                        ):
+                            residual = _welm_scatter_kv_mirror_rows(
+                                _welm_select_kv_mirror_rows(
+                                    residual, forward_batch, first_contract=True
+                                ),
+                                forward_batch,
+                            )
+                    residual = residual.tensor_split(self.self_attn.attn_tp_size)[
+                        self.self_attn.attn_tp_rank
+                    ]
         elif use_fp32_ppln_residual:
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
@@ -4582,7 +4836,22 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and residual is not None
             and residual.shape[0] != hidden_states.shape[0]
         ):
-            residual = _welm_align_kv_mirror_residual_rows(residual, forward_batch)
+            # With row alignment active (DeepEP + DP-attention) the residual
+            # between layers is this attn-TP rank's SCATTERED slice of the
+            # padded contracted domain (rows == output_size / attn_tp). It is
+            # already what prepare_mlp expects for SCATTERED residuals; re-
+            # aligning would gather T-domain indices out of the small slice.
+            _row_align = _welm_kv_mirror_row_alignment()
+            _out_sz = getattr(forward_batch, "kv_mirror_output_size", None)
+            _residual_is_padded_slice = (
+                _row_align > 1
+                and _out_sz is not None
+                and residual.shape[0] * _row_align == _out_sz
+            )
+            if not _residual_is_padded_slice:
+                residual = _welm_align_kv_mirror_residual_rows(
+                    residual, forward_batch
+                )
 
         if use_prefill_cp_attntp2_fused_norm:
             if residual is None:
@@ -5236,7 +5505,12 @@ class Qwen2MoeModel(nn.Module):
                             eps=self.norm.eps,
                         )
                     else:
-                        hidden_states = self.norm(hidden_states)
+                        # WelmV4FusedRMSNorm always returns (output, out_residual)
+                        # even without a residual arg; keep only the normed output.
+                        normed = self.norm(hidden_states)
+                        hidden_states = (
+                            normed[0] if isinstance(normed, tuple) else normed
+                        )
                 else:
                     last_layer = self.layers[self.end_layer - 1]
                     final_experts_output = getattr(
@@ -5494,6 +5768,22 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         hidden_states, aux_hidden_states, forward_batch
                     )
                 )
+                # Strip the attn-TP alignment pad rows (DeepEP + DP-attention)
+                # so the logits processor sees exactly one row per request,
+                # matching global_num_tokens_for_logprob. Pad rows sit at the
+                # tail of the contracted domain by construction.
+                row_pad = getattr(forward_batch, "_welm_kv_mirror_row_pad", 0)
+                if (
+                    row_pad > 0
+                    and hidden_states.shape[0]
+                    == forward_batch.kv_mirror_output_size
+                ):
+                    num_real_rows = forward_batch.kv_mirror_output_size - row_pad
+                    hidden_states = hidden_states[:num_real_rows]
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = [
+                            hidden[:num_real_rows] for hidden in aux_hidden_states
+                        ]
 
             prepared_logits = _welm_prepare_cp_prefill_logits_states(
                 hidden_states, aux_hidden_states, forward_batch

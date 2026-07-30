@@ -333,14 +333,28 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
+            # The GLOBAL router-replay buffers receive a dp_gather of every DP
+            # group's rows; sizing them at max_num_token lets python slicing
+            # silently clamp once uneven DP groups select a larger bucket ->
+            # all_gather size mismatch.
+            router_gather_rows = (
+                max_num_token * dp_size if require_mlp_tp_gather else max_num_token
+            )
             router_shape = (
-                max_num_token,
+                router_gather_rows,
                 router_replay_num_layers,
                 router_replay_top_k,
             )
             router_replay_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
-            router_replay_mask = torch.zeros((max_num_token,), dtype=torch.bool)
-            router_replay_local_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
+            router_replay_mask = torch.zeros((router_gather_rows,), dtype=torch.bool)
+            local_router_shape = (
+                max_num_token,
+                router_replay_num_layers,
+                router_replay_top_k,
+            )
+            router_replay_local_topk_ids = torch.zeros(
+                local_router_shape, dtype=torch.int32
+            )
             router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
 
             ngram_embedding_info = (

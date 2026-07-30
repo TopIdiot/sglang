@@ -39,6 +39,7 @@ from sglang.srt.models.welmv4 import (
     _get_welm_kv_mirror_states,
     _welm_init_kv_mirror_last_q_indices,
     _welm_prepare_kv_mirror_logits_states,
+    _welm_scatter_kv_mirror_rows,
     _welm_select_kv_mirror_rows,
     _welm_should_contract_kv_mirror,
     _welm_update_contracted_dp_metadata,
@@ -687,6 +688,10 @@ class WeLMV4ModelNextN(nn.Module):
             hidden_states = _welm_select_kv_mirror_rows(
                 hidden_states, forward_batch, first_contract=first_contract
             )
+            # Zero-pad the selected rows back to the attn_tp-aligned output
+            # domain (kv_mirror_output_size), matching the main model; the
+            # per-layer attn-TP collectives below require aligned row counts.
+            hidden_states = _welm_scatter_kv_mirror_rows(hidden_states, forward_batch)
             main_first_contract = (
                 main_hidden_states.shape[0] != forward_batch.kv_mirror_output_size
             )
@@ -695,11 +700,19 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch,
                 first_contract=main_first_contract,
             )
+            main_hidden_states = _welm_scatter_kv_mirror_rows(
+                main_hidden_states, forward_batch
+            )
             _welm_update_contracted_dp_metadata(
                 forward_batch,
                 hidden_states.shape[0],
                 marker_attr="_welm_mtp_contracted_dp_metadata_rows",
                 contract_to_request_counts=True,
+                logprob_local_num_tokens=max(
+                    hidden_states.shape[0]
+                    - getattr(forward_batch, "_welm_kv_mirror_row_pad", 0),
+                    0,
+                ),
             )
         elif (
             forward_batch.forward_mode.is_idle()
@@ -878,12 +891,23 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                         hidden_states, aux_hidden_states, forward_batch
                     )
                 )
-                _welm_update_contracted_dp_metadata(
-                    forward_batch,
-                    hidden_states.shape[0],
-                    marker_attr="_welm_mtp_contracted_dp_metadata_rows",
-                    contract_to_request_counts=True,
-                )
+                # Strip the attn-TP alignment pad rows before logits, like the
+                # main model; the next MTP step re-pads at its entry. Token
+                # counts stay in the padded domain (attn-TP collectives need
+                # the alignment) -- the entry metadata update already set the
+                # un-padded logprob counts for the logits gather.
+                row_pad = getattr(forward_batch, "_welm_kv_mirror_row_pad", 0)
+                if (
+                    row_pad > 0
+                    and hidden_states.shape[0]
+                    == forward_batch.kv_mirror_output_size
+                ):
+                    num_real_rows = forward_batch.kv_mirror_output_size - row_pad
+                    hidden_states = hidden_states[:num_real_rows]
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = [
+                            hidden[:num_real_rows] for hidden in aux_hidden_states
+                        ]
             elif getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
                 custom_last_index = getattr(forward_batch, "custom_last_index", None)
                 if (
