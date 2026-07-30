@@ -1,0 +1,4 @@
+interface:
+  display_name: "SGLang Astra Trace Benchmark"
+  short_description: "Replay production Astra traces against SGLang"
+  default_prompt: "Use $sglang-astra-trace-benchmark to benchmark an SGLang endpoint with the pinned production trace artifact."
