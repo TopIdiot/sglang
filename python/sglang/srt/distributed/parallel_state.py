@@ -380,6 +380,7 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self._graph_capture_communicators: Dict[str, Any] = {}
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -494,6 +495,29 @@ class GroupCoordinator:
         return self.ranks[(rank_in_group - 1) % world_size]
 
     @contextmanager
+    def _capture_communicators(self):
+        with contextlib.ExitStack() as stack:
+            if self.ca_comm is not None:
+                stack.enter_context(self.ca_comm.capture())
+            for communicator in self._graph_capture_communicators.values():
+                stack.enter_context(communicator.capture())
+            yield
+
+    def register_graph_capture_communicator(self, name: str, communicator):
+        existing = self._graph_capture_communicators.get(name)
+        if existing is not None:
+            if existing is not communicator:
+                raise RuntimeError(
+                    f"graph capture communicator {name!r} is already registered"
+                )
+            return existing
+        self._graph_capture_communicators[name] = communicator
+        return communicator
+
+    def get_graph_capture_communicator(self, name: str):
+        return self._graph_capture_communicators.get(name)
+
+    @contextmanager
     def graph_capture(
         self,
         graph_capture_context: Optional[GraphCaptureContext] = None,
@@ -507,16 +531,13 @@ class GroupCoordinator:
             stream = graph_capture_context.stream
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
-        ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
-
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
         curr_stream = get_current_device_stream_fast()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), self._capture_communicators():
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -1631,6 +1652,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        for communicator in reversed(
+            tuple(self._graph_capture_communicators.values())
+        ):
+            communicator.close()
+        self._graph_capture_communicators.clear()
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None

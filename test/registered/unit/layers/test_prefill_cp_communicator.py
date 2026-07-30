@@ -34,9 +34,14 @@ class _Layout:
     cp_rank: int
     active_local_tokens: int
     counts: tuple[int, ...]
+    owner_rotation: int = 0
 
     def active_tokens_per_cp_rank(self):
         return self.counts
+
+    @property
+    def spec(self):
+        return SimpleNamespace(owner_rotation=self.owner_rotation)
 
 
 class _RecordingGroup:
@@ -124,6 +129,7 @@ def _communicator(
     cp_output=None,
     pair_output=None,
     use_ep_dispatch=False,
+    fused_attntp2_norm_runner=None,
 ):
     cp_group = _RecordingGroup(4, layout.cp_rank, gather_output=cp_output)
     pair_group = _RecordingGroup(2, lane, gather_output=pair_output)
@@ -135,6 +141,7 @@ def _communicator(
         attn_tp_group=pair_group,
         global_tp_group=tp_group,
         use_ep_dispatch=use_ep_dispatch,
+        fused_attntp2_norm_runner=fused_attntp2_norm_runner,
     )
     return communicator, cp_group, pair_group, tp_group
 
@@ -556,6 +563,120 @@ def test_ep_prepare_mlp_keeps_one_token_copy_and_skips_global_gather(
     assert tp_group.calls == []
 
 
+class _RecordingFusedNormRunner:
+    def __init__(self, normalized, residual_out, fp32_output):
+        self.normalized = normalized
+        self.residual_out = residual_out
+        self.fp32_output = fp32_output
+        self.calls = []
+
+    def forward_prefill_cp(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.normalized, self.residual_out, self.fp32_output
+
+
+def test_fused_attntp2_prepare_mlp_gathers_normalized_and_keeps_fp32_residual():
+    counts = (5, 0, 3, 2)
+    layout = _Layout(
+        cp_rank=2,
+        active_local_tokens=3,
+        counts=counts,
+        owner_rotation=3,
+    )
+    partial = torch.arange(3, dtype=torch.bfloat16).view(3, 1)
+    residual = torch.arange(3, dtype=torch.float32).view(3, 1) + 100
+    normalized_local = partial + 10
+    normalized_global = torch.arange(10, dtype=torch.bfloat16).view(10, 1) + 10
+    residual_out = residual + 20
+    fp32_output = normalized_local.float()
+    runner = _RecordingFusedNormRunner(
+        normalized_local, residual_out, fp32_output
+    )
+    communicator, cp_group, _, _ = _communicator(
+        layout,
+        cp_output=normalized_global,
+        fused_attntp2_norm_runner=runner,
+    )
+    communicator.post_attention_layernorm = SimpleNamespace(
+        weight=torch.ones(1, dtype=torch.bfloat16), eps=2e-5
+    )
+    o_norm = SimpleNamespace(
+        weight=torch.full((1,), 2, dtype=torch.bfloat16), eps=1e-5
+    )
+    forward_batch = SimpleNamespace(attn_cp_prefill_runtime_layout=layout)
+
+    hidden, returned_residual = communicator.prepare_mlp_fused_attntp2(
+        partial, residual, forward_batch, o_norm=o_norm
+    )
+
+    assert torch.equal(hidden, normalized_global)
+    assert returned_residual is residual_out
+    assert runner.calls == [
+        (
+            (
+                partial,
+                residual,
+                o_norm.weight,
+                communicator.post_attention_layernorm.weight,
+                o_norm.eps,
+                communicator.post_attention_layernorm.eps,
+            ),
+            {"lane_rotation": 1},
+        )
+    ]
+    assert cp_group.calls[0][1] is normalized_local
+
+
+def test_fused_attntp2_empty_owner_skips_pair_collective_and_joins_cp_gather():
+    counts = (3, 0, 0, 0)
+    layout = _Layout(cp_rank=1, active_local_tokens=0, counts=counts)
+    empty_hidden = torch.empty((0, 1), dtype=torch.bfloat16)
+    empty_residual = torch.empty((0, 1), dtype=torch.float32)
+    normalized_global = torch.arange(3, dtype=torch.bfloat16).view(3, 1)
+    runner = _RecordingFusedNormRunner(None, None, None)
+    communicator, cp_group, pair_group, _ = _communicator(
+        layout,
+        cp_output=normalized_global,
+        fused_attntp2_norm_runner=runner,
+    )
+    communicator.post_attention_layernorm = SimpleNamespace(
+        weight=torch.ones(1, dtype=torch.bfloat16), eps=2e-5
+    )
+    forward_batch = SimpleNamespace(attn_cp_prefill_runtime_layout=layout)
+
+    hidden, returned_residual = communicator.prepare_mlp_fused_attntp2(
+        empty_hidden,
+        empty_residual,
+        forward_batch,
+        o_norm=SimpleNamespace(
+            weight=torch.ones(1, dtype=torch.bfloat16),
+            eps=1e-5,
+        ),
+    )
+
+    assert torch.equal(hidden, normalized_global)
+    assert returned_residual is empty_residual
+    assert runner.calls == []
+    assert [call[0] for call in cp_group.calls] == ["all_gatherv"]
+    assert pair_group.calls == []
+
+
+def test_fused_attntp2_prepare_mlp_fails_without_registered_runner():
+    layout = _Layout(cp_rank=0, active_local_tokens=1, counts=(1, 0, 0, 0))
+    communicator, _, _, _ = _communicator(layout)
+    forward_batch = SimpleNamespace(attn_cp_prefill_runtime_layout=layout)
+
+    with pytest.raises(RuntimeError, match="fused IPC norm runner is unavailable"):
+        communicator.prepare_mlp_fused_attntp2(
+            torch.ones((1, 1), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.float32),
+            forward_batch,
+            o_norm=SimpleNamespace(
+                weight=torch.ones(1, dtype=torch.bfloat16), eps=1e-5
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("lane", "lane_rows"),
     [(0, [20.0, 21.0, 22.0]), (1, [23.0, 24.0])],
@@ -640,6 +761,11 @@ def test_cp_prefill_fused_norm_fallback_is_explicit_and_rate_limited(
     monkeypatch.setattr(
         welmv4_model, "_WELM_CP_FUSED_NORM_FALLBACK_WARNED", False
     )
+    monkeypatch.setattr(
+        welmv4_model,
+        "get_global_server_args",
+        lambda: SimpleNamespace(_enable_attntp_fused_norm=False),
+    )
     kwargs = dict(
         use_previous_precision=False,
         residual_after_layernorm=True,
@@ -662,6 +788,47 @@ def test_cp_prefill_fused_norm_fallback_is_explicit_and_rate_limited(
     ]
     assert len(messages) == 1
     assert "falling back to the unfused norm path" in messages[0]
+    assert welmv4_model._welm_should_use_mmq_norm_after_attn(
+        **kwargs, use_prefill_cp_communicator=False
+    )
+
+
+def test_cp_prefill_selects_dedicated_attntp2_fused_norm(monkeypatch):
+    monkeypatch.setattr(
+        welmv4_model,
+        "get_global_server_args",
+        lambda: SimpleNamespace(_enable_attntp_fused_norm=True),
+    )
+    kwargs = dict(
+        use_previous_precision=False,
+        residual_after_layernorm=True,
+        use_o_norm=True,
+        o_norm_needs_attn_tp_reduce=False,
+    )
+    attention = SimpleNamespace(
+        attn_tp_size=2,
+        o_proj=SimpleNamespace(
+            reduce_results=True,
+            use_attention_tp_reduce=True,
+        ),
+        o_proj_suffix_parallel_reduce=False,
+    )
+
+    assert welmv4_model._welm_should_use_prefill_cp_attntp2_fused_norm(
+        **kwargs,
+        use_prefill_cp_communicator=True,
+        attention=attention,
+        hidden_size=2048,
+    )
+    assert not welmv4_model._welm_should_use_prefill_cp_attntp2_fused_norm(
+        **kwargs,
+        use_prefill_cp_communicator=False,
+        attention=attention,
+        hidden_size=2048,
+    )
+    assert not welmv4_model._welm_should_use_mmq_norm_after_attn(
+        **kwargs, use_prefill_cp_communicator=True
+    )
     assert welmv4_model._welm_should_use_mmq_norm_after_attn(
         **kwargs, use_prefill_cp_communicator=False
     )

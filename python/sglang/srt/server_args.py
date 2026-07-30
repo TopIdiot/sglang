@@ -78,6 +78,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+MAX_AUTO_RUNNING_REQUESTS = 4096
 _WELM_V4_MODEL_TYPES = {"welmv4_moe"}
 _WELM_V4_ARCHITECTURES = {
     "WeLMV4MoeForCausalLM",

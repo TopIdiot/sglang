@@ -39,16 +39,76 @@ class CustomAllReduceV2:
         max_push_blocks: Optional[int] = None,
     ) -> None:
         _init_config()
-        self.disabled = True
-        full_nvlink = can_use_custom_all_reduce_with_nvlink(
-            group=group,
-            device=device,
-            supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
-            cls_name="CustomAllReduceV2",
-        )
-        if full_nvlink != True:
+        self._reset_initialization_state()
+        if not self.is_supported(group=group, device=device):
             return
 
+        self._prepare_local(
+            group=group,
+            max_pull_size=max_pull_size,
+            max_push_size=max_push_size,
+            max_pull_blocks=max_pull_blocks,
+            max_push_blocks=max_push_blocks,
+        )
+        try:
+            self.finalize()
+        except Exception:
+            self.abort()
+            raise
+
+    @classmethod
+    def create_deferred(
+        cls,
+        group: ProcessGroup,
+        device: torch.device,
+        max_pull_size: Optional[int] = None,
+        max_push_size: Optional[int] = None,
+        max_pull_blocks: Optional[int] = None,
+        max_push_blocks: Optional[int] = None,
+    ) -> "CustomAllReduceV2":
+        """Allocate local state without exchanging IPC handles."""
+
+        _init_config()
+        communicator = cls.__new__(cls)
+        communicator._reset_initialization_state()
+        communicator._prepare_local(
+            group=group,
+            max_pull_size=max_pull_size,
+            max_push_size=max_push_size,
+            max_pull_blocks=max_pull_blocks,
+            max_push_blocks=max_push_blocks,
+        )
+        return communicator
+
+    @staticmethod
+    def is_supported(group: ProcessGroup, device: torch.device) -> bool:
+        _init_config()
+        return (
+            can_use_custom_all_reduce_with_nvlink(
+                group=group,
+                device=device,
+                supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
+                cls_name="CustomAllReduceV2",
+            )
+            is True
+        )
+
+    def _reset_initialization_state(self) -> None:
+        self.disabled = True
+        self._local_ready = False
+        self._finalized = False
+        self._aborted = False
+        self._storage_handle = None
+
+    def _prepare_local(
+        self,
+        *,
+        group: ProcessGroup,
+        max_pull_size: Optional[int],
+        max_push_size: Optional[int],
+        max_pull_blocks: Optional[int],
+        max_push_blocks: Optional[int],
+    ) -> None:
         self.group = group
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
@@ -62,18 +122,59 @@ class CustomAllReduceV2:
         self.max_size = max(max_pull_size, max_push_size)
         self.override_shot(None)  # set default config based on world size
         self.override_algo: Optional[AllReduceAlgo] = None
-        self.obj = get_custom_all_reduce_cls()(
-            rank=self.rank,
-            world_size=self.world_size,
-            pull_buffer_bytes=self.max_pull_size,
-            push_buffer_bytes=self.max_push_size,
-            graph_input_count=131072,
-            max_pull_blocks=max_pull_blocks,
-            max_push_blocks=max_push_blocks,
-        )
-        self._post_init_obj()
+        try:
+            self.obj = get_custom_all_reduce_cls()(
+                rank=self.rank,
+                world_size=self.world_size,
+                pull_buffer_bytes=self.max_pull_size,
+                push_buffer_bytes=self.max_push_size,
+                graph_input_count=131072,
+                max_pull_blocks=max_pull_blocks,
+                max_push_blocks=max_push_blocks,
+            )
+            self._storage_handle = self.obj.share_storage()
+            self._local_ready = True
+        except Exception:
+            self.abort()
+            raise
+
+    def finalize(self) -> None:
+        """Exchange prepared IPC handles and enable the communicator."""
+
+        if self._aborted:
+            raise RuntimeError("cannot finalize an aborted CustomAllReduceV2")
+        if self._finalized:
+            return
+        if not self._local_ready:
+            raise RuntimeError("CustomAllReduceV2 has no prepared local storage")
+        result = self._share_list([self._storage_handle])
+        if not all(len(handles) == 1 for handles in result):
+            raise RuntimeError("CustomAllReduceV2 received malformed IPC handles")
+        self.obj.post_init([handles[0] for handles in result])
+        self._finalized = True
         self.disabled = False
         log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
+
+    def abort(self) -> None:
+        """Release partially initialized state without entering a collective."""
+
+        if self._aborted:
+            return
+        self._aborted = True
+        self.disabled = True
+        obj = getattr(self, "obj", None)
+        if obj is None:
+            return
+        try:
+            try:
+                obj.free_ipc_handles()
+            finally:
+                obj.free_storage()
+        finally:
+            self.obj = None
+            self._storage_handle = None
+            self._local_ready = False
+            self._finalized = False
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -154,13 +255,6 @@ class CustomAllReduceV2:
             return AllReduceAlgo.ONE_SHOT_PULL
         else:
             return AllReduceAlgo.TWO_SHOT_PULL
-
-    def _post_init_obj(self):
-        handles = [self.obj.share_storage()]
-        result = self._share_list(handles)
-        assert all(len(r) == 1 for r in result)
-        result = [h[0] for h in result]
-        self.obj.post_init(result)
 
     def _share_list(self, input: List[T]) -> List[List[T]]:
         input_tensor = torch.tensor(input, dtype=torch.int64, device="cpu")

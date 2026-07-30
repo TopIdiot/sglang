@@ -95,6 +95,7 @@ class PrefillCPLayerCommunicator:
         attn_tp_group=None,
         global_tp_group=None,
         use_ep_dispatch: bool | None = None,
+        fused_attntp2_norm_runner=None,
     ):
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
@@ -110,6 +111,7 @@ class PrefillCPLayerCommunicator:
             if use_ep_dispatch is None
             else bool(use_ep_dispatch)
         )
+        self.fused_attntp2_norm_runner = fused_attntp2_norm_runner
 
     def _counts(self, layout) -> tuple[int, ...]:
         counts = tuple(int(count) for count in layout.active_tokens_per_cp_rank())
@@ -313,6 +315,46 @@ class PrefillCPLayerCommunicator:
         else:
             normalized, residual = self.post_attention_layernorm(
                 hidden_states, residual
+            )
+        if self.use_ep_dispatch:
+            return self.scatter_ep_input(normalized, layout), residual
+        return self.gather_global_tp_input(normalized, layout), residual
+
+    def prepare_mlp_fused_attntp2(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch,
+        *,
+        o_norm,
+    ):
+        runner = self.fused_attntp2_norm_runner
+        if runner is None:
+            raise RuntimeError(
+                "Prefill CP AttnTP2 fused IPC norm runner is unavailable"
+            )
+
+        layout = self._layout_from_batch(forward_batch)
+        self._validate_topology(layout)
+        self._validate_rows(
+            hidden_states, layout.active_local_tokens, "attention partial"
+        )
+        self._validate_rows(
+            residual, layout.active_local_tokens, "attention residual"
+        )
+        if hidden_states.shape[0] == 0:
+            normalized = hidden_states
+        else:
+            normalized, residual, _ = runner.forward_prefill_cp(
+                hidden_states,
+                residual,
+                o_norm.weight,
+                self.post_attention_layernorm.weight,
+                o_norm.eps,
+                self.post_attention_layernorm.eps,
+                lane_rotation=(
+                    layout.spec.owner_rotation % self.attn_tp_group.world_size
+                ),
             )
         if self.use_ep_dispatch:
             return self.scatter_ep_input(normalized, layout), residual

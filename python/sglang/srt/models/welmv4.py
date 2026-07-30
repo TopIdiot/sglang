@@ -34,6 +34,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.context_parallel import contract_cp_prefill_runtime_to_last_q
 from sglang.srt.distributed import (
     divide,
+    get_attn_tp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -47,6 +48,9 @@ from sglang.srt.environ import Envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attntp_fused_norm import (
+    get_or_create_attntp_fused_norm_manager,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -91,6 +95,9 @@ from sglang.srt.layers.moe.mk_moe_router import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.prefill_cp_logits import route_cp_prefill_hidden_states
+from sglang.srt.layers.attntp_fused_norm import (
+    get_prefill_cp_attntp_fused_norm_manager,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
@@ -121,6 +128,7 @@ from sglang.srt.layers.welmv4_op import (
 from sglang.srt.model_executor.forward_batch_context import get_current_forward_batch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
     WelmDeferredPrefillCompletion,
 )
@@ -133,7 +141,10 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
     welm_embeddings,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import (
+    MAX_AUTO_RUNNING_REQUESTS,
+    get_global_server_args,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -148,6 +159,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
+_WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED = False
 
 
 def _select_welm_router_linear_mode(
@@ -1031,11 +1043,20 @@ def _welm_should_use_mmq_norm_after_attn(
         and use_o_norm
         and not o_norm_needs_attn_tp_reduce
     )
-    if not use_fused_norm or not use_prefill_cp_communicator:
-        return use_fused_norm
+    if not use_fused_norm:
+        return False
+    if not use_prefill_cp_communicator:
+        return True
 
+    fused_cp_enabled = bool(
+        getattr(
+            get_global_server_args(),
+            "_enable_attntp_fused_norm",
+            False,
+        )
+    )
     global _WELM_CP_FUSED_NORM_FALLBACK_WARNED
-    if not _WELM_CP_FUSED_NORM_FALLBACK_WARNED:
+    if not fused_cp_enabled and not _WELM_CP_FUSED_NORM_FALLBACK_WARNED:
         logger.warning(
             "WeLM Phase 2 prefill CP is falling back to the unfused norm path "
             "because mmq_style_norm_after_attn does not support the CP-local "
@@ -1043,6 +1064,310 @@ def _welm_should_use_mmq_norm_after_attn(
         )
         _WELM_CP_FUSED_NORM_FALLBACK_WARNED = True
     return False
+
+
+def _welm_should_use_prefill_cp_attntp2_fused_norm(
+    *,
+    use_previous_precision: bool,
+    residual_after_layernorm: bool,
+    use_o_norm: bool,
+    o_norm_needs_attn_tp_reduce: bool,
+    use_prefill_cp_communicator: bool,
+    attention,
+    hidden_size: int,
+) -> bool:
+    if (
+        use_previous_precision
+        or not residual_after_layernorm
+        or not use_o_norm
+        or o_norm_needs_attn_tp_reduce
+        or not use_prefill_cp_communicator
+        or hidden_size != 2048
+    ):
+        return False
+    server_args = get_global_server_args()
+    if not bool(getattr(server_args, "_enable_attntp_fused_norm", False)):
+        return False
+    o_proj = attention.o_proj
+    return (
+        attention.attn_tp_size == 2
+        and o_proj.reduce_results
+        and o_proj.use_attention_tp_reduce
+        and not attention.o_proj_suffix_parallel_reduce
+    )
+
+
+def _welm_validate_attntp_fused_norm_speculation(server_args) -> None:
+    speculative_topk = int(getattr(server_args, "speculative_eagle_topk", None) or 1)
+    if speculative_topk > 1:
+        raise NotImplementedError(
+            "WeLM AttnTP fused norm currently requires "
+            "speculative_eagle_topk=1; "
+            f"got speculative_eagle_topk={speculative_topk}"
+        )
+
+
+def _welm_validate_attntp_fused_norm_dtype(model_dtype: torch.dtype) -> None:
+    if model_dtype is not torch.bfloat16:
+        raise NotImplementedError(
+            "WeLM AttnTP fused norm currently requires BF16 model activations "
+            f"and norm weights; got {model_dtype}"
+        )
+
+
+def _welm_create_prefill_cp_attntp2_fused_norm_runner(
+    *,
+    attention,
+    hidden_size: int,
+    residual_after_layernorm: bool,
+    model_dtype: torch.dtype = torch.bfloat16,
+):
+    server_args = get_global_server_args()
+    if (
+        not bool(getattr(server_args, "_enable_attntp_fused_norm", False))
+        or not server_args.enable_prefill_context_parallel
+        or server_args.attn_cp_mode != "sharded-kv"
+        or server_args.disaggregation_mode == "decode"
+        or not _welm_should_use_prefill_cp_attntp2_fused_norm(
+            use_previous_precision=welm_use_previous_precision(),
+            residual_after_layernorm=residual_after_layernorm,
+            use_o_norm=attention.use_o_norm,
+            o_norm_needs_attn_tp_reduce=attention.o_norm_needs_attn_tp_reduce,
+            use_prefill_cp_communicator=True,
+            attention=attention,
+            hidden_size=hidden_size,
+        )
+    ):
+        return None
+
+    _welm_validate_attntp_fused_norm_dtype(model_dtype)
+    _welm_validate_attntp_fused_norm_speculation(server_args)
+    max_global_tokens = int(server_args.max_prefill_tokens)
+    chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
+    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+        max_global_tokens = max(max_global_tokens, int(chunked_prefill_size))
+    return get_prefill_cp_attntp_fused_norm_manager(
+        group=get_attn_tp_group(),
+        max_global_tokens=max_global_tokens,
+        cp_size=server_args.attn_cp_size,
+        page_size=server_args.page_size,
+        hidden_size=hidden_size,
+    )
+
+
+def _welm_create_tp_dp_attntp_fused_norm_managers(
+    *,
+    attention,
+    hidden_size: int,
+    residual_after_layernorm: bool,
+    model_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, object]:
+    server_args = get_global_server_args()
+    if (
+        not bool(getattr(server_args, "_enable_attntp_fused_norm", False))
+        or welm_use_previous_precision()
+        or not residual_after_layernorm
+        or not attention.use_o_norm
+        or hidden_size not in (2048, 4096)
+        or attention.attn_tp_size <= 1
+        or attention.o_proj_suffix_parallel_reduce
+        or (
+            server_args.enable_prefill_context_parallel
+            and server_args.attn_cp_mode == "sharded-kv"
+        )
+    ):
+        return {}
+
+    _welm_validate_attntp_fused_norm_dtype(model_dtype)
+    _welm_validate_attntp_fused_norm_speculation(server_args)
+    dp_enabled = is_dp_attention_enabled()
+    if dp_enabled:
+        if (
+            attention.o_proj.reduce_results
+            or not attention.o_norm_needs_attn_tp_reduce
+        ):
+            return {}
+        topology = "dp"
+    else:
+        if (
+            not attention.o_proj.reduce_results
+            or attention.o_norm_needs_attn_tp_reduce
+        ):
+            return {}
+        topology = "tp"
+
+    group = get_attn_tp_group()
+    if attention.attn_tp_size != group.world_size:
+        raise RuntimeError(
+            "WeLM AttnTP fused norm attention/group size mismatch: "
+            f"{attention.attn_tp_size} != {group.world_size}"
+        )
+    role = server_args.disaggregation_mode
+    if role == "prefill":
+        phases = ("prefill",)
+    elif role == "decode":
+        phases = ("decode",)
+    elif role == "null":
+        phases = ("prefill", "decode")
+    else:
+        raise RuntimeError(f"Unsupported disaggregation mode for fused norm: {role}")
+
+    configured_max_requests = server_args.max_running_requests
+    if configured_max_requests is None:
+        scheduler_batch_capacity = MAX_AUTO_RUNNING_REQUESTS
+    else:
+        dp_divisor = (
+            max(1, int(getattr(server_args, "dp_size", 1))) if dp_enabled else 1
+        )
+        scheduler_batch_capacity = max(
+            1,
+            int(configured_max_requests) // dp_divisor,
+        )
+    decode_batch_capacity = max(
+        scheduler_batch_capacity,
+        int(server_args.cuda_graph_max_bs or 0),
+    )
+    decode_query_capacity = max(
+        1,
+        int(server_args.speculative_num_draft_tokens or 1),
+        int(getattr(attention, "scale_seq_times", 0) or 0) + 1,
+    )
+    max_rows = {
+        "prefill": int(server_args.max_prefill_tokens),
+        "decode": decode_batch_capacity * decode_query_capacity,
+    }
+    if topology == "tp":
+        max_rows["prefill"] = min(
+            max_rows["prefill"],
+            int(
+                getattr(
+                    server_args,
+                    "_attntp_fused_norm_prefill_max_rows",
+                    4096,
+                )
+            ),
+        )
+    if any(max_rows[phase] <= 0 for phase in phases):
+        raise RuntimeError(
+            "WeLM AttnTP fused norm requires positive phase row capacity"
+        )
+    return {
+        phase: get_or_create_attntp_fused_norm_manager(
+            group=group,
+            phase=phase,
+            topology=topology,
+            hidden_size=hidden_size,
+            max_rows=max_rows[phase],
+        )
+        for phase in phases
+    }
+
+
+def _welm_attntp_fused_norm_phase(forward_batch: ForwardBatch) -> str:
+    forward_mode = forward_batch.forward_mode
+    if getattr(forward_batch, "welm_mtp_variable_decode_extend", False):
+        if forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE):
+            raise RuntimeError(
+                "WeLM MTP variable decode extend has incompatible forward mode "
+                f"{forward_mode!r}"
+            )
+        return "decode"
+    if forward_mode in (
+        ForwardMode.DECODE,
+        ForwardMode.IDLE,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND,
+        ForwardMode.DRAFT_EXTEND_V2,
+    ):
+        return "decode"
+    if forward_mode in (
+        ForwardMode.EXTEND,
+        ForwardMode.MIXED,
+        ForwardMode.SPLIT_PREFILL,
+        ForwardMode.DLLM_EXTEND,
+    ):
+        return "prefill"
+    raise RuntimeError(
+        f"WeLM AttnTP fused norm does not support forward mode {forward_mode!r}"
+    )
+
+
+def _welm_select_tp_dp_attntp_fused_norm_manager(
+    layer,
+    forward_batch: ForwardBatch,
+    *,
+    use_prefill_cp_communicator: bool,
+):
+    managers = getattr(layer, "tp_dp_attntp_fused_norm_managers", {})
+    if not managers:
+        return None
+    if use_prefill_cp_communicator:
+        raise RuntimeError(
+            "TP/DP AttnTP fused norm cannot run through the Prefill CP communicator"
+        )
+
+    unexpected_phases = set(managers) - {"prefill", "decode"}
+    if unexpected_phases or len(managers) > 2:
+        raise RuntimeError(
+            "WeLM AttnTP fused norm manager set is malformed: "
+            f"{tuple(sorted(managers))}"
+        )
+    # A DP worker can be locally idle while its role has only one global phase.
+    if (
+        forward_batch.forward_mode == ForwardMode.IDLE
+        and len(managers) == 1
+        and not getattr(
+            forward_batch,
+            "welm_mtp_variable_decode_extend",
+            False,
+        )
+    ):
+        phase = next(iter(managers))
+    else:
+        phase = _welm_attntp_fused_norm_phase(forward_batch)
+    try:
+        manager = managers[phase]
+    except KeyError as error:
+        raise RuntimeError(
+            f"WeLM AttnTP fused norm has no {phase} manager for this worker"
+        ) from error
+
+    topology = "dp" if is_dp_attention_enabled() else "tp"
+    if phase == "prefill" and topology == "tp":
+        if forward_batch.extend_num_tokens is None:
+            raise RuntimeError(
+                "WeLM TP AttnTP fused norm prefill workload is missing "
+                "extend_num_tokens"
+            )
+        if forward_batch.extend_num_tokens > manager.max_rows:
+            global _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED
+            if not _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED:
+                logger.warning(
+                    "WeLM TP AttnTP fused norm is using the unfused path because "
+                    "the prefill row count %d exceeds the configured capacity %d",
+                    forward_batch.extend_num_tokens,
+                    manager.max_rows,
+                )
+                _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED = True
+            return None
+    expected = (
+        phase,
+        topology,
+        layer.self_attn.attn_tp_size,
+        layer.hidden_size,
+    )
+    actual = (
+        manager.phase,
+        manager.topology,
+        manager.attn_tp_size,
+        manager.hidden_size,
+    )
+    if actual != expected:
+        raise RuntimeError(
+            "WeLM AttnTP fused norm manager does not match the active path: "
+            f"expected={expected}, actual={actual}"
+        )
+    return manager
 
 
 def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
@@ -3513,6 +3838,7 @@ class Qwen2MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
         kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
         skip_o_norm: bool = False,
+        skip_o_proj_reduce: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _WELM_DUMP_ENABLED and _welm_should_dump_layer(self.layer_idx)
         mtp_dump_attention_io = _WELM_MTP_DUMP_ENABLED and self.is_nextn
@@ -3763,7 +4089,10 @@ class Qwen2MoeAttention(nn.Module):
         if attn_output.shape[0] == 0 and not needs_empty_dp_collectives:
             output = hidden_states.new_empty((0, self.hidden_size))
         else:
-            output, _ = self.o_proj(attn_output)
+            output, _ = self.o_proj(
+                attn_output,
+                skip_all_reduce=skip_o_proj_reduce,
+            )
             if self.o_proj_suffix_parallel_reduce and (
                 output.shape[0] != 0 or needs_empty_dp_collectives
             ):
@@ -3971,9 +4300,28 @@ class Qwen2MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
+        residual_after_layernorm = (
+            self.ppln and self.config_layer_id not in self.prenorm_layer_idx
+        )
         self.prefill_cp_communicator = PrefillCPLayerCommunicator(
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            fused_attntp2_norm_runner=(
+                _welm_create_prefill_cp_attntp2_fused_norm_runner(
+                    attention=self.self_attn,
+                    hidden_size=self.hidden_size,
+                    residual_after_layernorm=residual_after_layernorm,
+                    model_dtype=self.input_layernorm.weight.dtype,
+                )
+            ),
+        )
+        self.tp_dp_attntp_fused_norm_managers = (
+            _welm_create_tp_dp_attntp_fused_norm_managers(
+                attention=self.self_attn,
+                hidden_size=self.hidden_size,
+                residual_after_layernorm=residual_after_layernorm,
+                model_dtype=self.input_layernorm.weight.dtype,
+            )
         )
         self._prefill_cp_mlp_validated = False
 
@@ -3990,6 +4338,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_previous_precision = welm_use_previous_precision()
         layer_communicator, use_prefill_cp_communicator = (
             _welm_select_layer_communicator(self, forward_batch)
+        )
+        tp_dp_attntp_fused_norm_manager = (
+            _welm_select_tp_dp_attntp_fused_norm_manager(
+                self,
+                forward_batch,
+                use_prefill_cp_communicator=use_prefill_cp_communicator,
+            )
+        )
+        use_tp_dp_attntp_fused_norm = (
+            tp_dp_attntp_fused_norm_manager is not None
         )
         if use_prefill_cp_communicator and not self._prefill_cp_mlp_validated:
             layer_communicator.validate_mlp(self.mlp)
@@ -4085,6 +4443,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.self_attn.o_norm_needs_attn_tp_reduce
             ),
             use_prefill_cp_communicator=use_prefill_cp_communicator,
+        ) and not use_tp_dp_attntp_fused_norm
+        use_prefill_cp_attntp2_fused_norm = (
+            _welm_should_use_prefill_cp_attntp2_fused_norm(
+                use_previous_precision=use_previous_precision,
+                residual_after_layernorm=residual_after_layernorm,
+                use_o_norm=self.self_attn.use_o_norm,
+                o_norm_needs_attn_tp_reduce=(
+                    self.self_attn.o_norm_needs_attn_tp_reduce
+                ),
+                use_prefill_cp_communicator=use_prefill_cp_communicator,
+                attention=self.self_attn,
+                hidden_size=self.hidden_size,
+            )
         )
         needs_empty_dp_collectives = _welm_needs_empty_dp_collectives(
             forward_batch,
@@ -4107,7 +4478,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 kv_mirror_states=kv_mirror_states,
-                skip_o_norm=use_mmq_norm_after_attn,
+                skip_o_norm=(
+                    use_mmq_norm_after_attn
+                    or use_prefill_cp_attntp2_fused_norm
+                    or use_tp_dp_attntp_fused_norm
+                ),
+                skip_o_proj_reduce=(
+                    use_prefill_cp_attntp2_fused_norm
+                    or use_tp_dp_attntp_fused_norm
+                ),
             )
         if (
             _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
@@ -4129,7 +4508,69 @@ class Qwen2MoeDecoderLayer(nn.Module):
         ):
             residual = _welm_align_kv_mirror_residual_rows(residual, forward_batch)
 
-        if use_mmq_norm_after_attn:
+        if use_prefill_cp_attntp2_fused_norm:
+            if residual is None:
+                raise RuntimeError(
+                    "WeLMV4 Prefill CP fused norm requires a residual tensor"
+                )
+            if hidden_states.shape != residual.shape:
+                raise RuntimeError(
+                    "WeLMV4 Prefill CP fused norm-after-attn shape mismatch: "
+                    f"layer_id={self.layer_id}, "
+                    f"hidden_states.shape={tuple(hidden_states.shape)}, "
+                    f"residual.shape={tuple(residual.shape)}"
+                )
+            hidden_states, residual = (
+                layer_communicator.prepare_mlp_fused_attntp2(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    o_norm=self.self_attn.o_norm,
+                )
+            )
+            hidden_states_fp32 = (
+                hidden_states.to(torch.float32) if dump_this_layer else None
+            )
+        elif use_tp_dp_attntp_fused_norm:
+            if residual is None:
+                raise RuntimeError(
+                    "WeLMV4 AttnTP fused norm requires a residual tensor"
+                )
+            if hidden_states.shape != residual.shape:
+                raise RuntimeError(
+                    "WeLMV4 AttnTP fused norm-after-attn shape mismatch: "
+                    f"layer_id={self.layer_id}, "
+                    f"hidden_states.shape={tuple(hidden_states.shape)}, "
+                    f"residual.shape={tuple(residual.shape)}"
+                )
+            execution = (
+                "graph"
+                if tp_dp_attntp_fused_norm_manager.phase == "decode"
+                else "eager"
+            )
+            hidden_states, residual, _ = (
+                tp_dp_attntp_fused_norm_manager.forward(
+                    hidden_states,
+                    residual,
+                    self.self_attn.o_norm.weight,
+                    self.post_attention_layernorm.weight,
+                    self.self_attn.o_norm.eps,
+                    self.post_attention_layernorm.eps,
+                    execution=execution,
+                )
+            )
+            if use_dp_layer_communicator:
+                hidden_states, residual = (
+                    layer_communicator.prepare_mlp_from_fused_attntp(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                    )
+                )
+            hidden_states_fp32 = (
+                hidden_states.to(torch.float32) if dump_this_layer else None
+            )
+        elif use_mmq_norm_after_attn:
             if hidden_states.shape != residual.shape:
                 active_indices = getattr(
                     forward_batch, "kv_mirror_active_batch_indices", None

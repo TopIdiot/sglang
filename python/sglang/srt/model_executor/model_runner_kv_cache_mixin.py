@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.swa_memory_pool import (
     SuffixKVPool,
     SuffixTokenToKVPoolAllocator,
 )
+from sglang.srt.server_args import MAX_AUTO_RUNNING_REQUESTS
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -972,7 +973,7 @@ class ModelRunnerKVCacheMixin:
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
+        estimated = max(min(estimated, MAX_AUTO_RUNNING_REQUESTS), 2048)
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
@@ -1057,6 +1058,7 @@ class ModelRunnerKVCacheMixin:
                 self.memory_pool_config is not None
             ), "Draft worker requires memory_pool_config"
         else:
+            self.prepare_attntp_fused_norm_before_kv_pool()
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
             )

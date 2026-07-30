@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_cp_rank,
@@ -698,6 +699,31 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+        )
+
+    def prepare_mlp_from_fused_attntp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_mode = self.layer_scatter_modes.mlp_mode
+        if output_mode == ScatterMode.FULL:
+            if self._context.attn_dp_size == 1:
+                return hidden_states, residual
+            global_hidden = get_global_dp_buffer(get_tp_group())
+            dp_gather_replicate(global_hidden, hidden_states, forward_batch)
+            return global_hidden, residual
+        if output_mode == ScatterMode.SCATTERED:
+            rank = self._context.attn_tp_rank
+            size = self._context.attn_tp_size
+            return (
+                hidden_states.tensor_split(size)[rank],
+                residual.tensor_split(size)[rank],
+            )
+        raise RuntimeError(
+            "Fused AttnTP norm cannot prepare MLP input for "
+            f"{output_mode.name}"
         )
 
     def postprocess_layer(

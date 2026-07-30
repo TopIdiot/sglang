@@ -514,6 +514,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # FIXME: hacky set `use_mla_backend`
         global_server_args.use_mla_backend = self.use_mla_backend
+        self.enable_attntp_fused_norm = envs.SGLANG_ENABLE_ATTNTP_FUSED_NORM.get()
+        global_server_args._enable_attntp_fused_norm = self.enable_attntp_fused_norm
+        self.attntp_fused_norm_prefill_max_rows = (
+            envs.SGLANG_ATTNTP_FUSED_NORM_PREFILL_MAX_ROWS.get()
+        )
+        if (
+            self.enable_attntp_fused_norm
+            and self.attntp_fused_norm_prefill_max_rows <= 0
+        ):
+            raise ValueError(
+                "SGLANG_ATTNTP_FUSED_NORM_PREFILL_MAX_ROWS must be positive"
+            )
+        global_server_args._attntp_fused_norm_prefill_max_rows = (
+            self.attntp_fused_norm_prefill_max_rows
+        )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -2518,6 +2533,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(max_bs={max_bs}, max_loras={max_loras})"
                 )
                 break
+
+    def prepare_attntp_fused_norm_before_kv_pool(self):
+        if not self.enable_attntp_fused_norm:
+            return None
+
+        from sglang.srt.layers.attntp_fused_norm import (
+            prepare_attntp_fused_norm_before_kv_pool,
+        )
+
+        before_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            empty_cache=False,
+        )
+        prepared = None
+        try:
+            prepared = prepare_attntp_fused_norm_before_kv_pool(self)
+            return prepared
+        finally:
+            torch.cuda.synchronize(self.device)
+            gc.collect()
+            torch.cuda.empty_cache()
+            if prepared is not None:
+                after_memory = get_available_gpu_memory(
+                    self.device,
+                    self.gpu_id,
+                    empty_cache=False,
+                )
+                logger.info(
+                    "AttnTP fused norm autotune completed before KV pool "
+                    "sizing. avail mem before=%.2f GB, after cleanup=%.2f GB",
+                    before_memory,
+                    after_memory,
+                )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
