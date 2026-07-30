@@ -8,12 +8,66 @@ Covers all usage patterns found in welmv4.py:
 """
 
 import itertools
+import os
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.welmv4_op import WelmV4FusedRMSNorm
+from sglang.srt.layers.welmv4_op import (
+    WELM_QKV_DIRECT_MAX_ROWS,
+    WelmV4FusedRMSNorm,
+    welm_rmsnorm_use_pdl,
+)
+
+
+class TestWelmRMSNormPDLDispatch(unittest.TestCase):
+    _FEATURE_ON = {
+        "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "1",
+        "SGLANG_WELM_RMSNORM_PDL": "1",
+    }
+
+    def test_large_m_boundary_tracks_mk(self):
+        if WELM_QKV_DIRECT_MAX_ROWS is None:
+            self.skipTest("matching MK route metadata is unavailable")
+        with mock.patch.dict(os.environ, self._FEATURE_ON):
+            self.assertFalse(welm_rmsnorm_use_pdl(WELM_QKV_DIRECT_MAX_ROWS))
+            self.assertTrue(welm_rmsnorm_use_pdl(WELM_QKV_DIRECT_MAX_ROWS + 1))
+
+    def test_kill_switch_disables_both_routes(self):
+        large_rows = (
+            WELM_QKV_DIRECT_MAX_ROWS + 1
+            if WELM_QKV_DIRECT_MAX_ROWS is not None
+            else 16384
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "1",
+                "SGLANG_WELM_RMSNORM_PDL": "0",
+            },
+        ):
+            self.assertFalse(welm_rmsnorm_use_pdl(1))
+            self.assertFalse(welm_rmsnorm_use_pdl(large_rows))
+
+    def test_feature_gate_disables_pdl(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "0",
+                "SGLANG_WELM_RMSNORM_PDL": "1",
+            },
+        ):
+            self.assertFalse(welm_rmsnorm_use_pdl(1))
+            self.assertFalse(welm_rmsnorm_use_pdl(16384))
+
+    def test_missing_mk_metadata_disables_only_large_m_pdl(self):
+        with mock.patch.dict(os.environ, self._FEATURE_ON), mock.patch(
+            "sglang.srt.layers.welmv4_op.WELM_QKV_DIRECT_MAX_ROWS", None
+        ):
+            self.assertTrue(welm_rmsnorm_use_pdl(1))
+            self.assertFalse(welm_rmsnorm_use_pdl(16384))
 
 
 class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):

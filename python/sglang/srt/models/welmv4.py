@@ -141,6 +141,9 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
     welm_embeddings,
 )
+from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
+    welm_v45_80a3_fused_pre_attn_enabled,
+)
 from sglang.srt.server_args import (
     MAX_AUTO_RUNNING_REQUESTS,
     get_global_server_args,
@@ -160,6 +163,19 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
 _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED = False
+
+
+if welm_v45_80a3_fused_pre_attn_enabled():
+    from sglang.srt.models.welm_v45_80a3_fused_pre_attn import (
+        WeLMV45_80A3FusedPreAttnMixin,
+    )
+else:
+
+    class WeLMV45_80A3FusedPreAttnMixin:
+        """No-op base used when the optional fused pre-attention is disabled."""
+
+        def _try_mk_fused_qkv_knorm_rope_kv_write(self, *args, **kwargs):
+            return None
 
 
 def _select_welm_router_linear_mode(
@@ -3508,7 +3524,7 @@ def _welm_finalize_deferred_target_kv(
         finalizer(positions, *mirror_kv, forward_batch)
 
 
-class Qwen2MoeAttention(nn.Module):
+class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
     @staticmethod
     def _normalize_sliding_window_size(config: PretrainedConfig, window) -> int:
         if window is None:
@@ -3593,6 +3609,22 @@ class Qwen2MoeAttention(nn.Module):
         self.only_k_norm = k_norm
         self.use_o_norm = o_norm
         self.total_layer_num = total_layer_num
+        # This MK kernel encodes the WeLM v4.5 80A3 head layout, K-only
+        # normalization, and partial-RoPE contract. Keep the model gate
+        # separate from the later tensor-shape checks so a lookalike model
+        # cannot opt in merely by presenting compatible local tensors.
+        self._welm_v45_80a3_fused_pre_attn_model_contract = (
+            getattr(config, "model_type", None) == "welmv4_moe"
+            and getattr(config, "num_experts", None) == 512
+            and hidden_size == 2048
+            and num_heads == 24
+            and num_kv_heads == 2
+            and head_dim == 256
+            and qk_rope_head_dim == 64
+            and k_norm
+            and not qk_norm
+            and total_layer_num == 48
+        )
         if self.use_o_norm:
             self.o_norm = (
                 RMSNorm(self.hidden_size)
@@ -3831,6 +3863,38 @@ class Qwen2MoeAttention(nn.Module):
             self.need_clear_kv_cache = self.layer_idx == total_layer_num - 1
         self.is_nextn = is_nextn
 
+    def _mk_is_standard_projection(self) -> bool:
+        return isinstance(self.qkv_proj, StandardQkvProjection)
+
+    def _mk_projection_kind(self) -> Optional[str]:
+        if isinstance(self.qkv_proj, StandardQkvProjection):
+            return "standard"
+        if isinstance(self.qkv_proj, ImitateQkvMultiBankKvProjection):
+            return "mirror_source"
+        if isinstance(self.qkv_proj, MirrorQProjection) and not self.is_nextn:
+            return "mirror_consumer"
+        return None
+
+    def _mk_mirror_source_keys(self) -> tuple[int, ...]:
+        if isinstance(self.qkv_proj, ImitateQkvMultiBankKvProjection):
+            return tuple(self.qkv_proj.mirror_layer_indices)
+        return ()
+
+    def _mk_mirror_consumer_key(self) -> Optional[int]:
+        if not isinstance(self.qkv_proj, MirrorQProjection):
+            return None
+        return (
+            self.qkv_proj.mirror_layer_idx
+            if self.qkv_proj.mirror_layer_idx is not None
+            else self.qkv_proj.imitated_layer_idx
+        )
+
+    def _mk_mirror_requires_projection_contract(self, forward_batch: Any) -> bool:
+        return _welm_should_contract_kv_mirror(forward_batch)
+
+    def _mk_graph_dump_enabled(self) -> bool:
+        return _WELM_GRAPH_DUMP_ENABLED
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3900,9 +3964,16 @@ class Qwen2MoeAttention(nn.Module):
             )
             self.attn(q, k, v, forward_batch, save_kv_cache=False)
             return hidden_states.new_empty((0, self.hidden_size))
-        q, k, v, hidden_states = self.qkv_proj.forward(
-            self, hidden_states, forward_batch, kv_mirror_states
+        fused_qkv = self._try_mk_fused_qkv_knorm_rope_kv_write(
+            positions, hidden_states, forward_batch, kv_mirror_states
         )
+        kv_cache_written = fused_qkv is not None
+        if fused_qkv is None:
+            q, k, v, hidden_states = self.qkv_proj.forward(
+                self, hidden_states, forward_batch, kv_mirror_states
+            )
+        else:
+            q, k, v = fused_qkv
         if self.deferred_target_kv_finalizers:
             _welm_finalize_deferred_target_kv(
                 self.deferred_target_kv_finalizers,
@@ -3945,7 +4016,7 @@ class Qwen2MoeAttention(nn.Module):
             )
             # for welmv4, qk_norm is false and only_k_norm is true
             # fuse: implement a high precision and fused k_norm
-            if self.qk_norm or self.only_k_norm:
+            if (self.qk_norm or self.only_k_norm) and not kv_cache_written:
                 if welm_use_previous_precision():
                     k_by_head = k.reshape(-1, self.head_dim)
                     k_by_head, _ = self.k_norm(k_by_head)
@@ -3967,7 +4038,7 @@ class Qwen2MoeAttention(nn.Module):
         rope_positions = _scale_rope_positions(positions)
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         k_for_rope = k
-        if qk_nope_head_dim > 0:
+        if not kv_cache_written and qk_nope_head_dim > 0:
             if (
                 _welm_should_contract_kv_mirror(forward_batch)
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
@@ -4040,7 +4111,7 @@ class Qwen2MoeAttention(nn.Module):
             q = q.view(q_shape)
             if has_kv:
                 k = k_for_rope.view(k_shape)
-        else:
+        elif not kv_cache_written:
             q, k_for_rope = self.rotary_emb(rope_positions, q, k_for_rope)
             if has_kv:
                 k = k_for_rope
@@ -4053,12 +4124,17 @@ class Qwen2MoeAttention(nn.Module):
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
         if not _welm_should_dispatch_attention(q.shape[0], forward_batch, False):
-            if has_kv:
+            if has_kv and not kv_cache_written:
                 _welm_write_kv_cache_only(self.attn, k, v, forward_batch)
             attn_output = q.new_empty((0, self.num_heads * self.head_dim))
         else:
             attn_output = self.attn(
-                q, k, v, forward_batch, save_kv_cache=has_kv, **attn_kwargs
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=has_kv and not kv_cache_written,
+                **attn_kwargs,
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)

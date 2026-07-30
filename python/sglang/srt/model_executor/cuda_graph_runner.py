@@ -1132,6 +1132,29 @@ class CudaGraphRunner:
         )
         self.buffers.share_buffers()
 
+        from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
+            welm_v45_80a3_fused_pre_attn_enabled,
+        )
+
+        welm_qkv_prepared = 0
+        if welm_v45_80a3_fused_pre_attn_enabled():
+            from sglang.srt.models.welm_v45_80a3_fused_pre_attn import (
+                prepare_welm_v45_80a3_fused_pre_attn_cuda_graphs,
+            )
+
+            welm_qkv_prepared = prepare_welm_v45_80a3_fused_pre_attn_cuda_graphs(
+                self.model_runner,
+                self.buffers,
+                self.capture_bs,
+                self.num_tokens_per_bs,
+            )
+        if welm_qkv_prepared:
+            logger.info(
+                "Prepared %d WeLM v4.5 80A3 fused pre-attention CUDA graph "
+                "handles.",
+                welm_qkv_prepared,
+            )
+
         # Build per-bucket Prepared mk handles BEFORE capture. mk's prepare
         # does symm-mem rendezvous + workspace allocation; both must happen
         # outside ``torch.cuda.graph(...)`` capture.

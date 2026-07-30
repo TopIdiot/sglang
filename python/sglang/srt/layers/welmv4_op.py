@@ -8,6 +8,23 @@ from torch import nn
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.rotary_embedding import FusedSetKVBufferArg, RotaryEmbedding
+from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
+    welm_v45_80a3_fused_pre_attn_enabled,
+)
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+if welm_v45_80a3_fused_pre_attn_enabled():
+    try:
+        from mk.kernels import WELM_QKV_DIRECT_MAX_ROWS
+    except (ImportError, AttributeError):
+        # MK is optional. Without a matching version, omit the large-M early
+        # release; this preserves correctness and only gives up PDL overlap.
+        WELM_QKV_DIRECT_MAX_ROWS = None
+else:
+    # Loading the WeLM model with the opt-in disabled must not import MK.
+    WELM_QKV_DIRECT_MAX_ROWS = None
 
 
 def welm_use_previous_precision() -> bool:
@@ -17,6 +34,26 @@ def welm_use_previous_precision() -> bool:
         "yes",
         "on",
     }
+
+
+def welm_enable_rmsnorm_pdl() -> bool:
+    # PDL pairing invariant: this RMSNorm must remain the immediately paired
+    # producer for the QKV grid. If an intervening kernel also opts into
+    # programmatic stream serialization, the dependency chain must be audited.
+    return welm_v45_80a3_fused_pre_attn_enabled() and (
+        os.getenv("SGLANG_WELM_RMSNORM_PDL", "1").strip().lower()
+        in _TRUE_VALUES
+    )
+
+
+def welm_rmsnorm_use_pdl(rows: int) -> bool:
+    return welm_enable_rmsnorm_pdl() and (
+        rows <= 32
+        or (
+            WELM_QKV_DIRECT_MAX_ROWS is not None
+            and rows > WELM_QKV_DIRECT_MAX_ROWS
+        )
+    )
 
 
 def _get_num_sms(multiplier: int = 1) -> int:
@@ -620,6 +657,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     NUM_SMS,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
     USE_PREVIOUS_PRECISION: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     row_start = tl.program_id(0)
     cols_off = tl.arange(0, BLOCK_SIZE)
@@ -648,6 +686,13 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
             )
 
         out = _do_rms_norm(h, gamma_shm, cols, eps, USE_PREVIOUS_PRECISION)
+        if USE_PDL:
+            # Signal on each program's final row, after all earlier rows have
+            # been stored and before the final output-store epilogue. The QKV
+            # grid can prefetch immutable weights, while its griddepcontrol.wait
+            # still protects the hidden-state TMA.
+            if row_id + NUM_SMS >= rows:
+                tl.extra.cuda.gdc_launch_dependents()
         if out_copy_ptr is not None:
             tl.store(out_copy_ptr + output_offs, out, mask=mask)
 
@@ -709,6 +754,9 @@ class WelmV4FusedRMSNorm(CustomOp):
 
         num_sms = min(rows, self.num_sms)
         block_size = triton.next_power_of_2(cols)
+        # Rows above MK's direct limit use the large-M PDL route. Importing the
+        # limit from MK keeps the producer trigger aligned with QKV dispatch.
+        use_pdl = welm_rmsnorm_use_pdl(rows)
         rms_norm_kernel[(num_sms,)](
             x,
             residual,
@@ -727,6 +775,7 @@ class WelmV4FusedRMSNorm(CustomOp):
             num_sms,
             block_size,
             use_previous_precision,
+            use_pdl,
         )
         if out_residual is None:
             out_residual = x
