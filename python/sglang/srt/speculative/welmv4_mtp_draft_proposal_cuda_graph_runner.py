@@ -2007,6 +2007,16 @@ class WelmMTPDraftProposalCudaGraphRunner:
             )
         cached_hash = getattr(forward_batch, "welm_oe_decode_hashed_inputs", None)
         if (
+            cached_hash is None
+            and raw_bs == 0
+            and buffers.welm_mtp_oe_hash_out is not None
+        ):
+            # Idle dp-attention cycles replay this graph for collective
+            # alignment without OE hashes (idle skips draft-extend hash prep).
+            # An empty view keeps the fused pack invariant and its kernel
+            # zero-fills every padding row's output hash.
+            cached_hash = buffers.welm_mtp_oe_hash_out[:, :0]
+        if (
             buffers.welm_mtp_oe_hash_out is not None
             and cached_hash is None
             and raw_bs > 0
