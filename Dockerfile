@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build -trimpath -ldflags="-s -w" -o /out/remote-exec .
 
-FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS sglang-runtime-base
 
 ARG PYTHON_VERSION=3.12
 ARG VENV_PATH=/envs/venv
@@ -45,8 +45,12 @@ ARG SGLANG_VERSION=0.0.0.dev0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=${VENV_PATH} \
-    PATH="${VENV_PATH}/bin:${PATH}" \
-    LD_LIBRARY_PATH="/usr/local/tccl/lib:/usr/local/cuda/lib64" \
+    CUDA_HOME=/usr/local/cuda \
+    NVSHMEM_DIR=/opt/nvshmem \
+    GDRCOPY_HOME=/opt/gdrcopy \
+    LIBRARY_PATH="/usr/local/cuda/lib64/stubs" \
+    PATH="${VENV_PATH}/bin:/opt/nvshmem/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/nvshmem/lib:/opt/gdrcopy/lib:/usr/local/tccl/lib:/usr/local/cuda/lib64" \
     NCCL_IB_TC=160 \
     NCCL_SOCKET_IFNAME=bond1 \
     NCCL_IB_HCA=mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7,mlx5_bond_8 \
@@ -55,7 +59,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NCCL_IB_TIMEOUT=22 \
     NCCL_IB_SL=3 \
     NCCL_IB_DISABLE=0 \
-    GLOO_SOCKET_IFNAME=bond1
+    GLOO_SOCKET_IFNAME=bond1 \
+    NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond1 \
+    NVSHMEM_HCA_LIST=mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1 \
+    NVSHMEM_IB_TRAFFIC_CLASS=160 \
+    NVSHMEM_TIMEOUT=600 \
+    DEEPEP_NUM_CPU_TIMEOUT_SECONDS=500 \
+    DEEPEP_NUM_GPU_TIMEOUT_CYCLES_IN_BILLIONS=1000 \
+    TRMT_LOG_ENABLE=false
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -231,6 +242,26 @@ RUN mkdir -p /src/tccl && cd /src/tccl && \
     test -s /usr/local/tccl/lib/plugin/libnccl-tuner-astralNet.so && \
     cd / && rm -rf /src/tccl
 
+FROM sglang-runtime-base AS deepep-v1-builder
+
+ARG DEEPEP_BUILD_JOBS=8
+
+COPY docker/build_internal_deepep_v1.sh /tmp/build_internal_deepep_v1.sh
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends libjemalloc-dev
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python "${VENV_PATH}/bin/python" setuptools wheel
+
+RUN CUDA_VISIBLE_DEVICES="" \
+    DEEPEP_BUILD_JOBS="${DEEPEP_BUILD_JOBS}" \
+    bash /tmp/build_internal_deepep_v1.sh
+
+FROM sglang-runtime-base AS final
+
 COPY 3rdparty/Mooncake /sgl-workspace/3rdparty/Mooncake
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -324,33 +355,95 @@ uv pip install --python "${VENV_PATH}/bin/python" \
     --force-reinstall
 BASH
 
-# DeepEP v1.2.1 is prebuilt for CPython 3.12, x86_64, CUDA 12, and SM90.
-# deep_ep declares no dependencies, so its NVSHMEM runtime must be installed
-# explicitly. The assertion below verifies that the wheel retains NVSHMEM
-# linkage required by the internode/low-latency kernels.
-RUN --mount=type=bind,source=3rdparty/deep_ep_wheel/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl,target=/tmp/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl \
+# DeepEP V1, NVSHMEM, and GDRCopy are built against this image's CUDA and
+# Torch in deepep-v1-builder. Only runtime artifacts enter the final image.
+COPY --from=deepep-v1-builder /opt/gdrcopy/ /opt/gdrcopy/
+COPY --from=deepep-v1-builder /opt/nvshmem/ /opt/nvshmem/
+
+RUN --mount=from=deepep-v1-builder,source=/opt/deepep-v1-wheel,target=/tmp/deepep_v1,ro \
     --mount=type=cache,target=/root/.cache/uv <<'BASH'
 set -euo pipefail
-DEEP_EP_WHEEL=/tmp/deep_ep-1.2.1-cp312-cp312-linux_x86_64.whl
-echo "28e6f24c2d9de18d3eb0640421d96ff8d1f8744830ee5ed83d3af0a6fdaf8bcb  ${DEEP_EP_WHEEL}" | sha256sum --check
+mapfile -t wheels < <(find /tmp/deepep_v1 -maxdepth 1 -type f -name 'deep_ep-*.whl' -print)
+if [[ ${#wheels[@]} -ne 1 ]]; then
+    echo "expected exactly one DeepEP V1 wheel, found ${#wheels[@]}" >&2
+    exit 1
+fi
 uv pip install --python "${VENV_PATH}/bin/python" \
-    nvidia-nvshmem-cu12==3.4.5 \
-    "${DEEP_EP_WHEEL}"
+    --no-deps --force-reinstall \
+    "concurrent-log-handler==0.9.25" \
+    "portalocker==3.1.1" \
+    "${wheels[0]}"
+ldconfig
+test -s /opt/nvshmem/lib/libnvshmem.a
+test -e /opt/nvshmem/lib/nvshmem_bootstrap_uid.so
+test -e /opt/nvshmem/lib/nvshmem_transport_ibgda.so
+test -s /opt/gdrcopy/lib/libgdrapi.so.2.4
+test -L /opt/gdrcopy/lib/libgdrapi.so.2
+test -L /opt/gdrcopy/lib/libgdrapi.so
+grep -q '^6b9163524793307d7b2ab914e9f7df42e0cd5fec$' /opt/nvshmem/git_commit.txt
 "${VENV_PATH}/bin/python" - <<'PY'
+import ctypes
+import inspect
+import os
 import pathlib
 import subprocess
 
 import deep_ep
 from deep_ep import Buffer  # noqa: F401
+from deep_ep.version import __version__, __version_suffix__
+
+if (__version__, __version_suffix__) != ("1.0.0", "R02C22"):
+    raise SystemExit(
+        f"unexpected internal DeepEP version: {__version__} {__version_suffix__}"
+    )
+if hasattr(deep_ep, "ElasticBuffer"):
+    raise SystemExit("expected DeepEP V1 API, found V2 ElasticBuffer")
+if "allow_mnnvl" not in inspect.signature(Buffer.__init__).parameters:
+    raise SystemExit("DeepEP Buffer is missing SGLang's required allow_mnnvl API")
+for method in ("dispatch", "combine", "low_latency_dispatch", "low_latency_combine"):
+    if not hasattr(Buffer, method):
+        raise SystemExit(f"DeepEP Buffer is missing required method: {method}")
 
 site = pathlib.Path(deep_ep.__file__).resolve().parent.parent
-so = next(site.glob("deep_ep_cpp*.so"))
-linked = subprocess.run(["ldd", str(so)], capture_output=True, text=True).stdout
-if "libnvshmem_host" not in linked:
-    raise SystemExit(
-        "deep_ep was built WITHOUT NVSHMEM (internode/low-latency disabled)"
-    )
-print(f"deep_ep={deep_ep.__version__ if hasattr(deep_ep, '__version__') else '1.2.1'}, nvshmem linkage OK")
+extension = next(site.glob("deep_ep_cpp*.so"))
+torch_lib = pathlib.Path(__import__("torch").__file__).resolve().parent / "lib"
+env = os.environ.copy()
+env["LD_LIBRARY_PATH"] = (
+    f"/opt/nvshmem/lib:/opt/gdrcopy/lib:{torch_lib}:"
+    f"{env.get('LD_LIBRARY_PATH', '')}"
+)
+linked = subprocess.run(
+    ["ldd", str(extension)], check=True, capture_output=True, text=True, env=env
+).stdout
+missing = [line.strip() for line in linked.splitlines() if "not found" in line]
+if missing:
+    raise SystemExit("unresolved DeepEP libraries:\n" + "\n".join(missing))
+
+for library in (
+    "/opt/nvshmem/lib/nvshmem_bootstrap_uid.so",
+    "/opt/nvshmem/lib/nvshmem_transport_ibgda.so",
+):
+    linked = subprocess.run(
+        ["ldd", library], check=True, capture_output=True, text=True, env=env
+    ).stdout
+    missing = [line.strip() for line in linked.splitlines() if "not found" in line]
+    if missing:
+        raise SystemExit(
+            f"unresolved NVSHMEM libraries for {library}:\n" + "\n".join(missing)
+        )
+
+# Loading the userspace library does not touch /dev/gdrdrv, so this remains a
+# CPU-only build check while proving NVSHMEM can resolve its runtime dlopen.
+ctypes.CDLL("libgdrapi.so.2")
+cubins = subprocess.run(
+    ["cuobjdump", "--list-elf", str(extension)],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout
+if ".sm_90.cubin" not in cubins:
+    raise SystemExit("DeepEP wheel does not contain an sm_90 cubin for H20")
+print(f"deep_ep={__version__} ({__version_suffix__}), nvshmem=/opt/nvshmem")
 PY
 BASH
 
@@ -449,6 +542,8 @@ import sys
 import sysconfig
 
 import deep_ep
+from deep_ep.version import __version__ as deep_ep_version
+from deep_ep.version import __version_suffix__ as deep_ep_version_suffix
 import deep_gemm
 import decord
 import sglang
@@ -478,7 +573,7 @@ print(f"torch={torch.__version__}, torch_cuda={torch.version.cuda}")
 print(f"cuda-python={cuda_python}")
 print(f"decord_module={decord.__file__}")
 print(f"deep_gemm={version('sgl-deep-gemm')}, deep_gemm_module={deep_gemm.__file__}")
-print(f"deep_ep={version('deep-ep')}, nvshmem={version('nvidia-nvshmem-cu12')}")
+print(f"deep_ep={deep_ep_version} ({deep_ep_version_suffix}), nvshmem=/opt/nvshmem")
 print(f"sglang_module={sglang.__file__}")
 PY
 
