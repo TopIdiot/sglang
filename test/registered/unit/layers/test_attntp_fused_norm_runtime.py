@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -362,6 +363,68 @@ def test_manager_resolves_covering_bucket_without_changing_replicated_rows() -> 
     assert output.shape == partial.shape
     assert residual_out.shape == residual.shape
     assert fp32_output is None
+
+
+def test_manager_logs_runtime_active_only_after_first_kernel_dispatch(caplog) -> None:
+    key_16 = _key(16)
+    winner_16 = _winner("ipc_source_push", 16)
+    registry = AttnTPFusedNormRegistry.build(
+        required_keys=(key_16,),
+        winners={key_16: winner_16},
+    )
+    raw_runner = _FakeIPCPrefillRunner(capacity=16)
+    prepared = PreparedAttnTPFusedNormRunner(
+        phase="prefill",
+        candidate=winner_16.candidate,
+        runner=raw_runner,
+        capacity=16,
+        topology="cp",
+    )
+    manager = AttnTPFusedNormManager(
+        phase="prefill",
+        topology="cp",
+        attn_tp_size=2,
+        hidden_size=2048,
+        max_rows=16,
+    )
+    manager.install(registry=registry, prepared={key_16: prepared})
+    caplog.set_level(
+        logging.INFO,
+        logger="sglang.srt.layers.attntp_fused_norm",
+    )
+
+    manager.forward_prefill_cp(
+        *_inputs(0),
+        1e-6,
+        1e-6,
+        execution="eager",
+        lane_rotation=0,
+    )
+    assert not any(
+        "ATTNTP_FUSED_NORM=1 ACTIVE" in message for message in caplog.messages
+    )
+
+    for _ in range(2):
+        manager.forward_prefill_cp(
+            *_inputs(5),
+            1e-6,
+            1e-6,
+            execution="eager",
+            lane_rotation=1,
+        )
+
+    active_messages = [
+        message
+        for message in caplog.messages
+        if "SGLANG_ENABLE_ATTNTP_FUSED_NORM=1 ACTIVE" in message
+    ]
+    assert len(active_messages) == 1
+    assert "unfused norm path bypassed" in active_messages[0]
+    assert "phase=prefill" in active_messages[0]
+    assert "topology=cp" in active_messages[0]
+    assert "family=ipc_source_push" in active_messages[0]
+    assert "rows=5" in active_messages[0]
+    assert raw_runner.calls == [(5, 5, 1), (5, 5, 1)]
 
 
 def test_decode_manager_chunks_rows_above_kernel_capacity() -> None:

@@ -27,6 +27,7 @@ _TOPOLOGIES = ("tp", "dp", "cp")
 _ARENA_FAMILIES = ("direct_symm", "tile_pipeline")
 _DIRECT_FAMILIES = ("ipc_owner_pull", "ipc_source_push", "local_fused")
 _PREFILL_CP_ATTNTP2_COMM_NAME = "prefill_cp_attntp2_fused_norm"
+_ENABLE_ENV = "SGLANG_ENABLE_ATTNTP_FUSED_NORM"
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,7 @@ class AttnTPFusedNormManager:
         self.resources: tuple[object, ...] = ()
         self.manifest_path: str | None = None
         self._closed = False
+        self._runtime_active_logged = False
 
     def install(
         self,
@@ -533,6 +535,35 @@ class AttnTPFusedNormManager:
             resource.close()
         self._closed = True
 
+    def _log_runtime_active_once(
+        self,
+        *,
+        rows: int,
+        execution: str,
+        runner: PreparedAttnTPFusedNormRunner,
+        row_bucket: int,
+        chunks: int,
+    ) -> None:
+        if self._runtime_active_logged:
+            return
+        self._runtime_active_logged = True
+        logger.info(
+            "%s=1 ACTIVE: fused AttnTP norm kernel successfully dispatched; "
+            "unfused norm path bypassed (phase=%s, topology=%s, execution=%s, "
+            "family=%s, rows=%d, row_bucket=%d, chunks=%d, attn_tp_size=%d, "
+            "hidden_size=%d)",
+            _ENABLE_ENV,
+            self.phase,
+            self.topology,
+            execution,
+            runner.candidate.family,
+            rows,
+            row_bucket,
+            chunks,
+            self.attn_tp_size,
+            self.hidden_size,
+        )
+
     def forward(
         self,
         partial: torch.Tensor,
@@ -629,6 +660,7 @@ class AttnTPFusedNormManager:
         if self.phase == "decode" and rows > prepared_capacity:
             output = torch.empty_like(partial, dtype=torch.bfloat16)
             residual_out = torch.empty_like(residual, dtype=torch.float32)
+            chunks = 0
             for start in range(0, rows, prepared_capacity):
                 end = min(start + prepared_capacity, rows)
                 chunk_rows = end - start
@@ -658,6 +690,14 @@ class AttnTPFusedNormManager:
                     post_norm_eps,
                     lane_rotation=None,
                 )
+                chunks += 1
+            self._log_runtime_active_once(
+                rows=rows,
+                execution=execution,
+                runner=runner,
+                row_bucket=key.row_bucket,
+                chunks=chunks,
+            )
             return output, residual_out, None
         key, _ = self.registry.resolve_runtime(
             phase=self.phase,
@@ -692,6 +732,13 @@ class AttnTPFusedNormManager:
                 o_norm_eps,
                 post_norm_eps,
             )
+        self._log_runtime_active_once(
+            rows=rows,
+            execution=execution,
+            runner=runner,
+            row_bucket=key.row_bucket,
+            chunks=1,
+        )
         return output, residual_out, None
 
 
