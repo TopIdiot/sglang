@@ -1012,9 +1012,6 @@ class WelmMTPDraftProposalCudaGraphRunner:
     def _set_welmv4_mtp_mirror_metadata(self, bs: int) -> None:
         if not self.model_runner.server_args.enable_welm_kv_mirror_opt:
             return
-        metadata = self.draft_extend_attn_backend.draft_extend_metadata.get(bs)
-        if metadata is None:
-            return
         mirror_cu_seqlens_q = self._welm_mtp_mirror_cu_seqlens_q.get(bs)
         if mirror_cu_seqlens_q is None:
             mirror_cu_seqlens_q = torch.arange(
@@ -1024,6 +1021,30 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 device=self.model_runner.device,
             )
             self._welm_mtp_mirror_cu_seqlens_q[bs] = mirror_cu_seqlens_q
+
+        set_metadata = getattr(
+            self.draft_extend_attn_backend,
+            "set_welm_mtp_mirror_cuda_graph_metadata",
+            None,
+        )
+        if set_metadata is not None:
+            set_metadata(bs, mirror_cu_seqlens_q)
+            return
+
+        draft_extend_metadata = getattr(
+            self.draft_extend_attn_backend, "draft_extend_metadata", None
+        )
+        if draft_extend_metadata is None:
+            raise RuntimeError(
+                "WeLM KV mirror is not supported by speculative draft attention "
+                f"backend {type(self.draft_extend_attn_backend).__name__}."
+            )
+        metadata = draft_extend_metadata.get(bs)
+        if metadata is None:
+            raise RuntimeError(
+                "WeLM KV mirror draft attention metadata was not initialized "
+                f"for CUDA graph batch size {bs}."
+            )
         metadata.mirror_cu_seqlens_q = mirror_cu_seqlens_q
         metadata.mirror_max_seq_len_q = 1
 

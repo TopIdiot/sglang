@@ -142,6 +142,13 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        # WeLM KV mirror keeps all draft KV rows but contracts the query to the
+        # last row of every request.  Keep a separate, immutable Q layout for
+        # that path: CUDA graph replay rewrites the regular qo_indptr buffer
+        # with the uncontracted speculative length before every replay.
+        self.welm_kv_mirror_qo_indptr = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
+        )
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
@@ -874,6 +881,208 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def set_welm_mtp_mirror_cuda_graph_metadata(
+        self, bs: int, mirror_cu_seqlens_q: torch.Tensor
+    ) -> None:
+        """Declare support for contracted WeLM MTP queries in CUDA graphs.
+
+        The Triton extend kernel reads the Q layout at forward time, so unlike
+        FA4/TRT-LLM there is no per-captured-batch metadata object to patch.
+        This hook lets the unified WeLM graph runner validate backend support
+        while keeping the actual pointer stable across capture and replay.
+        """
+        if bs + 1 > self.welm_kv_mirror_qo_indptr.numel():
+            raise RuntimeError(
+                "WeLM KV mirror CUDA graph batch exceeds Triton Q metadata "
+                f"capacity: bs={bs}, capacity="
+                f"{self.welm_kv_mirror_qo_indptr.numel() - 1}."
+            )
+        if (
+            mirror_cu_seqlens_q.dtype != torch.int32
+            or mirror_cu_seqlens_q.device != self.welm_kv_mirror_qo_indptr.device
+            or mirror_cu_seqlens_q.numel() != bs + 1
+        ):
+            raise RuntimeError(
+                "Invalid WeLM KV mirror CUDA graph Q metadata for Triton: "
+                f"shape={tuple(mirror_cu_seqlens_q.shape)}, "
+                f"dtype={mirror_cu_seqlens_q.dtype}, "
+                f"device={mirror_cu_seqlens_q.device}."
+            )
+
+    def _is_welm_contracted_last_query(
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        custom_last_index = getattr(forward_batch, "custom_last_index", None)
+        use_welm_custom_last_q = (
+            getattr(forward_batch, "welm_kv_mirror_contracted", False)
+            and custom_last_index is not None
+            and q.shape[0] == custom_last_index.numel()
+        )
+        if not use_welm_custom_last_q:
+            return False
+
+        active_indices = getattr(
+            forward_batch, "kv_mirror_active_batch_indices", None
+        )
+        batch_size = int(forward_batch.batch_size)
+        if active_indices is not None and active_indices.numel() != batch_size:
+            raise NotImplementedError(
+                "WeLM KV mirror with Triton attention does not yet support an "
+                "attention-DP batch whose active query rows are a subset of "
+                f"the requests: active={active_indices.numel()}, bs={batch_size}."
+            )
+
+        num_queries = q.shape[0]
+        if num_queries != batch_size:
+            raise RuntimeError(
+                "WeLM KV mirror contracted Triton Q rows do not match the "
+                f"request batch: q_rows={num_queries}, bs={batch_size}."
+            )
+        if num_queries + 1 > self.welm_kv_mirror_qo_indptr.numel():
+            raise RuntimeError(
+                "WeLM KV mirror contracted Triton Q rows exceed metadata "
+                f"capacity: q_rows={num_queries}, capacity="
+                f"{self.welm_kv_mirror_qo_indptr.numel() - 1}."
+            )
+        return True
+
+    def _forward_welm_contracted_last_query(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Attend contracted last-query rows to complete cached KV once.
+
+        Merged WeLM MTP has already written all accepted K/V rows to the cache
+        before Q is contracted to one final row per request.  DRAFT_EXTEND
+        metadata already indexes the complete KV sequence, while ordinary
+        EXTEND metadata indexes only the prefix.  Build the latter into a
+        complete cache index once, then mark all but the final cached row as
+        prefix so the one-row query has the correct causal position.
+        """
+
+        metadata = self.forward_metadata
+        batch_size = int(forward_batch.batch_size)
+        qo_indptr = self.welm_kv_mirror_qo_indptr[: batch_size + 1]
+
+        use_window = (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and metadata.window_kv_indptr is not None
+            and metadata.window_kv_indices is not None
+        )
+        if use_window:
+            prefix_kv_indptr = metadata.window_kv_indptr
+            prefix_kv_indices = metadata.window_kv_indices
+            sliding_window_size = int(layer.sliding_window_size)
+        else:
+            prefix_kv_indptr = metadata.kv_indptr
+            prefix_kv_indices = metadata.kv_indices
+            sliding_window_size = -1
+
+        if forward_batch.forward_mode.is_draft_extend():
+            # EagleDraftInput.generate_attn_arg_prefill() has already built a
+            # complete KV index from the updated sequence lengths.
+            kv_indptr = prefix_kv_indptr
+            kv_indices = prefix_kv_indices
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            if extend_seq_lens is None:
+                raise RuntimeError(
+                    "WeLM contracted Triton EXTEND is missing extend_seq_lens."
+                )
+            extend_start_loc = forward_batch.extend_start_loc
+            if extend_start_loc is None:
+                extend_start_loc = torch.cat(
+                    [
+                        torch.zeros(
+                            1, dtype=torch.int32, device=extend_seq_lens.device
+                        ),
+                        torch.cumsum(extend_seq_lens[:-1], dim=0),
+                    ]
+                )
+
+            extend_kv_indices = forward_batch.out_cache_loc
+            pool = forward_batch.token_to_kv_pool
+            if (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
+                and isinstance(pool, SWAKVPool)
+                and pool.layers_mapping[layer.layer_id][1]
+            ):
+                if pool.swa_loc is not None:
+                    extend_kv_indices = pool.swa_loc
+                else:
+                    extend_kv_indices = pool.translate_loc_from_full_to_swa(
+                        extend_kv_indices
+                    )
+
+            kv_indptr, kv_indices, _ = self.build_unified_kv_indices(
+                prefix_kv_indptr,
+                prefix_kv_indices,
+                extend_start_loc,
+                extend_seq_lens,
+                extend_kv_indices,
+                batch_size,
+            )
+
+        kv_lens = kv_indptr[1 : batch_size + 1] - kv_indptr[:batch_size]
+        # Contracted Q is produced only after the current token has been added
+        # to every active sequence, so kv_lens >= 1 is a scheduler invariant.
+        # Do not add a GPU->CPU assertion here: this is a per-layer hot path and
+        # is also executed during CUDA Graph capture.
+        prefix_lens = (kv_lens - 1).to(torch.int32)
+
+        if metadata.custom_mask is not None:
+            raise NotImplementedError(
+                "WeLM contracted last-query Triton attention does not support "
+                "a custom tree mask."
+            )
+
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
+
+        window_start_pos = None
+        if use_window:
+            window_start_pos = (
+                forward_batch.seq_lens[:batch_size].to(kv_lens.dtype) - kv_lens
+            ).to(torch.int32)
+
+        self.extend_attention_fwd_unified(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_descale,
+            v_descale,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            prefix_lens,
+            1,
+            custom_mask=None,
+            mask_indptr=None,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            is_causal=causal,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            window_start_pos=window_start_pos,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
+        return o
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -956,6 +1165,17 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        if self._is_welm_contracted_last_query(q, forward_batch):
+            return self._forward_welm_contracted_last_query(
+                q,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks,
+            )
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
