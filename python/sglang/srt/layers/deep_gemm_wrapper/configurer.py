@@ -23,7 +23,10 @@ def _compute_enable_deep_gemm():
 
     try:
         import deep_gemm  # noqa: F401
-    except ImportError:
+    except Exception as e:
+        # deep_gemm can fail beyond ImportError, e.g. its native lib may fail
+        # to dlopen when built against a different CUDA runtime major version.
+        logger.warning("deep_gemm unavailable, disabling JIT DeepGEMM: %s", e)
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
