@@ -201,6 +201,7 @@ def flash_attn_with_kvcache(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")
@@ -291,6 +292,7 @@ def flash_attn_varlen_func(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")
