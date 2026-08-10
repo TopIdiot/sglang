@@ -3306,6 +3306,13 @@ class Qwen2MoeAttention(nn.Module):
             ]
         else:
             self.sliding_window_size = -1
+        # Full-context windows (e.g. 262144 == max_position_embeddings) must be
+        # normalized to -1 here, matching the hybrid SWA pool's layer
+        # classification; otherwise attention backends treat these layers as
+        # sliding-window and truncate them to the global SWA window.
+        self.sliding_window_size = self._normalize_sliding_window_size(
+            config, self.sliding_window_size
+        )
         logger.debug(
             "self.layer_idx:{}".format(layer_idx),
             "self.sliding_window_size:",
