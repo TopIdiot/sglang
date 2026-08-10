@@ -14,6 +14,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
+    get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
 )
@@ -114,6 +115,7 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     welm_mtp_branch_flat_cache_locs: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    num_token_non_padded: Optional[torch.Tensor]
 
 
 class WelmMTPDraftProposalCudaGraphRunner:
@@ -135,6 +137,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.graphs = {}
         self.output_buffers = {}
         self.forward_batches = {}
+        self.contracted_rows_by_bs = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -503,6 +506,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
             else:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
+            num_token_non_padded = (
+                torch.zeros((1,), dtype=torch.int32)
+                if self.use_token_owner
+                else None
+            )
 
             self.welm_mtp_mirror_padding_index = self.max_num_token
             self.welm_mtp_mirror_kv_len = self.max_num_token + 1
@@ -583,6 +591,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             welm_mtp_branch_flat_cache_locs=welm_mtp_branch_flat_cache_locs,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 
@@ -1356,6 +1365,32 @@ class WelmMTPDraftProposalCudaGraphRunner:
         max_num_tokens = max(int(count) for count in global_num_tokens)
         return (max_num_tokens + self.num_tokens_per_bs - 1) // self.num_tokens_per_bs
 
+    def _update_num_token_non_padded(self, *, graph_bs: int, raw_bs: int) -> None:
+        if not self.use_token_owner:
+            return
+
+        contracted_rows = self.contracted_rows_by_bs.get(graph_bs)
+        if contracted_rows is None:
+            valid_rows = padded_rows = graph_bs * self.num_tokens_per_bs
+        else:
+            valid_rows, padded_rows = raw_bs, contracted_rows
+
+        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_attention_tp_rank()
+        rows_per_rank, remainder = divmod(padded_rows, attn_tp_size)
+        local_start = rows_per_rank * attn_tp_rank + min(attn_tp_rank, remainder)
+        local_size = rows_per_rank + int(attn_tp_rank < remainder)
+        local_valid_rows = min(max(valid_rows - local_start, 0), local_size)
+        self.buffers.num_token_non_padded.fill_(local_valid_rows)
+
+    def _reject_token_owner_graph_miss(self, reason: str) -> bool:
+        if self.use_token_owner:
+            raise RuntimeError(
+                f"Token-owner MTP draft proposal CUDA graph {reason}; "
+                "eager fallback is disabled"
+            )
+        return False
+
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if not forward_batch.forward_mode.is_draft_extend(include_v2=True):
             return False
@@ -1382,15 +1417,19 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 return False
         else:
             cuda_graph_bs = raw_bs
-        is_bs_supported = (
+        has_capture_bucket = (
             cuda_graph_bs in self.graphs
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
-        if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
-        if not is_bs_supported:
-            return False
+        if not has_capture_bucket:
+            return self._reject_token_owner_graph_miss(
+                f"has no capture bucket for request batch size {cuda_graph_bs}"
+            )
+        if self.require_mlp_sync and not forward_batch.can_run_dp_cuda_graph:
+            return self._reject_token_owner_graph_miss(
+                "was scheduler disabled for this DP batch"
+            )
         spec_info = forward_batch.spec_info
         if not isinstance(spec_info, EagleDraftInput):
             return False
@@ -1405,7 +1444,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return False
         index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
         if index >= len(self.capture_bs):
-            return False
+            return self._reject_token_owner_graph_miss(
+                f"has no capture bucket for request batch size {cuda_graph_bs}"
+            )
         graph_bs = self.capture_bs[index]
         if sum(accepted_lens_cpu) != raw_num_tokens:
             return False
@@ -1543,6 +1584,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             global_dp_buffer_len = None
 
         capture_hidden_mode = CaptureHiddenMode.LAST
+        self._update_num_token_non_padded(graph_bs=bs, raw_bs=bs)
 
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
@@ -1588,6 +1630,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             capture_hidden_mode=capture_hidden_mode,
             attn_backend=self.draft_extend_attn_backend,
             oe_context=None,
+            num_token_non_padded=buffers.num_token_non_padded,
         )
         forward_batch.custom_last_index = custom_last_index
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
@@ -1746,6 +1789,13 @@ class WelmMTPDraftProposalCudaGraphRunner:
             is_extend_in_batch=not self.use_token_owner_deepep
         )
         self._capture_init(run_once)
+        contracted_rows = getattr(
+            forward_batch, "_welm_mtp_contracted_dp_metadata_rows", None
+        )
+        self.contracted_rows_by_bs[bs] = (
+            None if contracted_rows is None else int(contracted_rows)
+        )
+        self._update_num_token_non_padded(graph_bs=bs, raw_bs=bs)
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -1902,6 +1952,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(graph_num_tokens)
             buffers.global_num_tokens_for_logprob_gpu.fill_(graph_num_tokens)
+        self._update_num_token_non_padded(graph_bs=bs, raw_bs=raw_bs)
         replay_forward_batch = self.forward_batches[bs]
         replay_forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
@@ -2150,6 +2201,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(graph_num_tokens)
             buffers.global_num_tokens_for_logprob_gpu.fill_(graph_num_tokens)
+        self._update_num_token_non_padded(graph_bs=bs, raw_bs=raw_bs)
         replay_forward_batch = self.forward_batches[bs]
         replay_forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]

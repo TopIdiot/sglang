@@ -202,10 +202,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
     # data_ptr() the captured graph baked in. ``None`` when the runner won't
     # use the prepared mk path (env off, mk missing, OE not configured, etc.).
     welm_oe_fused_decode_output: Optional[torch.Tensor]
-    router_replay_topk_ids: Optional[torch.Tensor]
-    router_replay_mask: Optional[torch.Tensor]
-    router_replay_local_topk_ids: Optional[torch.Tensor]
-    router_replay_local_mask: Optional[torch.Tensor]
+    router_replay_topk_ids: torch.Tensor
+    router_replay_mask: torch.Tensor
+    router_replay_local_topk_ids: torch.Tensor
+    router_replay_local_mask: torch.Tensor
     scale_seq_factor: int = 1
 
     @classmethod
@@ -229,7 +229,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         welm_oe_decode_hash_num_branches: int,
         scale_seq_factor: int,
-        enable_router_replay: bool,
         router_replay_num_layers: int = 0,
         router_replay_top_k: int = 0,
         kv_mirror_layers: Optional[List[int]] = None,
@@ -334,40 +333,29 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
-            if enable_router_replay:
-                # Global buffers receive every DP group's rows.
-                router_gather_rows = (
-                    max_num_token * dp_size
-                    if require_mlp_tp_gather
-                    else max_num_token
-                )
-                router_shape = (
-                    router_gather_rows,
-                    router_replay_num_layers,
-                    router_replay_top_k,
-                )
-                router_replay_topk_ids = torch.zeros(
-                    router_shape, dtype=torch.int32
-                )
-                router_replay_mask = torch.zeros(
-                    (router_gather_rows,), dtype=torch.bool
-                )
-                local_router_shape = (
-                    max_num_token,
-                    router_replay_num_layers,
-                    router_replay_top_k,
-                )
-                router_replay_local_topk_ids = torch.zeros(
-                    local_router_shape, dtype=torch.int32
-                )
-                router_replay_local_mask = torch.zeros(
-                    (max_num_token,), dtype=torch.bool
-                )
-            else:
-                router_replay_topk_ids = None
-                router_replay_mask = None
-                router_replay_local_topk_ids = None
-                router_replay_local_mask = None
+            # The GLOBAL router-replay buffers receive a dp_gather of every DP
+            # group's rows; sizing them at max_num_token lets python slicing
+            # silently clamp once uneven DP groups select a larger bucket ->
+            # all_gather size mismatch.
+            router_gather_rows = (
+                max_num_token * dp_size if require_mlp_tp_gather else max_num_token
+            )
+            router_shape = (
+                router_gather_rows,
+                router_replay_num_layers,
+                router_replay_top_k,
+            )
+            router_replay_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
+            router_replay_mask = torch.zeros((router_gather_rows,), dtype=torch.bool)
+            local_router_shape = (
+                max_num_token,
+                router_replay_num_layers,
+                router_replay_top_k,
+            )
+            router_replay_local_topk_ids = torch.zeros(
+                local_router_shape, dtype=torch.int32
+            )
+            router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
 
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
@@ -427,6 +415,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         bs: int,
         seq_len_padding_value: int,
         require_gathered_buffer: bool,
+        gather_router_replay: bool,
         num_tokens_per_bs: int,
         nsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
@@ -544,10 +533,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
         static_num_token = bs * num_tokens_per_bs
-        if self.router_replay_topk_ids is not None and require_gathered_buffer:
-            assert self.router_replay_mask is not None
-            assert self.router_replay_local_topk_ids is not None
-            assert self.router_replay_local_mask is not None
+        if gather_router_replay:
+            copy_router_replay_to_cuda_graph_buffers(
+                dst_topk_ids=self.router_replay_local_topk_ids,
+                dst_mask=self.router_replay_local_mask,
+                src_topk_ids=forward_batch.router_replay_topk_ids,
+                src_mask=forward_batch.router_replay_mask,
+                raw_num_token=raw_num_token,
+                static_num_token=static_num_token,
+            )
+
             # NOTE(replay+dp-attn): use dp_gather_REPLICATE rather than
             # dp_gather_partial here. router_replay_topk_ids/mask are
             # replicated across attn-TP ranks within a DP rank, so the all-
@@ -557,19 +552,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             # forced_ids)` in _gather_router_replay_weights.  Replicate semantics
             # contribute only from attn_tp_rank==0 so the all-reduce returns a
             # single copy.
+            from sglang.srt.layers.dp_attention import dp_gather_replicate
+
             global_static_num_token = (
                 static_num_token * self.global_num_tokens_gpu.numel()
             )
-            copy_router_replay_to_cuda_graph_buffers(
-                dst_topk_ids=self.router_replay_local_topk_ids,
-                dst_mask=self.router_replay_local_mask,
-                src_topk_ids=forward_batch.router_replay_topk_ids,
-                src_mask=forward_batch.router_replay_mask,
-                raw_num_token=raw_num_token,
-                static_num_token=static_num_token,
-            )
-            from sglang.srt.layers.dp_attention import dp_gather_replicate
-
             old_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
             old_dp_padding_mode = forward_batch.dp_padding_mode
             old_dp_local_start_pos = forward_batch.dp_local_start_pos
@@ -581,7 +568,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 )
                 forward_batch.dp_local_start_pos = None
                 forward_batch.dp_local_num_tokens = None
-                # Clear non-source lanes before the sum-backed DP gather.
+                # Zero the slice BEFORE the all-reduce: dp_gather_replicate
+                # sums across the TP group, so any stale non-zero data on
+                # non-rank-0 attn_tp ranks would otherwise be summed in.
                 self.router_replay_topk_ids[:global_static_num_token].zero_()
                 dp_gather_replicate(
                     self.router_replay_topk_ids[:global_static_num_token],
@@ -608,8 +597,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 forward_batch.dp_local_num_tokens = old_dp_local_num_tokens
             if self.router_replay_mask.shape[0] > global_static_num_token:
                 self.router_replay_mask[global_static_num_token:].fill_(False)
-        elif self.router_replay_topk_ids is not None:
-            assert self.router_replay_mask is not None
+        else:
             copy_router_replay_to_cuda_graph_buffers(
                 dst_topk_ids=self.router_replay_topk_ids,
                 dst_mask=self.router_replay_mask,
@@ -1131,7 +1119,6 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             welm_oe_decode_hash_num_branches=welm_oe_decode_hash_num_branches,
             scale_seq_factor=self.scale_seq_factor,
-            enable_router_replay=self.model_runner.server_args.enable_moe_router_replay,
             router_replay_num_layers=getattr(
                 self.model_runner.model_config.hf_text_config,
                 "num_hidden_layers",
@@ -1467,6 +1454,13 @@ class CudaGraphRunner:
             )
         return max(counts)
 
+    def _reject_token_owner_graph_miss(self, reason: str) -> bool:
+        if self.use_token_owner:
+            raise RuntimeError(
+                f"Token-owner target CUDA graph {reason}; eager fallback is disabled"
+            )
+        return False
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -1477,6 +1471,12 @@ class CudaGraphRunner:
             if stream_idx is not None
             else self.attn_backend
         )
+        if self.require_mlp_sync and not forward_batch.can_run_dp_cuda_graph:
+            if forward_batch.is_extend_in_batch:
+                return False
+            return self._reject_token_owner_graph_miss(
+                "was scheduler disabled for this DP batch"
+            )
         if self.use_token_owner:
             cuda_graph_bs = self._requested_token_owner_graph_batch_size(forward_batch)
         elif self.require_mlp_tp_gather:
@@ -1518,9 +1518,10 @@ class CudaGraphRunner:
             else None
         )
         is_bs_supported = graph_key in self.graphs if graph_key is not None else False
-
-        if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+        if not is_bs_supported:
+            return self._reject_token_owner_graph_miss(
+                f"has no capture bucket for request batch size {cuda_graph_bs}"
+            )
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
@@ -1558,8 +1559,7 @@ class CudaGraphRunner:
         )
 
         return (
-            is_bs_supported
-            and is_encoder_lens_supported
+            is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
@@ -1880,16 +1880,10 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            router_replay_topk_ids=(
-                None
-                if buffers.router_replay_topk_ids is None
-                else buffers.router_replay_topk_ids[:router_replay_num_tokens]
-            ),
-            router_replay_mask=(
-                None
-                if buffers.router_replay_mask is None
-                else buffers.router_replay_mask[:router_replay_num_tokens]
-            ),
+            router_replay_topk_ids=buffers.router_replay_topk_ids[
+                :router_replay_num_tokens
+            ],
+            router_replay_mask=buffers.router_replay_mask[:router_replay_num_tokens],
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             scale_seq_factor=self.scale_seq_factor,
@@ -2129,6 +2123,9 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_padding_value=seq_len_padding_value,
             require_gathered_buffer=self.require_gathered_buffer,
+            gather_router_replay=(
+                self.require_gathered_buffer and not self.use_token_owner
+            ),
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(

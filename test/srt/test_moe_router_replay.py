@@ -791,7 +791,6 @@ def test_cuda_graph_replay_buffers_use_global_capacity_for_mlp_sync():
         enable_mamba_track=False,
         welm_oe_decode_hash_num_branches=0,
         scale_seq_factor=1,
-        enable_router_replay=True,
         router_replay_num_layers=3,
         router_replay_top_k=2,
     )

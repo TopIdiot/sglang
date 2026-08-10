@@ -79,9 +79,50 @@ class TestCudaGraphBatchSizes(unittest.TestCase):
 
 
 class TestTokenOwnerCudaGraph(unittest.TestCase):
-    def test_disabled_router_replay_has_no_buffers_or_dp_collective(self):
+    @staticmethod
+    def _make_runner(*, capture_bs, graphs, use_token_owner=True):
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        runner = CudaGraphRunner.__new__(CudaGraphRunner)
+        runner.use_token_owner = use_token_owner
+        runner.enable_pdmux = False
+        runner.attn_backend = SimpleNamespace(is_attn_cp_sharded_kv=False)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+        )
+        runner.require_mlp_tp_gather = False
+        runner.require_mlp_sync = True
+        runner.disable_padding = False
+        runner.capture_bs = list(capture_bs)
+        runner.enable_seq_len_graph_buckets = False
+        runner.seq_len_fill_values_by_bs = {}
+        runner.seq_len_fill_value = 1
+        runner.graphs = graphs
+        runner.record_nolora_graph = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.enable_two_batch_overlap = False
+        runner.num_tokens_per_bs = 1
+        return runner
+
+    @staticmethod
+    def _make_batch(*, can_run_dp_cuda_graph=True, is_extend_in_batch=False):
+        return SimpleNamespace(
+            replace_embeds=None,
+            global_num_reqs_cpu=[2, 1],
+            batch_size=2,
+            return_logprob=False,
+            lora_ids=None,
+            can_run_dp_cuda_graph=can_run_dp_cuda_graph,
+            is_extend_in_batch=is_extend_in_batch,
+            capture_hidden_mode=0,
+            spec_info=None,
+            input_ids=torch.arange(2),
+        )
+
+    def test_owner_decode_graph_skips_router_replay_collective(self):
         import sglang.srt.layers.dp_attention as dp_attention
-        from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.cuda_graph_runner import DecodeInputBuffers
 
         buffers = DecodeInputBuffers.create(
@@ -102,14 +143,9 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
             enable_mamba_track=False,
             welm_oe_decode_hash_num_branches=0,
             scale_seq_factor=1,
-            enable_router_replay=False,
             router_replay_num_layers=2,
             router_replay_top_k=1,
         )
-        self.assertIsNone(buffers.router_replay_topk_ids)
-        self.assertIsNone(buffers.router_replay_mask)
-        self.assertIsNone(buffers.router_replay_local_topk_ids)
-        self.assertIsNone(buffers.router_replay_local_mask)
         forward_batch = SimpleNamespace(
             input_ids=torch.tensor([1]),
             req_pool_indices=torch.tensor([0]),
@@ -125,9 +161,10 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
             router_replay_topk_ids=None,
             router_replay_mask=None,
             global_num_tokens_gpu=torch.tensor([1, 0], dtype=torch.int32),
-            dp_padding_mode=DpPaddingMode.MAX_LEN,
+            dp_padding_mode=None,
             dp_local_start_pos=None,
             dp_local_num_tokens=None,
+            num_token_non_padded=torch.tensor([1], dtype=torch.int32),
         )
 
         with patch.object(
@@ -142,69 +179,42 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
                 bs=1,
                 seq_len_padding_value=1,
                 require_gathered_buffer=True,
+                gather_router_replay=False,
                 num_tokens_per_bs=1,
                 nsa_enable_prefill_cp=False,
                 enable_num_token_non_padded_flag=False,
             )
 
-    def test_padding_preserves_disabled_lora_metadata(self):
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+    def test_owner_rejects_missing_target_graph_bucket(self):
+        runner = self._make_runner(capture_bs=(1,), graphs={1: object()})
 
-        batch = ForwardBatch(
-            forward_mode=ForwardMode.DECODE,
-            batch_size=1,
-            input_ids=torch.tensor([1]),
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([1], dtype=torch.int32),
-            out_cache_loc=torch.tensor([0]),
-            seq_lens_sum=1,
-            positions=torch.tensor([0]),
-            lora_ids=None,
-        )
-        model_runner = SimpleNamespace(
-            attn_backend=SimpleNamespace(
-                get_cuda_graph_seq_len_fill_value=lambda: 1
-            )
-        )
+        with self.assertRaisesRegex(RuntimeError, "capture bucket"):
+            runner.can_run(self._make_batch())
 
-        batch._pad_inputs_to_size(model_runner, num_tokens=2, bs=2)
+    def test_owner_rejects_scheduler_disabled_target_graph(self):
+        runner = self._make_runner(capture_bs=(2,), graphs={2: object()})
 
-        self.assertIsNone(batch.lora_ids)
-        self.assertEqual(batch.input_ids.shape[0], 2)
+        with self.assertRaisesRegex(RuntimeError, "scheduler disabled"):
+            runner.can_run(self._make_batch(can_run_dp_cuda_graph=False))
 
-    def test_owner_tracks_non_padded_rows_without_ep(self):
-        import sglang.srt.model_executor.forward_batch_info as fbi
+    def test_owner_prefill_uses_eager_when_scheduler_disables_graph(self):
+        runner = self._make_runner(capture_bs=(2,), graphs={2: object()})
 
-        with patch.object(
-            fbi, "get_moe_expert_parallel_world_size", return_value=1
-        ):
-            self.assertFalse(fbi.enable_num_token_non_padded())
-            self.assertTrue(
-                fbi.enable_num_token_non_padded(
-                    SimpleNamespace(enable_token_owner=True)
+        self.assertFalse(
+            runner.can_run(
+                self._make_batch(
+                    can_run_dp_cuda_graph=False,
+                    is_extend_in_batch=True,
                 )
             )
-
-    def test_owner_uses_global_request_bucket(self):
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-
-        forward_batch = SimpleNamespace(global_num_reqs_cpu=[1, 8, 3, 0])
-
-        self.assertEqual(
-            CudaGraphRunner._requested_token_owner_graph_batch_size(forward_batch),
-            8,
         )
 
-    def test_owner_requires_global_request_counts(self):
-        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    def test_non_owner_keeps_target_graph_eager_fallback(self):
+        runner = self._make_runner(
+            capture_bs=(1,), graphs={1: object()}, use_token_owner=False
+        )
 
-        with self.assertRaisesRegex(RuntimeError, "global request counts"):
-            CudaGraphRunner._requested_token_owner_graph_batch_size(
-                SimpleNamespace(global_num_reqs_cpu=None)
-            )
+        self.assertFalse(runner.can_run(self._make_batch()))
 
     def test_owner_non_padded_rows_follow_uneven_attntp_split(self):
         import sglang.srt.model_executor.forward_batch_info as fbi

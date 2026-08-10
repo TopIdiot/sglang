@@ -3081,7 +3081,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             prepare_n_gram_inputs=self.server_args.prepare_n_gram_inputs,
             scale_seq_factor=getattr(self.model_config.hf_config, "scale_seq_times", 0)
             + 1,
-            enable_router_replay=self.server_args.enable_moe_router_replay,
             router_replay_num_layers=getattr(
                 self.model_config.hf_text_config, "num_hidden_layers", 0
             ),

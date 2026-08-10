@@ -281,7 +281,20 @@ layout contract，并增加对应 provider，不重新定义用户接口。
 
 不支持场景必须在 communicator 安装或首次进入 fast path 时明确报错。
 
-## 11. 验收标准
+## 11. 代码组织与规模
+
+`welmv4.py` 只保留模型构造、layer forward 和 KV mirror 生命周期的必要接入，
+相对主线新增目标约为 200 行。WeLM 专属的 capability 校验、owner layout 推导、
+mirror survivor 映射和 Router context 放入单一 runtime 模块；通用 collective 继续
+复用 `TokenOwnerLayout` 与 `LayerCommunicator`，不得复制通信实现。
+
+runtime 在每次 model forward 开始时重置 batch-local cache，并在 mirror contraction
+改变布局后显式失效。不得使用多字段 identity cache、第二份 valid-mask cache，或在
+每层重新推导完整 layout。重构必须删除重复校验和包装逻辑，不能仅通过机械搬文件
+满足行数目标。若 `welmv4.py` 新增超过 200 行，超出部分必须对应无法下沉的模型
+forward 或 mirror 生命周期语义，并在提交前列出原因。
+
+## 12. 验收标准
 
 ### 正确性
 

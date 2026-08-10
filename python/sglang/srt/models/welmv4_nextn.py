@@ -31,6 +31,7 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_local_embedding,
     compute_welm_oe_embedding,
 )
+from sglang.srt.models.welmv4_token_owner import WeLMTokenOwnerRuntime
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     Qwen2MoeSparseMoeBlock,
@@ -285,13 +286,14 @@ class WeLMV4ModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        enable_token_owner: bool = False,
+        token_owner_runtime: Optional[WeLMTokenOwnerRuntime] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.num_physical_mtp_layers = int(config.num_nextn_predict_layers)
         self.num_nextn_predict_layers = self.num_physical_mtp_layers
+        self.token_owner_runtime = token_owner_runtime
 
         self.embed_tokens = None
         self.oe_embed = None
@@ -363,7 +365,7 @@ class WeLMV4ModelNextN(nn.Module):
                     is_nextn=True,
                     prefix=add_prefix(layer_name, prefix),
                     alt_stream=self.alt_stream,
-                    enable_token_owner=enable_token_owner,
+                    token_owner_runtime=token_owner_runtime,
                 )
                 for i in range(self.num_physical_mtp_layers)
             ]
@@ -642,6 +644,8 @@ class WeLMV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.token_owner_runtime is not None:
+            self.token_owner_runtime.begin_forward(forward_batch)
         mtp_step_idx = int(getattr(forward_batch, "mtp_step_idx", 0))
         if not getattr(forward_batch, "kv_fill_only", False) and mtp_step_idx == 0:
             _start_mtp_dump_pass()
@@ -858,15 +862,18 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        self.enable_token_owner = _welm_token_owner_enabled(
+        enable_token_owner = _welm_token_owner_enabled(
             pp_size=self.pp_group.world_size
+        )
+        self.token_owner_runtime = (
+            WeLMTokenOwnerRuntime() if enable_token_owner else None
         )
 
         self.model = WeLMV4ModelNextN(
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            enable_token_owner=self.enable_token_owner,
+            token_owner_runtime=self.token_owner_runtime,
         )
         self.lm_head = None
         self.logits_processor = LogitsProcessor(config)

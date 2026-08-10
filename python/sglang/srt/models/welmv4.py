@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +55,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
-    TokenOwnerLayout,
 )
 from sglang.srt.layers.communicator_prefill_cp import (
     PrefillCPLayerCommunicator,
@@ -63,7 +62,6 @@ from sglang.srt.layers.communicator_prefill_cp import (
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_reduce,
-    get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -144,6 +142,10 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
     welm_embeddings,
 )
+from sglang.srt.models.welmv4_token_owner import (
+    WeLMTokenOwnerRuntime,
+    welm_token_owner_enabled,
+)
 from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
     welm_v45_80a3_fused_pre_attn_enabled,
 )
@@ -168,660 +170,11 @@ _WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
 _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED = False
 
 
-def _validate_welm_token_owner_capability(
-    *,
-    enabled: bool,
-    dp_attention_enabled: bool,
-    attn_cp_size: int,
-    attn_tp_size: int,
-    pp_size: int,
-    global_tp_size: int,
-    global_tp_rank: int,
-    attn_tp_rank: int,
-    moe_a2a_backend: str,
-    use_previous_precision: bool,
-    suffix_parallel_enabled: bool,
-    tbo_enabled: bool,
-    router_replay_enabled: bool,
-    mk_router_enabled: bool,
-    speculative_enabled: bool,
-    speculative_moe_a2a_backend: Optional[str],
-    deepep_mode: str,
-    disaggregation_mode: str,
-    attn_tp_input_scattered: bool,
-    activation_dump_enabled: bool = False,
-    routed_expert_capture_enabled: bool = False,
-    expert_distribution_recorder_enabled: bool = False,
-) -> bool:
-    if not enabled:
-        return False
-    if not dp_attention_enabled:
-        raise NotImplementedError("WeLM token-owner currently requires DP Attention")
-    if attn_cp_size != 1:
-        raise NotImplementedError("WeLM token-owner currently requires AttnCP1")
-    if attn_tp_size <= 1:
-        raise NotImplementedError("WeLM token-owner currently requires AttnTP>1")
-    if pp_size != 1:
-        raise NotImplementedError("WeLM token-owner currently requires PP1")
-    if global_tp_size % attn_tp_size != 0:
-        raise RuntimeError("Global TP size must be divisible by AttnTP size")
-    if attn_tp_rank != global_tp_rank % attn_tp_size:
-        raise RuntimeError(
-            "Global TP and AttnTP ranks do not use DP-major rank ordering"
-        )
-    if moe_a2a_backend not in ("none", "deepep"):
-        raise NotImplementedError(
-            "WeLM token-owner currently requires MoE A2A backend none or DeepEP"
-        )
-    if use_previous_precision:
-        raise NotImplementedError(
-            "WeLM token-owner does not support previous-precision"
-        )
-    if suffix_parallel_enabled:
-        raise NotImplementedError("WeLM token-owner does not support suffix parallel")
-    if tbo_enabled:
-        raise NotImplementedError("WeLM token-owner does not support TBO")
-    if router_replay_enabled:
-        raise NotImplementedError("WeLM token-owner does not support Router Replay")
-    if mk_router_enabled:
-        raise NotImplementedError("WeLM token-owner does not support MK MoE Router")
-    if speculative_enabled:
-        effective_speculative_backend = (
-            speculative_moe_a2a_backend or moe_a2a_backend
-        )
-        global_tp_moe = (
-            moe_a2a_backend == "none" and effective_speculative_backend == "none"
-        )
-        matching_deepep = (
-            moe_a2a_backend == "deepep"
-            and effective_speculative_backend == "deepep"
-        )
-        if not (global_tp_moe or matching_deepep):
-            raise NotImplementedError(
-                "WeLM token-owner speculative decoding requires Global TP MoE "
-                "or matching DeepEP target and draft backends"
-            )
-        if matching_deepep and deepep_mode not in ("auto", "low_latency"):
-            raise NotImplementedError(
-                "WeLM token-owner speculative DeepEP requires deepep-mode "
-                "auto or low_latency"
-            )
-        if (
-            matching_deepep
-            and deepep_mode == "low_latency"
-            and disaggregation_mode != "decode"
-        ):
-            raise NotImplementedError(
-                "WeLM token-owner speculative DeepEP low_latency mode is "
-                "decode-only; use auto for non-disaggregated prefill/decode"
-            )
-    if attn_tp_input_scattered:
-        raise NotImplementedError(
-            "WeLM token-owner does not compose with AttnTP input scatter"
-        )
-    if activation_dump_enabled:
-        raise NotImplementedError(
-            "WeLM activation dump does not support owner-local routing"
-        )
-    if routed_expert_capture_enabled:
-        raise NotImplementedError(
-            "WeLM routed-expert capture does not support owner-local routing"
-        )
-    if expert_distribution_recorder_enabled:
-        raise NotImplementedError(
-            "WeLM expert distribution recorder does not support owner-local routing"
-        )
-    return True
-
-
 def _welm_token_owner_enabled(*, pp_size: int) -> bool:
-    server_args = get_global_server_args()
-    enabled = bool(getattr(server_args, "enable_token_owner", False))
-    if not enabled:
-        return False
-    global_tp_group = get_tp_group()
-    attn_tp_group = get_attn_tp_group()
-    return _validate_welm_token_owner_capability(
-        enabled=enabled,
-        dp_attention_enabled=is_dp_attention_enabled(),
-        attn_cp_size=get_attention_cp_size(),
-        attn_tp_size=get_attention_tp_size(),
+    return welm_token_owner_enabled(
         pp_size=pp_size,
-        global_tp_size=global_tp_group.world_size,
-        global_tp_rank=global_tp_group.rank_in_group,
-        attn_tp_rank=attn_tp_group.rank_in_group,
-        moe_a2a_backend=get_moe_a2a_backend().value,
-        use_previous_precision=welm_use_previous_precision(),
-        suffix_parallel_enabled=is_suffix_parallel_enabled(),
-        tbo_enabled=server_args.enable_two_batch_overlap,
-        router_replay_enabled=server_args.enable_moe_router_replay,
-        mk_router_enabled=get_mk_moe_router_mode() is not MkMoeRouterMode.OFF,
-        speculative_enabled=(
-            getattr(server_args, "speculative_algorithm", None) is not None
-        ),
-        speculative_moe_a2a_backend=getattr(
-            server_args, "speculative_moe_a2a_backend", None
-        ),
-        deepep_mode=getattr(server_args, "deepep_mode", "auto"),
-        disaggregation_mode=getattr(server_args, "disaggregation_mode", "null"),
-        attn_tp_input_scattered=bool(
-            getattr(server_args, "enable_attn_tp_input_scattered", False)
-        ),
         activation_dump_enabled=_WELM_DUMP_ENABLED,
-        routed_expert_capture_enabled=bool(
-            getattr(server_args, "enable_return_routed_experts", False)
-        ),
-        expert_distribution_recorder_enabled=(
-            getattr(server_args, "expert_distribution_recorder_mode", None)
-            is not None
-        ),
     )
-
-
-def _welm_kv_mirror_owner_sizes(
-    *,
-    original_token_count: int,
-    owner_count: int,
-    last_q_indices: Sequence[int],
-    active_batch_indices: Sequence[int],
-    output_size: int,
-) -> tuple[int, ...]:
-    original_token_count = int(original_token_count)
-    output_size = int(output_size)
-    last_q_indices = tuple(int(index) for index in last_q_indices)
-    active_batch_indices = tuple(int(index) for index in active_batch_indices)
-    if original_token_count < 0 or output_size < 0 or owner_count <= 0:
-        raise ValueError("invalid KV mirror owner dimensions")
-    if len(last_q_indices) != len(active_batch_indices):
-        raise RuntimeError("KV mirror last-Q and active-request metadata must align")
-    if any(
-        index < 0 or index >= output_size for index in active_batch_indices
-    ) or any(
-        current >= following
-        for current, following in zip(
-            active_batch_indices, active_batch_indices[1:]
-        )
-    ):
-        raise RuntimeError("KV mirror active-request indices must be ordered")
-    if any(index < 0 or index >= original_token_count for index in last_q_indices):
-        raise RuntimeError("KV mirror last-Q index is outside the original rows")
-
-    original_layout = TokenOwnerLayout.balanced(
-        valid_token_count=original_token_count,
-        owner_count=owner_count,
-        local_owner_rank=0,
-    )
-    owner_ends = (*original_layout.owner_offsets[1:], original_token_count)
-
-    active_owners = []
-    owner = 0
-    for last_q_index in last_q_indices:
-        while owner < owner_count - 1 and last_q_index >= owner_ends[owner]:
-            owner += 1
-        active_owners.append(owner)
-    if any(
-        current > following
-        for current, following in zip(active_owners, active_owners[1:])
-    ):
-        raise RuntimeError("KV mirror survivor owners are not monotonic")
-
-    boundaries = [0]
-    survivor = 0
-    for next_owner in range(1, owner_count):
-        while survivor < len(active_owners) and active_owners[survivor] < next_owner:
-            survivor += 1
-        boundaries.append(
-            active_batch_indices[survivor]
-            if survivor < len(active_batch_indices)
-            else output_size
-        )
-    boundaries.append(output_size)
-    return tuple(
-        boundaries[index + 1] - boundaries[index]
-        for index in range(owner_count)
-    )
-
-
-class WeLMTokenOwnerLayoutProvider:
-    def __init__(self, *, attn_tp_group=None, global_tp_group=None):
-        self.attn_tp_group = (
-            get_attn_tp_group() if attn_tp_group is None else attn_tp_group
-        )
-        self.global_tp_group = (
-            get_tp_group() if global_tp_group is None else global_tp_group
-        )
-
-    def _dp_rank(self) -> int:
-        return self.global_tp_group.rank_in_group // self.attn_tp_group.world_size
-
-    def _original_local_layout(self, forward_batch: ForwardBatch) -> TokenOwnerLayout:
-        original_counts = getattr(
-            forward_batch, "original_global_num_tokens_cpu", None
-        )
-        dp_rank = self._dp_rank()
-        if original_counts is None or not 0 <= dp_rank < len(original_counts):
-            raise RuntimeError(
-                "WeLM token-owner mirror contraction requires original DP counts"
-            )
-        return TokenOwnerLayout.balanced(
-            valid_token_count=int(original_counts[dp_rank]),
-            owner_count=self.attn_tp_group.world_size,
-            local_owner_rank=self.attn_tp_group.rank_in_group,
-        )
-
-    def _local_mirror_mapping(
-        self, forward_batch: ForwardBatch
-    ) -> tuple[TokenOwnerLayout, TokenOwnerLayout, tuple[tuple[int, int], ...]]:
-        layout = self.local_layout(forward_batch)
-        original_layout = self._original_local_layout(forward_batch)
-        last_q_indices = getattr(
-            forward_batch, "welm_kv_mirror_last_q_indices_cpu", None
-        )
-        active_batch_indices = getattr(
-            forward_batch, "welm_kv_mirror_active_batch_indices_cpu", None
-        )
-        if (
-            last_q_indices is None
-            or active_batch_indices is None
-            or len(last_q_indices) != len(active_batch_indices)
-        ):
-            raise RuntimeError(
-                "WeLM token-owner mirror contraction requires aligned CPU row metadata"
-            )
-
-        source_start = original_layout.owner_offsets[original_layout.local_owner_rank]
-        source_end = source_start + original_layout.local_valid_rows
-        output_start = layout.owner_offsets[layout.local_owner_rank]
-        output_end = output_start + layout.local_valid_rows
-        mapping = []
-        for source_index, output_index in zip(
-            last_q_indices, active_batch_indices, strict=True
-        ):
-            source_index = int(source_index)
-            if source_start <= source_index < source_end:
-                output_index = int(output_index)
-                if not output_start <= output_index < output_end:
-                    raise RuntimeError(
-                        "KV mirror survivor is outside its original owner segment"
-                    )
-                mapping.append(
-                    (source_index - source_start, output_index - output_start)
-                )
-        return layout, original_layout, tuple(mapping)
-
-    def _layouts(
-        self, forward_batch: ForwardBatch
-    ) -> tuple[TokenOwnerLayout, TokenOwnerLayout]:
-        contraction_marker = getattr(
-            forward_batch, "_welm_kv_mirror_contracted_dp_metadata_rows", None
-        )
-        counts_source = getattr(forward_batch, "global_num_tokens_cpu", None)
-        contract_flags_source = getattr(
-            forward_batch, "welm_kv_mirror_contract_flags", None
-        )
-        original_counts_source = getattr(
-            forward_batch, "original_global_num_tokens_cpu", None
-        )
-        last_q_indices_source = getattr(
-            forward_batch, "welm_kv_mirror_last_q_indices_cpu", None
-        )
-        active_batch_indices_source = getattr(
-            forward_batch, "welm_kv_mirror_active_batch_indices_cpu", None
-        )
-        merge_kv_fill_draft = bool(
-            getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-        )
-        cache = getattr(forward_batch, "_welm_token_owner_layout_cache", None)
-        if (
-            cache is not None
-            and cache[0] == contraction_marker
-            and cache[1] is counts_source
-            and cache[2] is contract_flags_source
-            and cache[3] is original_counts_source
-            and cache[4] is last_q_indices_source
-            and cache[5] is active_batch_indices_source
-            and cache[6] == merge_kv_fill_draft
-        ):
-            return cache[7]
-
-        if counts_source is None:
-            raise RuntimeError("WeLM token-owner requires CPU global token counts")
-        counts = tuple(int(count) for count in counts_source)
-        if not counts or any(count < 0 for count in counts):
-            raise RuntimeError("WeLM token-owner received invalid global token counts")
-
-        attn_tp_size = self.attn_tp_group.world_size
-        global_tp_rank = self.global_tp_group.rank_in_group
-        if self.global_tp_group.world_size != len(counts) * attn_tp_size:
-            raise RuntimeError("WeLM token-owner group sizes do not match token counts")
-        if self.attn_tp_group.rank_in_group != global_tp_rank % attn_tp_size:
-            raise RuntimeError("WeLM token-owner rank ordering changed at runtime")
-
-        dp_rank = self._dp_rank()
-        contraction_active = contraction_marker is not None
-        preserve_mirror_owner = contraction_active and not merge_kv_fill_draft
-        contract_flags = contract_flags_source
-        if preserve_mirror_owner:
-            if contract_flags is None or len(contract_flags) != len(counts):
-                raise RuntimeError(
-                    "WeLM token-owner mirror contraction requires one flag per DP rank"
-                )
-            contract_flags = tuple(bool(flag) for flag in contract_flags)
-        else:
-            contract_flags = tuple(False for _ in counts)
-
-        last_q_indices = tuple(int(index) for index in (last_q_indices_source or ()))
-        active_batch_indices = tuple(
-            int(index) for index in (active_batch_indices_source or ())
-        )
-        original_counts = tuple(
-            int(count) for count in (original_counts_source or counts)
-        )
-        if contract_flags[dp_rank]:
-            if len(original_counts) != len(counts):
-                raise RuntimeError(
-                    "WeLM token-owner mirror contraction requires original DP counts"
-                )
-            local_owner_sizes = _welm_kv_mirror_owner_sizes(
-                original_token_count=original_counts[dp_rank],
-                owner_count=attn_tp_size,
-                last_q_indices=last_q_indices,
-                active_batch_indices=active_batch_indices,
-                output_size=counts[dp_rank],
-            )
-            local_layout = TokenOwnerLayout.from_owner_sizes(
-                local_owner_sizes,
-                local_owner_rank=self.attn_tp_group.rank_in_group,
-            )
-        else:
-            local_layout = TokenOwnerLayout.balanced(
-                valid_token_count=counts[dp_rank],
-                owner_count=attn_tp_size,
-                local_owner_rank=self.attn_tp_group.rank_in_group,
-            )
-
-        global_owner_sizes = tuple(
-            owner_size
-            for count, contracted in zip(counts, contract_flags, strict=True)
-            for owner_size in (
-                (count, *(0 for _ in range(attn_tp_size - 1)))
-                if contracted
-                else TokenOwnerLayout.balanced(
-                    valid_token_count=count,
-                    owner_count=attn_tp_size,
-                    local_owner_rank=0,
-                ).owner_sizes
-            )
-        )
-        global_layout = TokenOwnerLayout.from_owner_sizes(
-            global_owner_sizes,
-            local_owner_rank=global_tp_rank,
-        )
-        layouts = (local_layout, global_layout)
-        forward_batch._welm_token_owner_layout_cache = (
-            contraction_marker,
-            counts_source,
-            contract_flags_source,
-            original_counts_source,
-            last_q_indices_source,
-            active_batch_indices_source,
-            merge_kv_fill_draft,
-            layouts,
-        )
-        return layouts
-
-    def local_layout(self, forward_batch: ForwardBatch) -> TokenOwnerLayout:
-        return self._layouts(forward_batch)[0]
-
-    def global_layout(self, forward_batch: ForwardBatch) -> TokenOwnerLayout:
-        return self._layouts(forward_batch)[1]
-
-    def local_contraction_active(self, forward_batch: ForwardBatch) -> bool:
-        if not hasattr(
-            forward_batch, "_welm_kv_mirror_contracted_dp_metadata_rows"
-        ):
-            return False
-        if getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
-            return False
-        contract_flags = getattr(
-            forward_batch, "welm_kv_mirror_contract_flags", None
-        )
-        counts = getattr(forward_batch, "global_num_tokens_cpu", None)
-        if (
-            contract_flags is None
-            or counts is None
-            or len(contract_flags) != len(counts)
-        ):
-            raise RuntimeError(
-                "WeLM token-owner mirror contraction requires one flag per DP rank"
-            )
-        return bool(contract_flags[self._dp_rank()])
-
-    def valid_local_mask(
-        self,
-        forward_batch: ForwardBatch,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        layout = self.local_layout(forward_batch)
-        last_q_indices_source = getattr(
-            forward_batch, "welm_kv_mirror_last_q_indices_cpu", None
-        )
-        active_batch_indices_source = getattr(
-            forward_batch, "welm_kv_mirror_active_batch_indices_cpu", None
-        )
-        cache = getattr(forward_batch, "_welm_token_owner_valid_mask_cache", None)
-        if (
-            cache is not None
-            and cache[0] is layout
-            and cache[1] is last_q_indices_source
-            and cache[2] is active_batch_indices_source
-            and cache[3] == device
-        ):
-            return cache[4]
-        mask = torch.zeros(layout.local_valid_rows, dtype=torch.bool, device=device)
-        if self.local_contraction_active(forward_batch):
-            _, _, mapping = self._local_mirror_mapping(forward_batch)
-            index = torch.tensor(
-                [output_index for _, output_index in mapping],
-                dtype=torch.long,
-                device=device,
-            )
-            mask.index_fill_(0, index, True)
-        else:
-            mask.fill_(True)
-        forward_batch._welm_token_owner_valid_mask_cache = (
-            layout,
-            last_q_indices_source,
-            active_batch_indices_source,
-            device,
-            mask,
-        )
-        return mask
-
-    def align_kv_mirror_residual(
-        self,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        if not self.local_contraction_active(forward_batch):
-            return residual
-        layout, original_layout, mapping = self._local_mirror_mapping(forward_batch)
-        if residual.shape[0] != original_layout.local_valid_rows:
-            raise RuntimeError(
-                "pre-contraction residual rows do not match the original owner"
-            )
-        contracted = residual.new_zeros(
-            (layout.local_valid_rows, *residual.shape[1:])
-        )
-        if mapping:
-            source = torch.tensor(
-                [source_index for source_index, _ in mapping],
-                dtype=torch.long,
-                device=residual.device,
-            )
-            output = torch.tensor(
-                [output_index for _, output_index in mapping],
-                dtype=torch.long,
-                device=residual.device,
-            )
-            contracted.index_copy_(0, output, residual.index_select(0, source))
-        return contracted
-
-
-@dataclass(frozen=True)
-class WeLMTokenOwnerRouterContext:
-    gathers_hidden_states = True
-
-    layout: TokenOwnerLayout
-    global_tp_group: object
-    local_layout: Optional[TokenOwnerLayout] = None
-    attn_tp_group: Optional[object] = None
-
-    def __post_init__(self):
-        if (
-            self.global_tp_group.world_size != len(self.layout.owner_sizes)
-            or self.global_tp_group.rank_in_group != self.layout.local_owner_rank
-        ):
-            raise RuntimeError(
-                "WeLM token-owner Router group does not match its layout"
-            )
-        if self.local_layout is not None:
-            if self.attn_tp_group is None:
-                raise RuntimeError("WeLM token-owner proxy requires an AttnTP group")
-            if (
-                self.attn_tp_group.world_size
-                != len(self.local_layout.owner_sizes)
-                or self.attn_tp_group.rank_in_group
-                != self.local_layout.local_owner_rank
-            ):
-                raise RuntimeError(
-                    "WeLM token-owner proxy group does not match its local layout"
-                )
-
-    @staticmethod
-    def _validate_rows(tensor: torch.Tensor, expected: int, name: str) -> None:
-        rows = 0 if tensor.ndim == 0 else tensor.shape[0]
-        if rows != expected:
-            raise RuntimeError(f"{name} has {rows} rows, expected {expected}")
-
-    def local_rows(self, tensor: torch.Tensor) -> torch.Tensor:
-        self._validate_rows(
-            tensor,
-            (
-                self.local_layout.local_valid_rows
-                if self.local_layout is not None
-                else self.layout.local_valid_rows
-            ),
-            "owner-local Router input",
-        )
-        return tensor
-
-    def prepare_moe_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: StandardTopKOutput,
-    ) -> tuple[torch.Tensor, StandardTopKOutput]:
-        local_rows = (
-            self.local_layout.local_valid_rows
-            if self.local_layout is not None
-            else self.layout.local_valid_rows
-        )
-        self._validate_rows(hidden_states, local_rows, "owner-local expert input")
-        if not isinstance(topk_output, StandardTopKOutput):
-            raise RuntimeError("WeLM token-owner requires Standard TopK output")
-        self._validate_rows(topk_output.topk_weights, local_rows, "owner top-k weights")
-        self._validate_rows(topk_output.topk_ids, local_rows, "owner top-k ids")
-        global_inputs = [
-            hidden_states,
-            topk_output.topk_weights,
-            topk_output.topk_ids,
-        ]
-        if self.local_layout is not None:
-            local_size = len(self.local_layout.owner_sizes)
-            group_start = (self.layout.local_owner_rank // local_size) * local_size
-            global_local_sizes = self.layout.owner_sizes[
-                group_start : group_start + local_size
-            ]
-            if global_local_sizes != self.local_layout.owner_sizes:
-                local_inputs = self.attn_tp_group.all_gatherv(
-                    global_inputs,
-                    sizes=list(self.local_layout.owner_sizes),
-                )
-                if not isinstance(local_inputs, list) or len(local_inputs) != 3:
-                    raise RuntimeError(
-                        "WeLM token-owner proxy gather returned an invalid result"
-                    )
-                global_inputs = (
-                    local_inputs
-                    if self.local_layout.local_owner_rank == 0
-                    else [tensor[:0] for tensor in local_inputs]
-                )
-        gathered = self.global_tp_group.all_gatherv(
-            global_inputs,
-            sizes=list(self.layout.owner_sizes),
-        )
-        if not isinstance(gathered, list) or len(gathered) != 3:
-            raise RuntimeError("WeLM token-owner expert-input gather failed")
-        full_hidden, full_weights, full_ids = gathered
-        for tensor, name in (
-            (full_hidden, "global expert input"),
-            (full_weights, "global top-k weights"),
-            (full_ids, "global top-k ids"),
-        ):
-            self._validate_rows(tensor, self.layout.valid_token_count, name)
-        return full_hidden, StandardTopKOutput(
-            topk_weights=full_weights,
-            topk_ids=full_ids,
-            router_logits=topk_output.router_logits.new_empty(
-                (self.layout.valid_token_count, 0)
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class WeLMDeepEPTokenOwnerRouterContext:
-    gathers_hidden_states = False
-
-    layout: TokenOwnerLayout
-    valid_local_mask: torch.Tensor
-
-    def __post_init__(self):
-        if (
-            self.valid_local_mask.dtype != torch.bool
-            or self.valid_local_mask.ndim != 1
-            or self.valid_local_mask.shape[0] != self.layout.local_valid_rows
-        ):
-            raise RuntimeError("invalid DeepEP token-owner valid-row mask")
-
-    def local_rows(self, tensor: torch.Tensor) -> torch.Tensor:
-        WeLMTokenOwnerRouterContext._validate_rows(
-            tensor,
-            self.layout.local_valid_rows,
-            "DeepEP owner-local Router input",
-        )
-        return tensor
-
-    def prepare_moe_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: StandardTopKOutput,
-    ) -> tuple[torch.Tensor, StandardTopKOutput]:
-        self.local_rows(hidden_states)
-        if not isinstance(topk_output, StandardTopKOutput):
-            raise RuntimeError("WeLM DeepEP token-owner requires Standard TopK output")
-        self.local_rows(topk_output.topk_weights)
-        self.local_rows(topk_output.topk_ids)
-        if self.valid_local_mask.device != topk_output.topk_ids.device:
-            raise RuntimeError("DeepEP token-owner valid-row mask is on the wrong device")
-        invalid = ~self.valid_local_mask[:, None]
-        topk_ids = topk_output.topk_ids.masked_fill(invalid, -1)
-        topk_weights = topk_output.topk_weights.masked_fill(invalid, 0)
-        return hidden_states, StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=topk_output.router_logits,
-        )
 
 
 if welm_v45_80a3_fused_pre_attn_enabled():
@@ -5139,30 +4492,6 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
         return output
 
 
-def _welm_build_layer_scatter_modes(
-    *,
-    config_layer_id: int,
-    total_layer_num: int,
-    num_nextn_predict_layers: int,
-    is_nextn: bool,
-    enable_token_owner: bool,
-    is_layer_sparse: bool,
-) -> LayerScatterModes:
-    standalone_nextn = is_nextn and enable_token_owner
-    return LayerScatterModes.init_new(
-        layer_id=0 if standalone_nextn else config_layer_id,
-        num_layers=(
-            1
-            if standalone_nextn
-            else total_layer_num + num_nextn_predict_layers
-        ),
-        is_layer_sparse=is_layer_sparse,
-        is_previous_layer_sparse=True,
-        is_next_layer_sparse=True,
-        enable_token_owner=enable_token_owner,
-    )
-
-
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -5172,7 +4501,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
-        enable_token_owner: bool = False,
+        token_owner_runtime: Optional[WeLMTokenOwnerRuntime] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -5265,23 +4594,28 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.config_layer_id = config_layer_id
         self.is_nextn = is_nextn
-        self.enable_token_owner = enable_token_owner
+        self.token_owner_runtime = token_owner_runtime
+        self.enable_token_owner = token_owner_runtime is not None
         self.token_owner_uses_global_tp_moe = (
-            enable_token_owner and get_moe_a2a_backend().is_none()
+            self.enable_token_owner and get_moe_a2a_backend().is_none()
         )
         self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
 
         # Qwen2MoE all layers are sparse (include nextn layers)
         self.is_layer_sparse = True
-        self.layer_scatter_modes = _welm_build_layer_scatter_modes(
-            config_layer_id=config_layer_id,
-            total_layer_num=total_layer_num,
-            num_nextn_predict_layers=(
-                num_nextn_predict_layers if is_nextn else 0
+        standalone_nextn = is_nextn and self.enable_token_owner
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=0 if standalone_nextn else config_layer_id,
+            num_layers=(
+                1
+                if standalone_nextn
+                else total_layer_num
+                + (num_nextn_predict_layers if is_nextn else 0)
             ),
-            is_nextn=is_nextn,
-            enable_token_owner=enable_token_owner,
             is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=True,
+            is_next_layer_sparse=True,
+            enable_token_owner=self.enable_token_owner,
         )
 
         if self.is_layer_sparse:
@@ -5315,16 +4649,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.token_owner_layout_provider = (
-            WeLMTokenOwnerLayoutProvider() if enable_token_owner else None
-        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            token_owner_layout_provider=self.token_owner_layout_provider,
-            pre_mlp_norm=self.self_attn.o_norm if enable_token_owner else None,
+            token_owner_layout_provider=token_owner_runtime,
+            pre_mlp_norm=self.self_attn.o_norm if self.enable_token_owner else None,
         )
         residual_after_layernorm = (
             self.ppln and self.config_layer_id not in self.prenorm_layer_idx
@@ -5343,7 +4674,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         self.tp_dp_attntp_fused_norm_managers = (
             {}
-            if enable_token_owner
+            if self.enable_token_owner
             else _welm_create_tp_dp_attntp_fused_norm_managers(
                 attention=self.self_attn,
                 hidden_size=self.hidden_size,
@@ -5351,7 +4682,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 model_dtype=self.input_layernorm.weight.dtype,
             )
         )
-        if enable_token_owner and layer_id == 0:
+        if self.enable_token_owner and layer_id == 0:
             logger.warning(
                 "WeLM token-owner uses variable AttnTP reduce-scatter and eager "
                 "norms; AttnTP fused norm is not used in this phase."
@@ -5369,7 +4700,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]
     ]:
         use_previous_precision = welm_use_previous_precision()
-        enable_token_owner = getattr(self, "enable_token_owner", False)
+        enable_token_owner = self.enable_token_owner
         token_owner_uses_global_tp_moe = (
             enable_token_owner and self.token_owner_uses_global_tp_moe
         )
@@ -5475,7 +4806,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                                 forward_batch,
                             )
                     if enable_token_owner:
-                        residual = self.token_owner_layout_provider.local_layout(
+                        residual = self.token_owner_runtime.local_layout(
                             forward_batch
                         ).local_rows(residual)
                     else:
@@ -5586,18 +4917,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and not use_previous_precision
         ):
             marker_attr = "_welm_kv_mirror_contracted_dp_metadata_rows"
-            had_contracted_layout = hasattr(forward_batch, marker_attr)
+            previous_contracted_rows = getattr(forward_batch, marker_attr, None)
             _welm_update_contracted_dp_metadata(
                 forward_batch,
                 hidden_states.shape[0],
                 marker_attr=marker_attr,
                 contract_to_request_counts=True,
             )
+            contracted_rows = getattr(forward_batch, marker_attr, None)
+            if enable_token_owner and contracted_rows != previous_contracted_rows:
+                self.token_owner_runtime.invalidate()
             mirror_owner_layout_just_contracted = (
                 enable_token_owner
-                and not had_contracted_layout
-                and hasattr(forward_batch, marker_attr)
-                and self.token_owner_layout_provider.local_contraction_active(
+                and previous_contracted_rows is None
+                and contracted_rows is not None
+                and self.token_owner_runtime.local_contraction_active(
                     forward_batch
                 )
             )
@@ -5609,7 +4943,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if enable_token_owner:
                 if mirror_owner_layout_just_contracted:
                     residual = (
-                        self.token_owner_layout_provider.align_kv_mirror_residual(
+                        self.token_owner_runtime.align_kv_mirror_residual(
                             residual,
                             forward_batch,
                         )
@@ -5801,30 +5135,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch
             )
         elif token_owner_uses_global_tp_moe:
-            router_context = WeLMTokenOwnerRouterContext(
-                layout=self.token_owner_layout_provider.global_layout(forward_batch),
-                local_layout=self.token_owner_layout_provider.local_layout(
-                    forward_batch
-                ),
-                global_tp_group=get_tp_group(),
-                attn_tp_group=get_attn_tp_group(),
+            router_context = self.token_owner_runtime.build_router_context(
+                forward_batch,
+                device=hidden_states.device,
+                use_deepep=False,
             )
-        elif (
-            enable_token_owner
-            and is_deepep_class_backend()
-            and self.token_owner_layout_provider.local_contraction_active(
-                forward_batch
-            )
-        ):
-            local_layout = self.token_owner_layout_provider.local_layout(forward_batch)
-            router_context = WeLMDeepEPTokenOwnerRouterContext(
-                layout=local_layout,
-                valid_local_mask=(
-                    self.token_owner_layout_provider.valid_local_mask(
-                        forward_batch,
-                        device=hidden_states.device,
-                    )
-                ),
+        elif enable_token_owner and is_deepep_class_backend():
+            router_context = self.token_owner_runtime.build_router_context(
+                forward_batch,
+                device=hidden_states.device,
+                use_deepep=True,
             )
         if skip_empty_cp_mlp:
             mlp_output = hidden_states
@@ -5917,8 +5237,11 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.enable_token_owner = _welm_token_owner_enabled(
+        enable_token_owner = _welm_token_owner_enabled(
             pp_size=self.pp_group.world_size
+        )
+        self.token_owner_runtime = (
+            WeLMTokenOwnerRuntime() if enable_token_owner else None
         )
 
         self.oe_dim = config.oe_dim
@@ -6047,7 +5370,7 @@ class Qwen2MoeModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
-                enable_token_owner=self.enable_token_owner,
+                token_owner_runtime=self.token_owner_runtime,
             )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -6169,6 +5492,8 @@ class Qwen2MoeModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.token_owner_runtime is not None:
+            self.token_owner_runtime.begin_forward(forward_batch)
         if _WELM_DUMP_ENABLED:
             _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
