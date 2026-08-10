@@ -381,6 +381,11 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # Class-level default so partially constructed instances (unit tests build
+    # bare schedulers via Scheduler.__new__) read the flag as disabled;
+    # __init__ / event_loop_overlap assign the real per-instance value.
+    welm_fused_sched_sync_enabled = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1328,6 +1333,16 @@ class Scheduler(
 
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
+
+        # WeLM fused sched-sync (SGLANG_WELM_FUSED_SCHED_SYNC). Enabled (with
+        # qualification checks) at event_loop_overlap entry; the pending stash
+        # exists unconditionally because recv_requests consumes it.
+        self.welm_fused_sched_sync_enabled = False
+        self._welm_fused_pending_reqs: List = []
+        self._welm_fused_fast_rounds = 0
+        self._welm_fused_classic_rounds = 0
+        self._welm_fused_last_log_t = 0.0
+        self._welm_fused_leader_group = None
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
@@ -1750,12 +1765,19 @@ class Scheduler(
                 and not self.spec_algorithm.is_none()
                 and not self.server_args.speculative_skip_dp_mlp_sync
             ):
+                self._welm_dp_prefill_consensus = None
                 return False
 
             has_local_prefill = int(
-                self.chunked_req is not None or len(self.waiting_queue) > 0
+                self.chunked_req is not None
+                or len(self.waiting_queue) > 0
+                # Grammar-queue requests are promoted into waiting_queue inside
+                # get_new_batch_prefill, after this consensus; count them so
+                # the first-mlp-sync skip stays collective-safe.
+                or self.grammar_manager.has_waiting_grammars()
             )
             if self.tp_size == 1:
+                self._welm_dp_prefill_consensus = None
                 return bool(has_local_prefill)
 
             dp_spec_prefill_flag.fill_(has_local_prefill)
@@ -1764,29 +1786,63 @@ class Scheduler(
                 op=torch.distributed.ReduceOp.MAX,
                 group=self.tp_cpu_group,
             )
-            return bool(dp_spec_prefill_flag.item())
+            any_prefill = bool(dp_spec_prefill_flag.item())
+            # Stamp with forward_ct: cache-hit-extend rounds skip this closure,
+            # so a stale consensus must not enable the fast path.
+            self._welm_dp_prefill_consensus = (self.forward_ct, any_prefill)
+            return any_prefill
+
+        self.welm_fused_sched_sync_enabled = self._welm_init_fused_sched_sync()
 
         while True:
-            # Receive requests
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            if self._engine_paused:
-                continue
-
             processed_last_before_schedule = False
-            if should_process_last_cache_hit_extend_before_schedule():
-                pop_and_process()
-                processed_last_before_schedule = True
-            elif should_process_last_before_dp_spec_prefill():
-                # A DP prefill may be local to only one attention-DP rank, but
-                # its MLP-sync collective is global. Finish the previous
-                # speculative decode result on every rank before any rank can
-                # enter the next MLP-sync scheduling collective.
-                pop_and_process()
-                processed_last_before_schedule = True
+            fused_fast = False
+            batch = None
+            if self.welm_fused_sched_sync_enabled:
+                # Steady decode fast path: one fused CPU all_gather replaces
+                # the recv broadcasts, the dp-spec-prefill all_reduce and the
+                # decode mlp-sync gather. Falls through to the classic path
+                # (with the polled requests stashed for recv_requests) on any
+                # non-steady round.
+                fused_fast, batch = self._welm_try_fused_fast_round()
+                if fused_fast:
+                    self._welm_fused_fast_rounds += 1
+                else:
+                    self._welm_fused_classic_rounds += 1
+                now = time.monotonic()
+                if now - self._welm_fused_last_log_t >= 30.0:
+                    self._welm_fused_last_log_t = now
+                    total_rounds = (
+                        self._welm_fused_fast_rounds + self._welm_fused_classic_rounds
+                    )
+                    logger.info(
+                        "[welm] fused sched-sync rounds: fast=%d classic=%d "
+                        "(fast ratio %.1f%%)",
+                        self._welm_fused_fast_rounds,
+                        self._welm_fused_classic_rounds,
+                        100.0 * self._welm_fused_fast_rounds / total_rounds,
+                    )
 
-            # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            if not fused_fast:
+                # Receive requests
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                if self._engine_paused:
+                    continue
+
+                if should_process_last_cache_hit_extend_before_schedule():
+                    pop_and_process()
+                    processed_last_before_schedule = True
+                elif should_process_last_before_dp_spec_prefill():
+                    # A DP prefill may be local to only one attention-DP rank, but
+                    # its MLP-sync collective is global. Finish the previous
+                    # speculative decode result on every rank before any rank can
+                    # enter the next MLP-sync scheduling collective.
+                    pop_and_process()
+                    processed_last_before_schedule = True
+
+                # Get the next batch to run
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1823,6 +1879,156 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    def _welm_init_fused_sched_sync(self) -> bool:
+        """Qualify SGLANG_WELM_FUSED_SCHED_SYNC against the runtime config.
+
+        The fused fast path is only valid for the dp-attention x spec-v2
+        overlap deployment it was designed for; every unsupported feature
+        below either owns extra per-round state the fused row does not carry
+        or reorders scheduling in ways the fast path does not replicate.
+        """
+        if not envs.SGLANG_WELM_FUSED_SCHED_SYNC.get():
+            return False
+
+        sa = self.server_args
+        blockers = []
+        if not (sa.enable_dp_attention and sa.dp_size > 1 and self.require_mlp_sync):
+            blockers.append("requires dp-attention with dp_size > 1")
+        if self.spec_algorithm.is_none() or not (
+            self.spec_algorithm.supports_spec_v2() and self.enable_overlap
+        ):
+            blockers.append("requires speculative decoding with spec-v2 overlap")
+        if sa.speculative_skip_dp_mlp_sync:
+            blockers.append("incompatible with --speculative-skip-dp-mlp-sync")
+        if sa.pp_size > 1:
+            blockers.append("pp_size > 1")
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            blockers.append("disaggregation mode")
+        if self.dllm_config is not None:
+            blockers.append("dllm")
+        if self.enable_hisparse:
+            blockers.append("hisparse")
+        if self.enable_pdmux:
+            blockers.append("pdmux")
+        if self.enable_hierarchical_cache:
+            blockers.append("hierarchical cache")
+        if self.is_mixed_chunk:
+            blockers.append("mixed chunk")
+        if self.attn_cp_size > 1:
+            blockers.append("attention CP")
+        if sa.elastic_ep_backend is not None:
+            blockers.append("elastic EP")
+        if self.input_blocker is not None:
+            blockers.append("input blocker")
+        if len(self.offload_tags) > 0:
+            blockers.append("offload tags")
+        if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+            blockers.append("SGLANG_SCHEDULER_SKIP_ALL_GATHER")
+        if envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get():
+            blockers.append("NCCL sync-batch all_gather")
+        if (
+            envs.SGLANG_REQ_RUNNING_TIMEOUT.get() > 0
+            or envs.SGLANG_REQ_WAITING_TIMEOUT.get() > 0
+        ):
+            # Timeout aborts run inside get_next_batch_to_run, which fast
+            # rounds skip; their wall-clock triggers are also not uniform
+            # across ranks.
+            blockers.append("request timeout aborts")
+        if sa.language_only and sa.encoder_transfer_backend == "zmq_to_scheduler":
+            blockers.append("EPD mm receiver")
+        if self.external_corpus_manager is not None:
+            blockers.append("external corpus manager")
+
+        if blockers:
+            logger.warning(
+                "[welm] fused sched-sync requested but disabled: %s",
+                "; ".join(blockers),
+            )
+            return False
+
+        # Cross-node gloo group of the dp-group leaders (attn_tp_rank 0 of
+        # each group). Every rank must reach this collectively: the enable
+        # decision above only reads uniform env/server-args state, so all
+        # ranks create the group together here at event-loop entry.
+        group_span = self.attn_tp_size * self.attn_cp_size
+        leader_ranks = [
+            self.tp_group.ranks[g * group_span] for g in range(sa.dp_size)
+        ]
+        self._welm_fused_leader_group = torch.distributed.new_group(
+            ranks=leader_ranks, backend="gloo"
+        )
+        logger.info(
+            "[welm] fused sched-sync enabled (hierarchical: %d-leader "
+            "cross-node gather %s + intra-node fan-out)",
+            sa.dp_size,
+            leader_ranks,
+        )
+        return True
+
+    def _welm_try_fused_fast_round(self):
+        """Attempt the fused single-all_gather steady-decode round.
+
+        The local prechecks below only read state that is uniform across
+        ranks by construction — globally reduced flags from the previous
+        round's gather, or control state that only changes through the
+        classic path — so every rank takes or skips the fused gather
+        together (a divergence would trip the forward_ct stamp assert).
+        """
+        if self._engine_paused:
+            return False, None
+        last_batch = self.last_batch
+        if last_batch is not None:
+            # The round after a prefill must merge last_batch into the
+            # running batch inside get_next_batch_to_run.
+            # is_extend_in_batch is the globally reduced flag.
+            if last_batch.is_extend_in_batch:
+                return False, None
+            if _should_process_cache_hit_extend_before_schedule(
+                last_batch,
+                has_pending_result=len(self.result_queue) > 0,
+                require_mlp_sync=self.require_mlp_sync,
+            ):
+                return False, None
+
+        if self.enable_fpm:
+            self._fpm_batch_t0 = time.monotonic()
+
+        # Session housekeeping normally rides process_input_requests, which
+        # fast rounds skip; run it here so deferred/timed-out session closes
+        # release their resources during sustained steady decode. Local-only
+        # and internally throttled, so a same-iteration classic fallback
+        # calling it again is harmless.
+        self.session_controller.maybe_reap(time.monotonic())
+
+        pending_work_count = pending_control_count = 0
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            polled = self._poll_leader_sockets()
+            if polled:
+                self._welm_fused_pending_reqs.extend(polled)
+            if self._welm_fused_pending_reqs:
+                work_reqs, control_reqs = self._split_work_and_control_reqs(
+                    self._welm_fused_pending_reqs
+                )
+                pending_work_count = len(work_reqs)
+                pending_control_count = len(control_reqs)
+            # Leader-only shm GC normally piggybacked on
+            # process_input_requests; no-op when nothing to reclaim.
+            self._cleanup_routed_replay_shm()
+
+        is_fast, batch = self.welm_fused_sched_sync_round(
+            pending_work_count, pending_control_count
+        )
+        if not is_fast:
+            return False, None
+
+        # Parity with the get_next_batch_to_run tail for scheduled batches.
+        batch = self._maybe_prepare_ngram_embedding(batch)
+        if batch:
+            set_schedule_time_batch(batch)
+            if self.enable_fpm:
+                batch.fpm_start_time = self._fpm_batch_t0
+        return True, batch
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -2053,6 +2259,53 @@ class Scheduler(
             self._routed_replay_pending.append((recv_req, future))
         return immediate
 
+    def _poll_leader_sockets(self) -> List:
+        """Non-blocking drain of the leader's tokenizer/rpc sockets.
+
+        Shared by recv_requests and the WeLM fused sched-sync pre-gather poll.
+        Only call on attn_tp_rank == 0 and attn_cp_rank == 0 (pp_rank 0).
+        """
+        recv_reqs = []
+
+        # Drain any router-replay fetches that completed since the
+        # last iteration. These reqs are now resolved (have a CPU
+        # int32 tensor on .router_replay_experts) and are ready to
+        # be broadcast to the other TP ranks.
+        recv_reqs.extend(self._drain_routed_replay_fetches())
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_req)
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_rpc)
+
+        # Defer any reqs with a remote routed_experts ref to the
+        # background thread pool; they'll surface again via
+        # `_drain_routed_replay_fetches` once the Redis GET
+        # completes. This keeps the leader's main loop unblocked
+        # on what would otherwise be ~150-200 ms blocking GETs.
+        return self._enqueue_routed_replay_fetches(recv_reqs)
+
+    def _welm_take_fused_pending(self) -> List:
+        """Pop requests the fused sched-sync poll stashed for this iteration."""
+        if not self._welm_fused_pending_reqs:
+            return []
+        pending = list(self._welm_fused_pending_reqs)
+        self._welm_fused_pending_reqs.clear()
+        return pending
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -2067,38 +2320,10 @@ class Scheduler(
 
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                recv_reqs = []
-
-                # Drain any router-replay fetches that completed since the
-                # last iteration. These reqs are now resolved (have a CPU
-                # int32 tensor on .router_replay_experts) and are ready to
-                # be broadcast to the other TP ranks.
-                recv_reqs.extend(self._drain_routed_replay_fetches())
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-
-                # Defer any reqs with a remote routed_experts ref to the
-                # background thread pool; they'll surface again via
-                # `_drain_routed_replay_fetches` once the Redis GET
-                # completes. This keeps the leader's main loop unblocked
-                # on what would otherwise be ~150-200 ms blocking GETs.
-                recv_reqs = self._enqueue_routed_replay_fetches(recv_reqs)
+                # Requests already polled by the fused sched-sync fast-path
+                # attempt this iteration come first, in arrival order.
+                recv_reqs = self._welm_take_fused_pending()
+                recv_reqs.extend(self._poll_leader_sockets())
             else:
                 recv_reqs = None
         else:
@@ -3176,7 +3401,25 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            consensus = getattr(self, "_welm_dp_prefill_consensus", None)
+            if (
+                new_batch is None
+                and consensus is not None
+                and consensus[0] == self.forward_ct
+                and consensus[1] is False
+            ):
+                # Steady decode: the spec-prefill all_reduce above proved no
+                # rank holds prefill work, so every rank's new_batch is None
+                # and this all_gather would gather zeros and return None.
+                # Skipping it is collective-safe (the consensus is itself a
+                # collective result); the decode-batch sync below still runs.
+                if not getattr(self, "_welm_skip_first_mlpsync_logged", False):
+                    self._welm_skip_first_mlpsync_logged = True
+                    logger.info(
+                        "[welm] steady-decode fast path: skipping redundant first mlp-sync all_gather"
+                    )
+            else:
+                new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
             if (
@@ -4055,6 +4298,26 @@ class Scheduler(
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self.flush_cache())
+
+        if self.welm_fused_sched_sync_enabled:
+            # Deferred (wait-for-idle) flush keeps per-rank state whose
+            # clearing conditions diverge across ranks — state the fused
+            # sched-sync consensus cannot see. Rather than teach the fused
+            # fast path a flush lifecycle for an admin operation with no
+            # in-repo callers, refuse the deferral; callers poll the
+            # immediate mode until the engine drains. Checked before the
+            # idle short-cut so every DP group answers a deferred request
+            # identically under imbalanced load (no partial flush from this
+            # path; the tokenizer keeps only the first of the dp_size
+            # replies).
+            return FlushCacheReqOutput(
+                success=False,
+                message=(
+                    "Deferred flush_cache (timeout_s > 0) is not supported "
+                    "with SGLANG_WELM_FUSED_SCHED_SYNC; retry with "
+                    "timeout_s=0 once the engine is idle."
+                ),
+            )
 
         if self.is_fully_idle():
             return FlushCacheReqOutput(success=self.flush_cache())

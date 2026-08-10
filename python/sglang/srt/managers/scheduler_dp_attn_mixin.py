@@ -25,6 +25,21 @@ _MLP_SYNC_FLAG_ROUTER_REPLAY = 1 << 0
 _MLP_SYNC_FLAG_CACHE_HIT_EXTEND = 1 << 1
 _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT = 1 << 2
 
+# WeLM fused sched-sync (SGLANG_WELM_FUSED_SCHED_SYNC): the mlp-sync row is
+# widened so one all_gather can also carry the per-round scheduling intent
+# that previously required separate collectives (recv broadcasts + the
+# dp-spec-prefill all_reduce). Words 0-7 keep their classic meaning; classic
+# gathers simply carry zeros in the new words.
+_MLP_SYNC_ROW_WORDS = 12
+_WELM_FUSED_SCHED_SYNC_SCHEMA = 1
+
+# Intent word (row index 8) bits. Any nonzero intent on any rank sends the
+# whole round down the classic scheduling path.
+_FUSED_INTENT_NEEDS_CLASSIC = 1 << 0  # prefill/chunked/grammar/prefill-only work
+_FUSED_INTENT_PENDING_WORK = 1 << 1  # leader polled unbroadcast work requests
+_FUSED_INTENT_PENDING_CONTROL = 1 << 2  # leader polled unbroadcast control msgs
+_FUSED_INTENT_MAY_RETRACT = 1 << 3  # decode memory check failed / test retract
+
 
 def _pack_welm_mtp_prefill_info(prefill_num_tokens: int, num_reqs: int) -> int:
     return (
@@ -85,9 +100,13 @@ class MLPSyncBatchInfo:
     has_cache_hit_extend: bool = False
     will_contract_welm_kv_mirror: bool = False
     welm_mtp_prefill_num_tokens: int = 0
+    # WeLM fused sched-sync extras (zero on classic gathers)
+    fused_intent: int = 0
+    fused_stamp: int = 0
 
     # some gathered elements
     tp0_info: torch.Tensor = None
+    all_rows: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_num_reqs: list[int] = None
@@ -118,6 +137,10 @@ class MLPSyncBatchInfo:
                     self.welm_mtp_prefill_num_tokens,
                     self.num_reqs,
                 ),
+                self.fused_intent,
+                self.fused_stamp,
+                _WELM_FUSED_SCHED_SYNC_SCHEMA,
+                0,  # reserved
             ],
             device=device,
             dtype=dtype,
@@ -134,6 +157,10 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # packed flags
                 _pack_welm_mtp_prefill_info(0, 0),  # welm_mtp_prefill_info
+                0,  # fused_intent
+                self.fused_stamp,  # keep the stamp assert happy on substitution
+                _WELM_FUSED_SCHED_SYNC_SCHEMA,
+                0,  # reserved
             ],
             device=device,
             dtype=dtype,
@@ -142,7 +169,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 8),
+            (self.dp_size, self.tp_size * self.cp_size, _MLP_SYNC_ROW_WORDS),
             dtype=torch.int64,
             device=device,
         )
@@ -158,10 +185,50 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 8)
+        tp_info = global_info_tensor.view(
+            self.dp_size * self.tp_size * self.cp_size, _MLP_SYNC_ROW_WORDS
+        )
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        self.all_rows = tp_info
 
-        tp0_info = global_info_tensor[:, 0, :]
+        self._finish_parse(global_info_tensor[:, 0, :])
+
+    def gather_hierarchical(
+        self,
+        leader_group: torch.distributed.ProcessGroup,
+        attn_tp_cpu_group: torch.distributed.ProcessGroup,
+        attn_tp_src: int,
+        is_leader: bool,
+    ):
+        """Two-stage transport for the fused sched-sync gather.
+
+        Within an attn-TP group every rank's row is mirrored (the flat path
+        already consumes only the tp0 rows), so the dp-group leaders exchange
+        one row per group over a small cross-node gloo group (dp_size-1 ring
+        hops instead of world_size-1), then fan the (dp_size, W) result out
+        over the intra-node attn-TP cpu group. Callers must run the stamp
+        assert on all_rows AFTER this returns so leaders and members raise
+        together on desync instead of hanging in the broadcast.
+
+        Only valid when elastic EP is off (no inactive-rank fallback rows) —
+        guaranteed by the fused sched-sync init qualification.
+        """
+        rows = torch.empty((self.dp_size, _MLP_SYNC_ROW_WORDS), dtype=torch.int64)
+        if is_leader:
+            local_info_tensor = self._get_local_tensor(device="cpu")
+            torch.distributed.all_gather_into_tensor(
+                rows.flatten(),
+                local_info_tensor,
+                group=leader_group,
+            )
+        if self.tp_size * self.cp_size > 1:
+            torch.distributed.broadcast(
+                rows, src=attn_tp_src, group=attn_tp_cpu_group
+            )
+        self.all_rows = rows
+        self._finish_parse(rows)
+
+    def _finish_parse(self, tp0_info: torch.Tensor):
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
         cpu_data = tp0_info[:, [0, 1, 2, 3, 5, 6, 7]].cpu()
@@ -274,18 +341,19 @@ def _get_welm_mtp_prefill_num_tokens(local_batch: Optional[ScheduleBatch]) -> in
     return int(local_batch.extend_num_tokens or 0)
 
 
-def prepare_mlp_sync_batch_raw(
-    local_batch: ScheduleBatch,
+def compute_local_mlp_sync_info(
+    local_batch: Optional[ScheduleBatch],
     dp_size: int,
     attn_tp_size: int,
     attn_cp_size: int,
-    tp_group: GroupCoordinator,
-    get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
-    require_mlp_tp_gather: bool,
-    disable_overlap_schedule: bool,
-    offload_tags: set[str],
 ):
+    """Compute this rank's mlp-sync row from local scheduler state.
+
+    Shared by the classic prepare_mlp_sync_batch_raw path and the WeLM fused
+    sched-sync fast path so both contribute bit-identical rows.
+    Returns (mlp_sync_info, tbo_preparer); no collective is issued here.
+    """
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
@@ -311,7 +379,6 @@ def prepare_mlp_sync_batch_raw(
         else:
             num_tokens_for_logprob = local_batch.batch_size()
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -333,16 +400,6 @@ def prepare_mlp_sync_batch_raw(
     welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
-    ):
-        group = tp_group.device_group
-        device = tp_group.device
-    else:
-        group = tp_group.cpu_group
-        device = "cpu"
-
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
     mlp_sync_info = MLPSyncBatchInfo(
@@ -361,10 +418,24 @@ def prepare_mlp_sync_batch_raw(
         will_contract_welm_kv_mirror=will_contract_welm_kv_mirror,
         welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
     )
+    return mlp_sync_info, tbo_preparer
 
+
+def apply_gathered_mlp_sync(
+    local_batch: Optional[ScheduleBatch],
+    mlp_sync_info: MLPSyncBatchInfo,
+    tbo_preparer: TboDPAttentionPreparer,
+    get_idle_batch: Callable[[], ScheduleBatch],
+    require_mlp_tp_gather: bool,
+    skip_all_gather: bool,
+):
+    """Apply gathered mlp-sync metadata to the local batch.
+
+    Mirrors the post-gather half of the classic prepare_mlp_sync_batch_raw:
+    TBO output, idle-batch creation for ranks without work, and the
+    _update_gather_batch field propagation.
+    """
     if not skip_all_gather:
-        mlp_sync_info.all_gather(device=device, group=group)
-
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
                 mlp_sync_info.tp0_info[:, 4:6],
@@ -389,6 +460,50 @@ def prepare_mlp_sync_batch_raw(
     return local_batch
 
 
+def prepare_mlp_sync_batch_raw(
+    local_batch: ScheduleBatch,
+    dp_size: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    tp_group: GroupCoordinator,
+    get_idle_batch: Callable[[], ScheduleBatch],
+    disable_cuda_graph: bool,
+    require_mlp_tp_gather: bool,
+    disable_overlap_schedule: bool,
+    offload_tags: set[str],
+):
+    mlp_sync_info, tbo_preparer = compute_local_mlp_sync_info(
+        local_batch,
+        dp_size=dp_size,
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=attn_cp_size,
+        disable_cuda_graph=disable_cuda_graph,
+    )
+
+    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    if len(offload_tags) == 0 and (
+        disable_overlap_schedule
+        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    ):
+        group = tp_group.device_group
+        device = tp_group.device
+    else:
+        group = tp_group.cpu_group
+        device = "cpu"
+
+    if not skip_all_gather:
+        mlp_sync_info.all_gather(device=device, group=group)
+
+    return apply_gathered_mlp_sync(
+        local_batch,
+        mlp_sync_info,
+        tbo_preparer,
+        get_idle_batch=get_idle_batch,
+        require_mlp_tp_gather=require_mlp_tp_gather,
+        skip_all_gather=skip_all_gather,
+    )
+
+
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -403,6 +518,123 @@ class SchedulerDPAttnMixin:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
         )
+
+    def welm_fused_sched_sync_round(
+        self: Scheduler, pending_work_count: int, pending_control_count: int
+    ):
+        """Single fused CPU all_gather for a steady decode round.
+
+        Collapses the per-round recv broadcasts (empty in steady state), the
+        dp-spec-prefill all_reduce, and the decode mlp-sync all_gather into
+        one collective. Pre-gather work is read-only or idempotent
+        (filter_batch); every side-effecting step (retract, admission,
+        control handling) is deferred until the gathered consensus authorizes
+        the fast path.
+
+        Returns (True, batch) when every rank is on a plain decode/idle
+        round; batch may be None (fully idle fleet). Returns (False, None)
+        when any rank raised an intent bit — the caller must then run the
+        classic scheduling path, which re-resolves the round from scratch
+        (nothing gathered here has been applied).
+        """
+        rb = self.running_batch
+        initial_bs = rb.batch_size()
+        if not rb.is_empty():
+            # Same filter update_running_batch would run (idempotent), hoisted
+            # so the gathered num_tokens reflects the post-filter batch size.
+            rb.filter_batch(v1_spec_info_filtered=True)
+            if rb.batch_size() < initial_bs:
+                rb.batch_is_full = False
+
+        candidate = None
+        if not rb.is_empty() and not rb.is_prefill_only:
+            candidate = rb
+
+        intent = 0
+        if pending_work_count > 0:
+            intent |= _FUSED_INTENT_PENDING_WORK
+        if pending_control_count > 0:
+            intent |= _FUSED_INTENT_PENDING_CONTROL
+        if (
+            self.chunked_req is not None
+            or len(self.waiting_queue) > 0
+            # Grammar-queue requests are promoted into waiting_queue inside
+            # get_new_batch_prefill; count them here so the fast path stays
+            # collective-safe (same lesson as the dp-spec-prefill consensus).
+            or self.grammar_manager.has_waiting_grammars()
+            or (not rb.is_empty() and rb.is_prefill_only)
+        ):
+            intent |= _FUSED_INTENT_NEEDS_CLASSIC
+        if candidate is not None and (
+            not self._check_decode_mem(candidate)
+            or (
+                envs.SGLANG_TEST_RETRACT.get()
+                and self.forward_ct % envs.SGLANG_TEST_RETRACT_INTERVAL.get() == 0
+            )
+        ):
+            # Retraction may fire in update_running_batch: it would change the
+            # batch size after we gathered it, so route through the classic
+            # path where retract happens before the decode mlp-sync gather.
+            # Deliberately unconditional: check_decode_mem may evict from the
+            # radix cache, and that side effect must stay identical on every
+            # rank of an attn-TP group, so it must not be gated on
+            # leader-only intent bits such as pending work/control.
+            intent |= _FUSED_INTENT_MAY_RETRACT
+
+        mlp_sync_info, tbo_preparer = compute_local_mlp_sync_info(
+            candidate,
+            dp_size=self.server_args.dp_size,
+            attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+        )
+        mlp_sync_info.fused_intent = intent
+        mlp_sync_info.fused_stamp = self.forward_ct
+
+        mlp_sync_info.gather_hierarchical(
+            leader_group=self._welm_fused_leader_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_tp_src=self.attn_tp_group.ranks[0],
+            is_leader=(self.attn_tp_rank == 0 and self.attn_cp_rank == 0),
+        )
+
+        rows = mlp_sync_info.all_rows
+        if not (
+            bool((rows[:, 9] == self.forward_ct).all())
+            and bool((rows[:, 10] == _WELM_FUSED_SCHED_SYNC_SCHEMA).all())
+        ):
+            # A rank skipped or double-entered a collective. Failing loudly
+            # here beats the silent cross-rank hang this used to become.
+            raise RuntimeError(
+                "[welm] fused sched-sync desync detected "
+                f"(local forward_ct={self.forward_ct}, "
+                f"schema={_WELM_FUSED_SCHED_SYNC_SCHEMA}); gathered rows: "
+                f"{rows.tolist()}"
+            )
+
+        if bool(rows[:, 8].any()):
+            return False, None
+
+        # Fast path: every rank is on a plain decode (or idle) round. Finish
+        # the non-retract remainder of update_running_batch — the pre-gather
+        # _check_decode_mem consensus guarantees the retract branch is dead —
+        # then apply the gathered metadata exactly like the classic path.
+        if candidate is not None:
+            self.new_token_ratio = max(
+                self.new_token_ratio - self.new_token_ratio_decay,
+                self.min_new_token_ratio,
+            )
+            candidate.prepare_for_decode()
+
+        batch = apply_gathered_mlp_sync(
+            candidate,
+            mlp_sync_info,
+            tbo_preparer,
+            get_idle_batch=self.get_idle_batch,
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            skip_all_gather=False,
+        )
+        return True, batch
 
     def maybe_prepare_mlp_sync_batch(
         self: Scheduler,

@@ -472,6 +472,12 @@ class Envs:
     SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # WeLM fused scheduler sync: collapse the per-round recv broadcasts,
+    # spec-prefill all_reduce and decode mlp-sync all_gather into a single
+    # hierarchical CPU gather (cross-node leader gather + intra-node fan-out)
+    # on steady decode rounds (dp-attention x spec-v2 only).
+    SGLANG_WELM_FUSED_SCHED_SYNC = EnvBool(False)
+
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
