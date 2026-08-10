@@ -202,10 +202,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
     # data_ptr() the captured graph baked in. ``None`` when the runner won't
     # use the prepared mk path (env off, mk missing, OE not configured, etc.).
     welm_oe_fused_decode_output: Optional[torch.Tensor]
-    router_replay_topk_ids: torch.Tensor
-    router_replay_mask: torch.Tensor
-    router_replay_local_topk_ids: torch.Tensor
-    router_replay_local_mask: torch.Tensor
+    router_replay_topk_ids: Optional[torch.Tensor]
+    router_replay_mask: Optional[torch.Tensor]
+    router_replay_local_topk_ids: Optional[torch.Tensor]
+    router_replay_local_mask: Optional[torch.Tensor]
     scale_seq_factor: int = 1
 
     @classmethod
@@ -229,6 +229,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         welm_oe_decode_hash_num_branches: int,
         scale_seq_factor: int,
+        enable_router_replay: bool,
         router_replay_num_layers: int = 0,
         router_replay_top_k: int = 0,
         kv_mirror_layers: Optional[List[int]] = None,
@@ -333,29 +334,40 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
-            # The GLOBAL router-replay buffers receive a dp_gather of every DP
-            # group's rows; sizing them at max_num_token lets python slicing
-            # silently clamp once uneven DP groups select a larger bucket ->
-            # all_gather size mismatch.
-            router_gather_rows = (
-                max_num_token * dp_size if require_mlp_tp_gather else max_num_token
-            )
-            router_shape = (
-                router_gather_rows,
-                router_replay_num_layers,
-                router_replay_top_k,
-            )
-            router_replay_topk_ids = torch.zeros(router_shape, dtype=torch.int32)
-            router_replay_mask = torch.zeros((router_gather_rows,), dtype=torch.bool)
-            local_router_shape = (
-                max_num_token,
-                router_replay_num_layers,
-                router_replay_top_k,
-            )
-            router_replay_local_topk_ids = torch.zeros(
-                local_router_shape, dtype=torch.int32
-            )
-            router_replay_local_mask = torch.zeros((max_num_token,), dtype=torch.bool)
+            if enable_router_replay:
+                # Global buffers receive every DP group's rows.
+                router_gather_rows = (
+                    max_num_token * dp_size
+                    if require_mlp_tp_gather
+                    else max_num_token
+                )
+                router_shape = (
+                    router_gather_rows,
+                    router_replay_num_layers,
+                    router_replay_top_k,
+                )
+                router_replay_topk_ids = torch.zeros(
+                    router_shape, dtype=torch.int32
+                )
+                router_replay_mask = torch.zeros(
+                    (router_gather_rows,), dtype=torch.bool
+                )
+                local_router_shape = (
+                    max_num_token,
+                    router_replay_num_layers,
+                    router_replay_top_k,
+                )
+                router_replay_local_topk_ids = torch.zeros(
+                    local_router_shape, dtype=torch.int32
+                )
+                router_replay_local_mask = torch.zeros(
+                    (max_num_token,), dtype=torch.bool
+                )
+            else:
+                router_replay_topk_ids = None
+                router_replay_mask = None
+                router_replay_local_topk_ids = None
+                router_replay_local_mask = None
 
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
@@ -532,16 +544,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
         static_num_token = bs * num_tokens_per_bs
-        if require_gathered_buffer:
-            copy_router_replay_to_cuda_graph_buffers(
-                dst_topk_ids=self.router_replay_local_topk_ids,
-                dst_mask=self.router_replay_local_mask,
-                src_topk_ids=forward_batch.router_replay_topk_ids,
-                src_mask=forward_batch.router_replay_mask,
-                raw_num_token=raw_num_token,
-                static_num_token=static_num_token,
-            )
-
+        if self.router_replay_topk_ids is not None and require_gathered_buffer:
+            assert self.router_replay_mask is not None
+            assert self.router_replay_local_topk_ids is not None
+            assert self.router_replay_local_mask is not None
             # NOTE(replay+dp-attn): use dp_gather_REPLICATE rather than
             # dp_gather_partial here. router_replay_topk_ids/mask are
             # replicated across attn-TP ranks within a DP rank, so the all-
@@ -551,11 +557,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
             # forced_ids)` in _gather_router_replay_weights.  Replicate semantics
             # contribute only from attn_tp_rank==0 so the all-reduce returns a
             # single copy.
-            from sglang.srt.layers.dp_attention import dp_gather_replicate
-
             global_static_num_token = (
                 static_num_token * self.global_num_tokens_gpu.numel()
             )
+            copy_router_replay_to_cuda_graph_buffers(
+                dst_topk_ids=self.router_replay_local_topk_ids,
+                dst_mask=self.router_replay_local_mask,
+                src_topk_ids=forward_batch.router_replay_topk_ids,
+                src_mask=forward_batch.router_replay_mask,
+                raw_num_token=raw_num_token,
+                static_num_token=static_num_token,
+            )
+            from sglang.srt.layers.dp_attention import dp_gather_replicate
+
             old_global_num_tokens_gpu = forward_batch.global_num_tokens_gpu
             old_dp_padding_mode = forward_batch.dp_padding_mode
             old_dp_local_start_pos = forward_batch.dp_local_start_pos
@@ -567,9 +581,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 )
                 forward_batch.dp_local_start_pos = None
                 forward_batch.dp_local_num_tokens = None
-                # Zero the slice BEFORE the all-reduce: dp_gather_replicate
-                # sums across the TP group, so any stale non-zero data on
-                # non-rank-0 attn_tp ranks would otherwise be summed in.
+                # Clear non-source lanes before the sum-backed DP gather.
                 self.router_replay_topk_ids[:global_static_num_token].zero_()
                 dp_gather_replicate(
                     self.router_replay_topk_ids[:global_static_num_token],
@@ -596,7 +608,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 forward_batch.dp_local_num_tokens = old_dp_local_num_tokens
             if self.router_replay_mask.shape[0] > global_static_num_token:
                 self.router_replay_mask[global_static_num_token:].fill_(False)
-        else:
+        elif self.router_replay_topk_ids is not None:
+            assert self.router_replay_mask is not None
             copy_router_replay_to_cuda_graph_buffers(
                 dst_topk_ids=self.router_replay_topk_ids,
                 dst_mask=self.router_replay_mask,
@@ -758,7 +771,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
         mul_base *= 2
         num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
 
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer(server_args) and not server_args.enable_token_owner:
         mul_base *= get_attention_tp_size()
 
     # Sharded-KV CP keeps each decode request as a full-Q request and only shards
@@ -865,6 +878,7 @@ class CudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.use_token_owner = model_runner.server_args.enable_token_owner
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         self.record_nolora_graph = should_record_nolora_graph()
@@ -1117,6 +1131,7 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             welm_oe_decode_hash_num_branches=welm_oe_decode_hash_num_branches,
             scale_seq_factor=self.scale_seq_factor,
+            enable_router_replay=self.model_runner.server_args.enable_moe_router_replay,
             router_replay_num_layers=getattr(
                 self.model_runner.model_config.hf_text_config,
                 "num_hidden_layers",
@@ -1441,6 +1456,17 @@ class CudaGraphRunner:
             return "lora"
         return "nolora"
 
+    @staticmethod
+    def _requested_token_owner_graph_batch_size(
+        forward_batch: ForwardBatch,
+    ) -> int:
+        counts = forward_batch.global_num_reqs_cpu
+        if not counts:
+            raise RuntimeError(
+                "Token-owner CUDA graph requires non-empty global request counts"
+            )
+        return max(counts)
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -1451,7 +1477,9 @@ class CudaGraphRunner:
             if stream_idx is not None
             else self.attn_backend
         )
-        if self.require_mlp_tp_gather:
+        if self.use_token_owner:
+            cuda_graph_bs = self._requested_token_owner_graph_batch_size(forward_batch)
+        elif self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -1731,7 +1759,7 @@ class CudaGraphRunner:
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
         if (
-            enable_num_token_non_padded()
+            enable_num_token_non_padded(self.model_runner.server_args)
             and self.require_gathered_buffer
             and not self.nsa_enable_prefill_cp
         ):
@@ -1747,6 +1775,11 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        capture_global_num_tokens_cpu = (
+            [num_tokens] * self.dp_size
+            if self.use_token_owner
+            else None
+        )
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -1836,6 +1869,8 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            original_global_num_tokens_cpu=capture_global_num_tokens_cpu,
+            global_num_tokens_cpu=capture_global_num_tokens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -1845,10 +1880,16 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            router_replay_topk_ids=buffers.router_replay_topk_ids[
-                :router_replay_num_tokens
-            ],
-            router_replay_mask=buffers.router_replay_mask[:router_replay_num_tokens],
+            router_replay_topk_ids=(
+                None
+                if buffers.router_replay_topk_ids is None
+                else buffers.router_replay_topk_ids[:router_replay_num_tokens]
+            ),
+            router_replay_mask=(
+                None
+                if buffers.router_replay_mask is None
+                else buffers.router_replay_mask[:router_replay_num_tokens]
+            ),
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             scale_seq_factor=self.scale_seq_factor,
@@ -2047,7 +2088,11 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.require_mlp_tp_gather:
+        if self.use_token_owner:
+            requested_graph_bs = self._requested_token_owner_graph_batch_size(
+                forward_batch
+            )
+        elif self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             requested_graph_bs = (
                 max_num_tokens / self.num_tokens_per_bs
@@ -2086,7 +2131,9 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
+            enable_num_token_non_padded_flag=enable_num_token_non_padded(
+                self.model_runner.server_args
+            ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
 

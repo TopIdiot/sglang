@@ -2106,8 +2106,11 @@ def should_enable_attn_tp_pynccl(
     attn_cp_size: int,
     sync_token_ids: bool,
     enable_symm_mem: bool,
+    enable_token_owner: bool = False,
 ) -> bool:
-    return bool(sync_token_ids or enable_symm_mem or attn_cp_size > 1)
+    return bool(
+        sync_token_ids or enable_symm_mem or attn_cp_size > 1 or enable_token_owner
+    )
 
 
 def initialize_model_parallel(
@@ -2123,6 +2126,7 @@ def initialize_model_parallel(
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     use_decode_sharded_kv_layout: bool = False,
+    enable_token_owner: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2142,6 +2146,8 @@ def initialize_model_parallel(
             parallelism.
         use_decode_sharded_kv_layout: group contiguous global-TP ranks for the
             mainline Decode CP KV-head replication layout.
+        enable_token_owner: create the Attention TP PyNCCL communicator used by
+            token-owner variable-size collectives.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2317,6 +2323,7 @@ def initialize_model_parallel(
                 attn_cp_size=attn_cp_size,
                 sync_token_ids=SYNC_TOKEN_IDS_ACROSS_TP,
                 enable_symm_mem=enable_symm_mem,
+                enable_token_owner=enable_token_owner,
             ),
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
@@ -2325,6 +2332,13 @@ def initialize_model_parallel(
             group_name="attention_tp",
             recovered_rank=recovered_rank,
         )
+        if enable_token_owner and (
+            _ATTN_TP.pynccl_comm is None
+            or not getattr(_ATTN_TP.pynccl_comm, "available", False)
+        ):
+            raise RuntimeError(
+                "Token-owner requires an available AttnTP PyNCCL communicator"
+            )
 
     global _SUFFIX_PARALLEL
     assert (

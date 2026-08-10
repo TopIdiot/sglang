@@ -763,6 +763,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_token_owner: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
@@ -7010,6 +7011,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+        )
+        parser.add_argument(
+            "--enable-token-owner",
+            action="store_true",
+            help="Enable owner-local token layout outside attention for supported models and parallel topologies.",
         )
         parser.add_argument(
             "--enable-dp-attention-local-control-broadcast",

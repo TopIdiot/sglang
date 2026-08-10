@@ -245,9 +245,15 @@ class DeepEPMoE(FusedMoE):
             output = self.forward_npu(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.quant_config is None:
-                raise NotImplementedError(
-                    "Unquantized DeepEP MoE currently supports low_latency mode only"
-                )
+                runner = getattr(self.quant_method, "runner", None)
+                backend = getattr(runner, "runner_backend", None)
+                if backend is None or not backend.is_deep_gemm():
+                    backend_name = getattr(backend, "value", repr(backend))
+                    raise NotImplementedError(
+                        "Unquantized DeepEP normal MoE requires the DeepGEMM "
+                        f"runner, got {backend_name}"
+                    )
+                return super().run_moe_core(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:

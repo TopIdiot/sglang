@@ -42,6 +42,7 @@ from sglang.srt.models.welmv4 import (
     _welm_scatter_kv_mirror_rows,
     _welm_select_kv_mirror_rows,
     _welm_should_contract_kv_mirror,
+    _welm_token_owner_enabled,
     _welm_update_contracted_dp_metadata,
     welm_nextn_local_to_hf_name,
     welm_use_previous_precision,
@@ -284,6 +285,7 @@ class WeLMV4ModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_token_owner: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -361,6 +363,7 @@ class WeLMV4ModelNextN(nn.Module):
                     is_nextn=True,
                     prefix=add_prefix(layer_name, prefix),
                     alt_stream=self.alt_stream,
+                    enable_token_owner=enable_token_owner,
                 )
                 for i in range(self.num_physical_mtp_layers)
             ]
@@ -855,9 +858,15 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
+        self.enable_token_owner = _welm_token_owner_enabled(
+            pp_size=self.pp_group.world_size
+        )
 
         self.model = WeLMV4ModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            enable_token_owner=self.enable_token_owner,
         )
         self.lm_head = None
         self.logits_processor = LogitsProcessor(config)

@@ -9,13 +9,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 
-def _make_model_runner(*, attn_cp_mode="none"):
+def _make_model_runner(*, attn_cp_mode="none", enable_token_owner=False):
     server_args = SimpleNamespace(
         cuda_graph_bs=[1, 2, 4, 8, 12, 16],
         enable_two_batch_overlap=False,
         enable_torch_compile=False,
         torch_compile_max_bs=32,
         attn_cp_mode=attn_cp_mode,
+        enable_token_owner=enable_token_owner,
     )
     return SimpleNamespace(
         server_args=server_args,
@@ -49,6 +50,178 @@ class TestCudaGraphBatchSizes(unittest.TestCase):
             )
 
         self.assertEqual(capture_bs, [1, 2, 4, 8, 12, 16])
+
+    def test_token_owner_keeps_logical_request_buckets(self):
+        import sglang.srt.model_executor.cuda_graph_runner as cgr
+
+        with (
+            patch.object(cgr, "require_gathered_buffer", return_value=True),
+            patch.object(cgr, "get_attention_tp_size", return_value=4),
+            patch.object(cgr, "get_attention_cp_size", return_value=1),
+        ):
+            capture_bs, _ = cgr.get_batch_sizes_to_capture(
+                _make_model_runner(enable_token_owner=True)
+            )
+
+        self.assertEqual(capture_bs, [1, 2, 4, 8, 12, 16])
+
+    def test_non_owner_keeps_attntp_bucket_alignment(self):
+        import sglang.srt.model_executor.cuda_graph_runner as cgr
+
+        with (
+            patch.object(cgr, "require_gathered_buffer", return_value=True),
+            patch.object(cgr, "get_attention_tp_size", return_value=4),
+            patch.object(cgr, "get_attention_cp_size", return_value=1),
+        ):
+            capture_bs, _ = cgr.get_batch_sizes_to_capture(_make_model_runner())
+
+        self.assertEqual(capture_bs, [4, 8, 12, 16])
+
+
+class TestTokenOwnerCudaGraph(unittest.TestCase):
+    def test_disabled_router_replay_has_no_buffers_or_dp_collective(self):
+        import sglang.srt.layers.dp_attention as dp_attention
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+        from sglang.srt.model_executor.cuda_graph_runner import DecodeInputBuffers
+
+        buffers = DecodeInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=2,
+            hidden_size=4,
+            vocab_size=8,
+            dtype=torch.float32,
+            dp_size=2,
+            pp_size=1,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=True,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=1,
+            num_tokens_per_bs=1,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+            welm_oe_decode_hash_num_branches=0,
+            scale_seq_factor=1,
+            enable_router_replay=False,
+            router_replay_num_layers=2,
+            router_replay_top_k=1,
+        )
+        self.assertIsNone(buffers.router_replay_topk_ids)
+        self.assertIsNone(buffers.router_replay_mask)
+        self.assertIsNone(buffers.router_replay_local_topk_ids)
+        self.assertIsNone(buffers.router_replay_local_mask)
+        forward_batch = SimpleNamespace(
+            input_ids=torch.tensor([1]),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+            out_cache_loc=torch.tensor([0]),
+            positions=torch.tensor([0]),
+            mrope_positions=None,
+            encoder_lens=None,
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            out_cache_loc_swa=None,
+            router_replay_topk_ids=None,
+            router_replay_mask=None,
+            global_num_tokens_gpu=torch.tensor([1, 0], dtype=torch.int32),
+            dp_padding_mode=DpPaddingMode.MAX_LEN,
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+        )
+
+        with patch.object(
+            dp_attention,
+            "dp_gather_replicate",
+            side_effect=AssertionError("inactive router replay communicated"),
+        ):
+            buffers.populate_from_forward_batch(
+                forward_batch=forward_batch,
+                raw_bs=1,
+                raw_num_token=1,
+                bs=1,
+                seq_len_padding_value=1,
+                require_gathered_buffer=True,
+                num_tokens_per_bs=1,
+                nsa_enable_prefill_cp=False,
+                enable_num_token_non_padded_flag=False,
+            )
+
+    def test_padding_preserves_disabled_lora_metadata(self):
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=1,
+            input_ids=torch.tensor([1]),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            out_cache_loc=torch.tensor([0]),
+            seq_lens_sum=1,
+            positions=torch.tensor([0]),
+            lora_ids=None,
+        )
+        model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                get_cuda_graph_seq_len_fill_value=lambda: 1
+            )
+        )
+
+        batch._pad_inputs_to_size(model_runner, num_tokens=2, bs=2)
+
+        self.assertIsNone(batch.lora_ids)
+        self.assertEqual(batch.input_ids.shape[0], 2)
+
+    def test_owner_tracks_non_padded_rows_without_ep(self):
+        import sglang.srt.model_executor.forward_batch_info as fbi
+
+        with patch.object(
+            fbi, "get_moe_expert_parallel_world_size", return_value=1
+        ):
+            self.assertFalse(fbi.enable_num_token_non_padded())
+            self.assertTrue(
+                fbi.enable_num_token_non_padded(
+                    SimpleNamespace(enable_token_owner=True)
+                )
+            )
+
+    def test_owner_uses_global_request_bucket(self):
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+        forward_batch = SimpleNamespace(global_num_reqs_cpu=[1, 8, 3, 0])
+
+        self.assertEqual(
+            CudaGraphRunner._requested_token_owner_graph_batch_size(forward_batch),
+            8,
+        )
+
+    def test_owner_requires_global_request_counts(self):
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+        with self.assertRaisesRegex(RuntimeError, "global request counts"):
+            CudaGraphRunner._requested_token_owner_graph_batch_size(
+                SimpleNamespace(global_num_reqs_cpu=None)
+            )
+
+    def test_owner_non_padded_rows_follow_uneven_attntp_split(self):
+        import sglang.srt.model_executor.forward_batch_info as fbi
+
+        actual = []
+        for rank in range(4):
+            with (
+                patch.object(fbi, "get_attention_tp_size", return_value=4),
+                patch.object(fbi, "get_attention_tp_rank", return_value=rank),
+            ):
+                local_rows = fbi.compute_local_num_token_non_padded(
+                    torch.tensor(5, dtype=torch.int32),
+                    6,
+                )
+            actual.append(int(local_rows))
+
+        self.assertEqual(actual, [2, 2, 1, 0])
 
 
 class TestAttnCPCudaGraphSeqBuckets(unittest.TestCase):

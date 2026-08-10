@@ -34,6 +34,16 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_token_owner_cli(self):
+        self.assertFalse(
+            prepare_server_args(["--model-path", "dummy"]).enable_token_owner
+        )
+        self.assertTrue(
+            prepare_server_args(
+                ["--model-path", "dummy", "--enable-token-owner"]
+            ).enable_token_owner
+        )
+
 
 class TestWelmOeArgs(unittest.TestCase):
     def test_hash_kernel_rejects_incompatible_options(self):

@@ -1017,3 +1017,9 @@ def test_attention_tp_group_enables_pynccl_for_context_parallel():
         sync_token_ids=False,
         enable_symm_mem=False,
     )
+    assert should_enable_attn_tp_pynccl(
+        attn_cp_size=1,
+        sync_token_ids=False,
+        enable_symm_mem=False,
+        enable_token_owner=True,
+    )

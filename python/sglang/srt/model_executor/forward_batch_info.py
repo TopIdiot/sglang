@@ -236,12 +236,14 @@ def compute_local_num_token_non_padded(
     """
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+    tokens_per_rank, remainder = divmod(num_tokens_per_dp, attn_tp_size)
+    local_start = tokens_per_rank * attn_tp_rank + min(attn_tp_rank, remainder)
+    local_size = tokens_per_rank + int(attn_tp_rank < remainder)
 
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - local_start,
         0,
-        tokens_per_rank,
+        local_size,
     )
 
 
@@ -365,6 +367,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     welm_kv_mirror_last_q_indices: Optional[torch.Tensor] = None
     welm_kv_mirror_active_batch_indices: Optional[torch.Tensor] = None
+    welm_kv_mirror_last_q_indices_cpu: Optional[List[int]] = None
+    welm_kv_mirror_active_batch_indices_cpu: Optional[List[int]] = None
     welm_kv_mirror_output_size: Optional[int] = None
 
     # For MoE router replay
@@ -563,7 +567,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded():
+        if enable_num_token_non_padded(model_runner.server_args):
             ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
                 device, non_blocking=True
             )
@@ -651,6 +655,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
             if batch.welm_kv_mirror_last_q_indices is not None:
+                ret.welm_kv_mirror_last_q_indices_cpu = (
+                    batch.welm_kv_mirror_last_q_indices
+                )
+                ret.welm_kv_mirror_active_batch_indices_cpu = (
+                    batch.welm_kv_mirror_active_batch_indices
+                )
                 ret.welm_kv_mirror_last_q_indices = torch.tensor(
                     batch.welm_kv_mirror_last_q_indices,
                     dtype=torch.long,
@@ -1110,7 +1120,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.lora_ids is not None:
+            self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1365,8 +1376,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return self.tbo_split_seq_index is not None
 
 
-def enable_num_token_non_padded():
-    return get_moe_expert_parallel_world_size() > 1
+def enable_num_token_non_padded(server_args=None):
+    return get_moe_expert_parallel_world_size() > 1 or bool(
+        getattr(server_args, "enable_token_owner", False)
+    )
 
 
 class PPProxyTensors:

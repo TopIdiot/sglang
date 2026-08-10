@@ -1375,6 +1375,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
+                enable_token_owner=self.server_args.enable_token_owner,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
                 use_decode_sharded_kv_layout=(
                     self.server_args.attn_cp_mode == "sharded-kv"
@@ -1617,6 +1618,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            token_owner_enabled = getattr(
+                self.server_args, "enable_token_owner", False
+            )
+            if token_owner_enabled and not getattr(
+                self.model, "supports_token_owner", False
+            ):
+                raise NotImplementedError(
+                    "--enable-token-owner is not supported by the loaded model"
+                )
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -3071,6 +3081,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             prepare_n_gram_inputs=self.server_args.prepare_n_gram_inputs,
             scale_seq_factor=getattr(self.model_config.hf_config, "scale_seq_times", 0)
             + 1,
+            enable_router_replay=self.server_args.enable_moe_router_replay,
             router_replay_num_layers=getattr(
                 self.model_config.hf_text_config, "num_hidden_layers", 0
             ),

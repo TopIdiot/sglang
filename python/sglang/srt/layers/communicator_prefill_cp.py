@@ -12,6 +12,7 @@ from sglang.srt.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 def pair_lane_sizes(token_count: int) -> tuple[int, int]:
@@ -33,6 +34,8 @@ def global_tp_destination_sizes(
 
 @dataclass(frozen=True)
 class PrefillCPRouterContext:
+    gathers_hidden_states = False
+
     global_tp_group: object
     destination_sizes: tuple[int, ...]
     owner_start: int
@@ -83,6 +86,27 @@ class PrefillCPRouterContext:
         ):
             raise RuntimeError("router metadata gather changed a tensor dtype")
         return full_weights, full_ids
+
+    def prepare_moe_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: StandardTopKOutput,
+    ) -> tuple[torch.Tensor, StandardTopKOutput]:
+        if not isinstance(topk_output, StandardTopKOutput):
+            raise RuntimeError(
+                "owner-local prefill CP routing requires Standard TopK output"
+            )
+        full_weights, full_ids = self.gather_routing_metadata(
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+        )
+        return hidden_states, StandardTopKOutput(
+            topk_weights=full_weights,
+            topk_ids=full_ids,
+            router_logits=topk_output.router_logits.new_empty(
+                (self.global_token_count, 0)
+            ),
+        )
 
 
 class PrefillCPLayerCommunicator:
@@ -142,9 +166,7 @@ class PrefillCPLayerCommunicator:
 
     def validate_mlp(self, mlp) -> None:
         if not self.use_ep_dispatch:
-            validate_local_router = getattr(
-                mlp, "validate_prefill_cp_local_router", None
-            )
+            validate_local_router = getattr(mlp, "validate_local_router", None)
             if validate_local_router is None:
                 raise RuntimeError(
                     "prefill CP token-owner routing requires an MoE router validator"

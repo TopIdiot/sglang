@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -228,6 +228,76 @@ class ScatterMode(Enum):
         return ScatterMode.TP_ATTN_FULL
 
 
+@dataclass(frozen=True)
+class TokenOwnerLayout:
+    valid_token_count: int
+    owner_sizes: tuple[int, ...]
+    owner_offsets: tuple[int, ...]
+    local_owner_rank: int
+    local_valid_rows: int
+
+    @classmethod
+    def balanced(
+        cls,
+        *,
+        valid_token_count: int,
+        owner_count: int,
+        local_owner_rank: int,
+    ) -> "TokenOwnerLayout":
+        if valid_token_count < 0:
+            raise ValueError("valid_token_count must be non-negative")
+        if owner_count <= 0:
+            raise ValueError("owner_count must be positive")
+        quotient, remainder = divmod(valid_token_count, owner_count)
+        return cls.from_owner_sizes(
+            tuple(
+                quotient + (owner_rank < remainder)
+                for owner_rank in range(owner_count)
+            ),
+            local_owner_rank=local_owner_rank,
+        )
+
+    @classmethod
+    def from_owner_sizes(
+        cls,
+        owner_sizes: Sequence[int],
+        *,
+        local_owner_rank: int,
+    ) -> "TokenOwnerLayout":
+        owner_sizes = tuple(int(size) for size in owner_sizes)
+        if not owner_sizes or any(size < 0 for size in owner_sizes):
+            raise ValueError("owner_sizes must contain non-negative row counts")
+        if not 0 <= local_owner_rank < len(owner_sizes):
+            raise ValueError("local_owner_rank is outside owner_sizes")
+
+        owner_offsets = []
+        valid_token_count = 0
+        for size in owner_sizes:
+            owner_offsets.append(valid_token_count)
+            valid_token_count += size
+        local_valid_rows = owner_sizes[local_owner_rank]
+        return cls(
+            valid_token_count=valid_token_count,
+            owner_sizes=owner_sizes,
+            owner_offsets=tuple(owner_offsets),
+            local_owner_rank=local_owner_rank,
+            local_valid_rows=local_valid_rows,
+        )
+
+    def local_rows(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 0 or tensor.shape[0] != self.valid_token_count:
+            raise RuntimeError(
+                "token-owner input rows do not match the layout: "
+                f"expected {self.valid_token_count}, got "
+                f"{0 if tensor.ndim == 0 else tensor.shape[0]}"
+            )
+        return tensor.narrow(
+            0,
+            self.owner_offsets[self.local_owner_rank],
+            self.local_valid_rows,
+        )
+
+
 class AttentionInputs:
     def __init__(
         self,
@@ -349,6 +419,7 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
+    enable_token_owner: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -358,6 +429,7 @@ class _LayerModeComputationContext:
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             is_next_layer_sparse=self.is_layer_sparse,
+            enable_token_owner=self.enable_token_owner,
         )
 
 
@@ -365,10 +437,10 @@ class _LayerModeComputationContext:
 class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
-    # Can be further split into e.g. mlp_input_mode and mlp_output_mode if needed
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    router_mode: ScatterMode
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -379,6 +451,7 @@ class LayerScatterModes:
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
+            router_mode=cls._compute_router_mode(context),
         )
 
     @classmethod
@@ -408,6 +481,12 @@ class LayerScatterModes:
             )
 
     @classmethod
+    def _compute_router_mode(cls, context: _LayerModeComputationContext):
+        if context.enable_token_owner:
+            return ScatterMode.SCATTERED
+        return cls._compute_mlp_mode(context)
+
+    @classmethod
     def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
         return (
             not context.is_layer_sparse
@@ -418,6 +497,8 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
+        if context.enable_token_owner:
+            return ScatterMode.SCATTERED
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
@@ -427,9 +508,11 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
+        if context.enable_token_owner:
+            return ScatterMode.SCATTERED
+        mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
             if cls._should_gather_for_tbo(context):
                 return ScatterMode.TP_ATTN_FULL
@@ -453,6 +536,8 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        token_owner_layout_provider=None,
+        pre_mlp_norm: Optional[torch.nn.Module] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -460,6 +545,8 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.token_owner_layout_provider = token_owner_layout_provider
+        self.pre_mlp_norm = pre_mlp_norm
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -477,7 +564,7 @@ class LayerCommunicator:
             CommunicateWithAllReduceAndLayerNormFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
                 residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
+                hidden_states_output_mode=self.layer_scatter_modes.router_mode,
                 residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
                 context=self._context,
             )
@@ -652,11 +739,21 @@ class LayerCommunicator:
                             post_residual_addition,
                         )
 
-        hidden_states = self._communicate_simple_fn(
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            context=self._context,
-        )
+        if self.token_owner_layout_provider is None:
+            hidden_states = self._communicate_simple_fn(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                context=self._context,
+            )
+        else:
+            hidden_states = self._communicate_simple_fn(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                context=self._context,
+                token_owner_layout=self.token_owner_layout_provider.local_layout(
+                    forward_batch
+                ),
+            )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
@@ -693,12 +790,24 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
+        if self.token_owner_layout_provider is None:
+            return self._communicate_with_all_reduce_and_layer_norm_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                layernorm=self.post_attention_layernorm,
+                context=self._context,
+            )
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            token_owner_layout=self.token_owner_layout_provider.local_layout(
+                forward_batch
+            ),
+            pre_layernorm=self.pre_mlp_norm,
         )
 
     def prepare_mlp_from_fused_attntp(
@@ -732,12 +841,26 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self.token_owner_layout_provider is None:
+            return self._communicate_summable_tensor_pair_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+                allow_reduce_scatter=self.allow_reduce_scatter,
+            )
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
+            token_owner_layout=self.token_owner_layout_provider.global_layout(
+                forward_batch
+            ),
+            local_token_owner_layout=self.token_owner_layout_provider.local_layout(
+                forward_batch
+            ),
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
@@ -879,6 +1002,7 @@ class CommunicateSimpleFn:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        **kwargs,
     ) -> torch.Tensor:
         return hidden_states
 
@@ -887,7 +1011,23 @@ class CommunicateSimpleFn:
         hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        token_owner_layout: Optional[TokenOwnerLayout] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if token_owner_layout is not None:
+            inputs = (
+                hidden_states if isinstance(hidden_states, tuple) else (hidden_states,)
+            )
+            for local_hidden_states in inputs:
+                if local_hidden_states.shape[0] != token_owner_layout.local_valid_rows:
+                    raise RuntimeError(
+                        "owner-local attention input rows do not match the layout"
+                    )
+            outputs = get_attention_tp_group().all_gatherv(
+                list(inputs),
+                sizes=list(token_owner_layout.owner_sizes),
+            )
+            return tuple(outputs) if isinstance(hidden_states, tuple) else outputs[0]
+
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
@@ -1089,7 +1229,29 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        token_owner_layout: Optional[TokenOwnerLayout] = None,
+        pre_layernorm: Optional[torch.nn.Module] = None,
     ):
+        if token_owner_layout is not None:
+            hidden_states = get_attention_tp_group().reduce_scatterv(
+                hidden_states,
+                sizes=list(token_owner_layout.owner_sizes),
+            )
+            if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+                residual = token_owner_layout.local_rows(residual)
+            elif residual.shape[0] != token_owner_layout.local_valid_rows:
+                raise RuntimeError(
+                    "owner-local residual rows do not match the layout"
+                )
+            if hidden_states.shape[0] != 0:
+                if pre_layernorm is not None:
+                    normalized = pre_layernorm(hidden_states)
+                    hidden_states = (
+                        normalized[0] if isinstance(normalized, tuple) else normalized
+                    )
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
+
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
@@ -1248,6 +1410,20 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._scatter_hidden_states_moe
 
+        if (
+            hidden_states_input_mode == ScatterMode.FULL
+            and residual_input_mode == ScatterMode.SCATTERED
+            and output_mode == ScatterMode.SCATTERED
+        ):
+            return CommunicateSummableTensorPairFn._reduce_scatter_to_owner
+
+        if (
+            hidden_states_input_mode == ScatterMode.FULL
+            and residual_input_mode == ScatterMode.SCATTERED
+            and output_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            return CommunicateSummableTensorPairFn._reduce_scatter_to_owner_and_gather
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
         )
@@ -1301,10 +1477,17 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        local_token_owner_layout: Optional[TokenOwnerLayout] = None,
         **kwargs,
     ):
         hidden_states += residual
         residual = None
+        if local_token_owner_layout is not None:
+            hidden_states = get_attention_tp_group().all_gatherv(
+                hidden_states,
+                sizes=list(local_token_owner_layout.owner_sizes),
+            )[0]
+            return hidden_states, residual
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(
                 _get_dp_buffer_group(forward_batch, get_attention_tp_group())
@@ -1328,6 +1511,97 @@ class CommunicateSummableTensorPairFn:
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
         hidden_states = tensor_list[context.attn_tp_rank]
         return hidden_states, residual
+
+    @staticmethod
+    def _reduce_scatter_to_owner(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        token_owner_layout: TokenOwnerLayout,
+        local_token_owner_layout: Optional[TokenOwnerLayout] = None,
+        **kwargs,
+    ):
+        if hidden_states.shape[0] != token_owner_layout.valid_token_count:
+            raise RuntimeError(
+                "global expert output rows do not match the token-owner layout"
+            )
+        residual_layout = local_token_owner_layout or token_owner_layout
+        if residual.shape[0] != residual_layout.local_valid_rows:
+            raise RuntimeError(
+                "owner-local residual rows do not match the token-owner layout"
+            )
+        hidden_states = get_tp_group().reduce_scatterv(
+            hidden_states,
+            sizes=list(token_owner_layout.owner_sizes),
+        )
+        if local_token_owner_layout is not None:
+            local_size = len(local_token_owner_layout.owner_sizes)
+            group_start = (
+                token_owner_layout.local_owner_rank // local_size
+            ) * local_size
+            global_local_sizes = token_owner_layout.owner_sizes[
+                group_start : group_start + local_size
+            ]
+            if token_owner_layout.local_owner_rank % local_size != (
+                local_token_owner_layout.local_owner_rank
+            ):
+                raise RuntimeError(
+                    "global and local token-owner ranks do not match"
+                )
+            if global_local_sizes != local_token_owner_layout.owner_sizes:
+                local_rows = local_token_owner_layout.valid_token_count
+                if local_token_owner_layout.local_owner_rank == 0:
+                    if hidden_states.shape[0] != local_rows:
+                        raise RuntimeError(
+                            "DP-local proxy output rows do not match the local layout"
+                        )
+                    local_input = hidden_states
+                else:
+                    if hidden_states.shape[0] != 0:
+                        raise RuntimeError(
+                            "non-proxy Global TP rank received owner rows"
+                        )
+                    local_input = hidden_states.new_zeros(
+                        (local_rows, *hidden_states.shape[1:])
+                    )
+                hidden_states = get_attention_tp_group().reduce_scatterv(
+                    local_input,
+                    sizes=list(local_token_owner_layout.owner_sizes),
+                )
+        if hidden_states.shape[0] != residual_layout.local_valid_rows:
+            raise RuntimeError(
+                "reduced expert output rows do not match the local owner layout"
+            )
+        return hidden_states, residual
+
+    @staticmethod
+    def _reduce_scatter_to_owner_and_gather(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        token_owner_layout: TokenOwnerLayout,
+        local_token_owner_layout: TokenOwnerLayout,
+        **kwargs,
+    ):
+        hidden_states, residual = (
+            CommunicateSummableTensorPairFn._reduce_scatter_to_owner(
+                hidden_states,
+                residual,
+                forward_batch,
+                context,
+                token_owner_layout,
+                local_token_owner_layout=local_token_owner_layout,
+            )
+        )
+        return CommunicateSummableTensorPairFn._gather(
+            hidden_states,
+            residual,
+            forward_batch,
+            context,
+            local_token_owner_layout=local_token_owner_layout,
+        )
 
     @staticmethod
     def _scatter_hidden_states_moe(

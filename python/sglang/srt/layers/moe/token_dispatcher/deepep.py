@@ -398,10 +398,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         backend = get_moe_runner_backend()
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
         # BF16 dispatch is needed when:
+        #   - quant_config requests BF16 dispatch explicitly
         #   - cutlass backend (uses different kernel)
         #   - deep_gemm backend with SGLANG_DEEPEP_BF16_DISPATCH enabled
-        need_bf16_dispatch = backend.is_cutlass() or (
+        need_bf16_dispatch = bf16_dispatch or backend.is_cutlass() or (
             backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         )
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:

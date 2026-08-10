@@ -4022,7 +4022,8 @@ class EagleDraftWorker(BaseDraftWorker):
             self._is_welmv4_mtp_draft_model()
             and self.speculative_num_steps > 1
             and (
-                not is_idle_decode
+                self.server_args.enable_token_owner
+                or not is_idle_decode
                 or self.cuda_graph_runner_for_draft_proposal is not None
                 or self.topk > 1
             )

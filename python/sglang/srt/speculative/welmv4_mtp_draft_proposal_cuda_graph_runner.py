@@ -17,6 +17,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
+from sglang.srt.layers.moe.utils import get_speculative_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -140,6 +141,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.use_token_owner = model_runner.server_args.enable_token_owner
+        self.use_token_owner_deepep = (
+            self.use_token_owner
+            and get_speculative_moe_a2a_backend().is_deepep()
+        )
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -635,7 +641,8 @@ class WelmMTPDraftProposalCudaGraphRunner:
 
     def _filter_contracted_dp_capture_bs(self, capture_bs: list[int]) -> list[int]:
         if (
-            not self.require_gathered_buffer
+            self.use_token_owner
+            or not self.require_gathered_buffer
             or not DpPaddingMode.get_default_mode_in_cuda_graph().is_max_len()
         ):
             return capture_bs
@@ -1327,14 +1334,16 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self,
         forward_batch: ForwardBatch,
     ) -> Optional[int]:
-        if not self.require_mlp_tp_gather:
+        if not (self.require_mlp_tp_gather or self.use_token_owner):
             return int(forward_batch.batch_size)
 
         global_num_reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
-        if global_num_reqs is not None:
-            if len(global_num_reqs) == 0:
-                return None
+        if global_num_reqs:
             return max(int(count) for count in global_num_reqs)
+        if self.use_token_owner:
+            raise RuntimeError(
+                "Token-owner MTP draft graph requires non-empty global request counts"
+            )
 
         # Topk tree proposals can have a different row width from scheduler
         # token counts, so DP graph replay must use synchronized request counts.
@@ -1367,7 +1376,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return False
         if raw_bs == 0 and not self.require_mlp_sync:
             return False
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.use_token_owner:
             cuda_graph_bs = self._get_dp_cuda_graph_request_bs(forward_batch)
             if cuda_graph_bs is None or cuda_graph_bs <= 0:
                 return False
@@ -1495,6 +1504,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
         custom_last_index = buffers.custom_last_index[:bs]
         custom_last_cache_loc = buffers.custom_last_cache_loc[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
+        capture_token_counts = (
+            [num_tokens] * self.dp_size if self.use_token_owner else None
+        )
+        capture_request_counts = [bs] * self.dp_size if self.use_token_owner else None
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -1562,8 +1575,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
+            original_global_num_tokens_cpu=capture_token_counts,
+            global_num_tokens_cpu=capture_token_counts,
             global_num_tokens_gpu=global_num_tokens,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
+            global_num_reqs_cpu=capture_request_counts,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -1575,6 +1591,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         forward_batch.custom_last_index = custom_last_index
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
+        forward_batch._welm_force_low_latency_deepep = self.use_token_owner_deepep
         if self.distributed_topk:
             forward_batch.welm_mtp_distributed_topk = self.sampling_topk
             forward_batch.welm_mtp_candidate_indices_buffer = (
@@ -1725,7 +1742,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return out
 
-        self.deepep_adapter.capture(is_extend_in_batch=True)
+        self.deepep_adapter.capture(
+            is_extend_in_batch=not self.use_token_owner_deepep
+        )
         self._capture_init(run_once)
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
@@ -2001,7 +2020,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         buffers = self.buffers
         raw_bs = int(forward_batch.batch_size)
 
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.use_token_owner:
             cuda_graph_bs = self._get_dp_cuda_graph_request_bs(forward_batch)
             if cuda_graph_bs is None:
                 raise RuntimeError(

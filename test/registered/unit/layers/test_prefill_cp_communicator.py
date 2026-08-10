@@ -279,9 +279,7 @@ def test_non_ep_mlp_validation_accepts_local_router_contract():
     layout = _Layout(cp_rank=0, active_local_tokens=1, counts=(1, 0, 0, 0))
     communicator, _, _, _ = _communicator(layout, use_ep_dispatch=False)
     validated = []
-    mlp = SimpleNamespace(
-        validate_prefill_cp_local_router=lambda: validated.append(True)
-    )
+    mlp = SimpleNamespace(validate_local_router=lambda: validated.append(True))
 
     communicator.validate_mlp(mlp)
 

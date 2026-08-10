@@ -959,13 +959,10 @@ def test_prefill_cp_ppln_keeps_communicator_fp32_residual(
     assert captured["mlp_hidden_states_fp32"] is None
     if ep_dispatch:
         assert "router_context_batch" not in captured
-        assert "prefill_cp_router_context" not in captured["mlp_kwargs"]
+        assert captured["mlp_kwargs"]["router_context"] is None
     else:
         assert captured["router_context_batch"] is forward_batch
-        assert (
-            captured["mlp_kwargs"]["prefill_cp_router_context"]
-            == "router-context"
-        )
+        assert captured["mlp_kwargs"]["router_context"] == "router-context"
 
 
 def test_prefill_cp_ppln_routes_attntp2_partial_through_fused_norm(monkeypatch):
@@ -1336,7 +1333,10 @@ def test_dp_ppln_routes_partial_through_autotuned_fused_norm(monkeypatch):
         layer_communicator=communicator,
         prefill_cp_communicator=object(),
         tp_dp_attntp_fused_norm_managers={"decode": Manager()},
-        layer_scatter_modes=SimpleNamespace(mlp_mode=welmv4_model.ScatterMode.FULL),
+        layer_scatter_modes=SimpleNamespace(
+            layer_input_mode=welmv4_model.ScatterMode.TP_ATTN_FULL,
+            mlp_mode=welmv4_model.ScatterMode.FULL,
+        ),
         hidden_size=2048,
         ppln=True,
         config_layer_id=1,
@@ -1416,10 +1416,14 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
             captured.setdefault("local_rows", []).append(tensor)
             return tensor[2:4]
 
-        def gather_routing_metadata(self, weights, ids):
-            captured["local_weights"] = weights
-            captured["local_ids"] = ids
-            return full_weights, full_ids
+        def prepare_moe_inputs(self, expert_hidden, topk_output):
+            captured["local_weights"] = topk_output.topk_weights
+            captured["local_ids"] = topk_output.topk_ids
+            return expert_hidden, StandardTopKOutput(
+                topk_weights=full_weights,
+                topk_ids=full_ids,
+                router_logits=topk_output.router_logits.new_empty((6, 0)),
+            )
 
     class SharedExpert:
         def __call__(self, tensor):
@@ -1427,7 +1431,10 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
             return torch.zeros_like(tensor)
 
     class TopK:
-        def __call__(self, routing_hidden, router_logits):
+        def __call__(
+            self, routing_hidden, router_logits, num_token_non_padded=None
+        ):
+            assert num_token_non_padded is None
             captured["topk_hidden"] = routing_hidden
             captured["router_logits"] = router_logits
             return StandardTopKOutput(
@@ -1477,7 +1484,7 @@ def test_prefill_cp_moe_routes_only_owner_rows_but_keeps_full_expert_input(
         hidden,
         hidden_fp32,
         forward_batch=SimpleNamespace(),
-        prefill_cp_router_context=RouterContext(),
+        router_context=RouterContext(),
     )
 
     assert torch.equal(output, hidden)
@@ -1502,11 +1509,18 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
             captured["local_rows_calls"] = captured.get("local_rows_calls", 0) + 1
             return tensor[2:4]
 
-        def gather_routing_metadata(self, weights, ids):
-            return full_weights, full_ids
+        def prepare_moe_inputs(self, expert_hidden, topk_output):
+            return expert_hidden, StandardTopKOutput(
+                topk_weights=full_weights,
+                topk_ids=full_ids,
+                router_logits=topk_output.router_logits.new_empty((6, 0)),
+            )
 
     class TopK:
-        def __call__(self, routing_hidden, router_logits):
+        def __call__(
+            self, routing_hidden, router_logits, num_token_non_padded=None
+        ):
+            assert num_token_non_padded is None
             return StandardTopKOutput(
                 topk_weights=torch.ones((2, 2), dtype=torch.float32),
                 topk_ids=torch.zeros((2, 2), dtype=torch.int64),
@@ -1545,7 +1559,7 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
         hidden,
         None,
         forward_batch=SimpleNamespace(),
-        prefill_cp_router_context=RouterContext(),
+        router_context=RouterContext(),
     )
 
     assert torch.equal(output, hidden)
@@ -1554,16 +1568,28 @@ def test_prefill_cp_default_router_does_not_require_fp32_hidden(monkeypatch):
 
 def test_prefill_cp_moe_rejects_nonstandard_local_topk(monkeypatch):
     hidden = torch.ones((2, 4), dtype=torch.bfloat16)
-    context = SimpleNamespace(
-        local_rows=lambda tensor: tensor[:1],
-    )
+
+    class RouterContext:
+        @staticmethod
+        def local_rows(tensor):
+            return tensor[:1]
+
+        @staticmethod
+        def prepare_moe_inputs(_hidden_states, topk_output):
+            if not isinstance(topk_output, StandardTopKOutput):
+                raise RuntimeError(
+                    "owner-local prefill CP routing requires Standard TopK output"
+                )
+            raise AssertionError("unexpected Standard TopK output")
+
+    context = RouterContext()
     block = SimpleNamespace(
         _mk_moe_router=None,
         layer_id=0,
         shared_expert=None,
         shared_expert_gate=None,
         gate=SimpleNamespace(weight=torch.empty((4, 4))),
-        topk=lambda *_args: object(),
+        topk=lambda *_args, **_kwargs: object(),
         experts=MagicMock(),
         tp_size=1,
         router_score_func="sigmoid",
@@ -1592,7 +1618,7 @@ def test_prefill_cp_moe_rejects_nonstandard_local_topk(monkeypatch):
             hidden,
             hidden.float(),
             forward_batch=SimpleNamespace(),
-            prefill_cp_router_context=context,
+            router_context=context,
         )
 
 
@@ -1612,7 +1638,7 @@ def test_prefill_cp_local_router_accepts_metadata_only_moe_runners(backend):
         )
     )
 
-    welmv4_model.Qwen2MoeSparseMoeBlock.validate_prefill_cp_local_router(block)
+    welmv4_model.Qwen2MoeSparseMoeBlock.validate_local_router(block)
 
 
 def test_prefill_cp_local_router_rejects_runner_that_consumes_logits():
@@ -1627,7 +1653,7 @@ def test_prefill_cp_local_router_rejects_runner_that_consumes_logits():
     )
 
     with pytest.raises(NotImplementedError, match="got marlin"):
-        welmv4_model.Qwen2MoeSparseMoeBlock.validate_prefill_cp_local_router(
+        welmv4_model.Qwen2MoeSparseMoeBlock.validate_local_router(
             block
         )
 
