@@ -941,6 +941,7 @@ class CudaGraphRunner:
             )
         elif getattr(self.attn_backend, "is_attn_cp_sharded_kv", False):
             self.attn_backend.cuda_graph_max_seq_len = self.seq_len_fill_value
+        self.attn_backend.set_cuda_graph_capture_bs(self.capture_bs)
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -1422,6 +1423,7 @@ class CudaGraphRunner:
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 if getattr(attn_backend, "is_attn_cp_sharded_kv", False):
                     attn_backend.cuda_graph_max_seq_len = self.seq_len_fill_value
+                attn_backend.set_cuda_graph_capture_bs(self.capture_bs)
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
     def _cache_loc_dtype(self):

@@ -36,6 +36,32 @@ MTP serving 需要使用真正带 MTP/NextN 权重的 WeLMV4 checkpoint。模型
 | `SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE` | 未设置 | draft sampling 使用固定 temperature。只在 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1` 时有意义；值必须大于 `0`。 |
 | `SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P` | 未设置 | draft sampling 使用固定 top-p。只在 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1` 时有意义；值必须在 `(0, 1]`。 |
 | `SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK` | `0` | 限制 draft sampling 只在前 K 个 token 内采样。`<=0` 表示关闭；值必须小于 vocab size，否则会被忽略。只建议和 `topk=1` 的 draft sampling 一起使用。 |
+| `SGLANG_WELM_V4D5_80A3_MTP_VERIFY_ATTENTION_BACKEND` | `fa3` | 只控制 WeLM V4D5 80A3 的 MTP target-verify attention。`fa3` 保持当前实现；`mk` 在满足下述固定契约时使用 MK verify kernel，不支持或启动自检失败时打印明确原因并回退 FA3。 |
+
+### WeLM V4D5 80A3 MK verify attention
+
+MK 路径是 target-verify 专用 fast path。Prefill、普通 decode 和 draft model
+attention 始终使用原 FA3 backend，不属于 fallback。启用方式：
+
+```bash
+git submodule update --init 3rdparty/mk
+git -C 3rdparty/mk submodule update --init ref/flashinfer
+export SGLANG_WELM_V4D5_80A3_MTP_VERIFY_ATTENTION_BACKEND=mk
+```
+
+MK 必须包含已初始化的 `3rdparty/mk/ref/flashinfer` 子模块；缺失时
+verify kernel 无法编译，启动日志会给出明确 fallback 原因。
+
+MK 路径固定要求 H20/SM90、每个 DP replica 使用 TP4、BF16 KV cache、page size 16、
+`steps=3`、`topk=1`、每请求 4 个 verify tokens，以及本地
+Q/KV heads 为 6/1、head dim 256。只支持 Full attention 和 SWA512；
+支持由独立 TP4 replica 组成的普通数据并行，但不支持 DP attention、
+AttnCP、tree/custom mask 或 FP8 KV cache。
+
+每个 worker 在 CUDA Graph capture 前自动运行 Full/SWA512 两个 MK-vs-FA3
+数值检查。第一次真正调用 MK 时会打印 `Using MK WeLM V4D5 80A3...`；
+任何安全的 fallback 都打印 `requested_backend=mk selected_backend=fa3`、
+结构化 `reason`、`actual` 和 `expected`。同一原因只打印一次，但内部计数持续累加。
 
 ## 参数限制
 
@@ -53,7 +79,8 @@ MTP serving 需要使用真正带 MTP/NextN 权重的 WeLMV4 checkpoint。模型
   `1 + topk + (steps - 1) * topk * topk`。例如 `steps=3, topk=2`
   时最大是 `11`。
 - `topk > 1` 时不支持draft sampling，即不能设置 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1`。
-- Attention Backend请固定使用 `fa3`。
+- 基础 Attention Backend 请固定使用 `fa3`。MK 环境变量只替换满足契约的
+  target-verify attention，其余模式继续使用 FA3。
 
 ## 示例：
 

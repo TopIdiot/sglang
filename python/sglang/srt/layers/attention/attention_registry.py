@@ -298,7 +298,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_backend, linear_attn_backend, full_attn_layers
         )
 
-    return full_attn_backend
+    from sglang.srt.layers.attention.welm_v4d5_80a3_mtp_verify import (
+        maybe_wrap_welm_v4d5_80a3_mtp_verify_backend,
+    )
+
+    return maybe_wrap_welm_v4d5_80a3_mtp_verify_backend(runner, full_attn_backend)
 
 
 @register_attention_backend("intel_xpu")

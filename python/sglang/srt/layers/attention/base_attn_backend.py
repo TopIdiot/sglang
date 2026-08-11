@@ -27,6 +27,9 @@ class AttentionBackend(ABC):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
+    def set_cuda_graph_capture_bs(self, capture_bs) -> None:
+        """Publish the exact sparse batch sizes selected by the graph runner."""
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
