@@ -390,9 +390,9 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             self.a,
             self.b,
             self.out,
-            masked_m=self.masked_m,
+            self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
-            expected_m=m,
+            m,
         )
 
 

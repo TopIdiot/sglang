@@ -1550,7 +1550,13 @@ class Req(ReqDllmMixin):
             return input_len
         # The matched length is at most 1 less than the input length to enable logprob computation.
         max_prefix_len = input_len - 1
-        if self.return_logprob and self.logprob_start_len >= 0:
+        if (
+            self.return_logprob
+            and self.logprob_start_len >= 0
+            and not self.retract_replay_skips_logprob()
+        ):
+            # A retract replay with stored logprobs recomputes none of them, so
+            # its prefix match may also cover the generated tokens.
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
 
@@ -1854,6 +1860,16 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = []
 
+    def retract_replay_skips_logprob(self) -> bool:
+        # A retraction victim was in the running decode batch, so its input
+        # logprobs were finalized and every generated token's logprob is already
+        # stored on the request; add_input_logprob_return_values drops any
+        # recomputed replay values. Mirroring that discard condition here makes
+        # skipping the recomputation exactly behavior-preserving.
+        return self.retracted_stain and (
+            not self.return_logprob or self.input_token_logprobs_val is not None
+        )
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1914,6 +1930,12 @@ class Req(ReqDllmMixin):
             logprob_start_len - prefix_len,
             self.extend_input_len,
         )
+        if self.retract_replay_skips_logprob():
+            # Skip the replayed region so a retracted request's re-prefill does
+            # not materialize [replay_len, vocab_size] logits for values the
+            # scheduler would drop anyway; _get_pruned_states still keeps the
+            # sampling position.
+            self.extend_logprob_start_len = self.extend_input_len
 
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
@@ -2506,9 +2528,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if global_start_idx < logprob_start_len:
                     global_start_idx = logprob_start_len
 
-                logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
-                ]
+                if req.retract_replay_skips_logprob():
+                    # The replay computes no input logprobs (see
+                    # set_extend_input_len), so contribute no token ids to keep
+                    # the flat list aligned with the pruned logprob rows.
+                    logprob_token_ids = []
+                else:
+                    logprob_token_ids = req.origin_input_ids[
+                        global_start_idx + 1 : global_end_idx + 1
+                    ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
@@ -2725,7 +2753,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_lens = [r.extend_input_len for r in reqs]
 
         for req, pre_len in zip(reqs, logical_prefix_lens):
-            if req.logprob_start_len >= pre_len:
+            if req.retract_replay_skips_logprob():
+                # Keep in sync with set_extend_input_len: a retracted request's
+                # replay skips its whole logprob region. Check this before the
+                # pre_len comparison because such a replay's prefix match may
+                # cover positions past logprob_start_len.
+                req.extend_logprob_start_len = req.extend_input_len
+            elif req.logprob_start_len >= pre_len:
                 if self.is_prefill_only and req.logprob_start_len == len(
                     req.origin_input_ids
                 ):

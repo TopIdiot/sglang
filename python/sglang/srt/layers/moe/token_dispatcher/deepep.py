@@ -237,8 +237,9 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            # DeepEP V2 maps MNNVL to CUDA Fabric memory allocations, which
+            # are unavailable on Hopper PCIe GPUs such as H20.
+            allow_mnnvl=is_blackwell(),
         )
         return cls._buffer
 
