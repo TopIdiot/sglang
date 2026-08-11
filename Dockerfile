@@ -452,6 +452,7 @@ BASH
 COPY 3rdparty/mk/pyproject.toml 3rdparty/mk/README.md /sgl-workspace/3rdparty/mk/
 COPY 3rdparty/mk/mk /sgl-workspace/3rdparty/mk/mk
 COPY 3rdparty/mk/csrcs /sgl-workspace/3rdparty/mk/csrcs
+COPY 3rdparty/mk/ref/flashinfer/csrc/xqa /sgl-workspace/3rdparty/mk/ref/flashinfer/csrc/xqa
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \
