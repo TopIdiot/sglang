@@ -40,7 +40,7 @@ def _state(prompt_token_ids, phase):
     state = schedule_batch_module.WelmDeferredDecodeState.from_prompt_tokens(
         list(prompt_token_ids)
     )
-    if phase is schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING:
+    if phase is schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING:
         return state
     state.transition_to(schedule_batch_module.WelmDeferredDecodePhase.READY)
     if phase is schedule_batch_module.WelmDeferredDecodePhase.READY:
@@ -137,7 +137,7 @@ def test_inflight_retract_restores_ready_and_marks_seed_slot_overallocated(
 @pytest.mark.parametrize(
     "phase",
     (
-        schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING,
+        schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING,
         schedule_batch_module.WelmDeferredDecodePhase.READY,
     ),
 )
@@ -220,14 +220,14 @@ def test_release_kv_cache_requires_explicit_uncommitted_tail_permission():
     tree_cache.req_to_token_pool.free.assert_called_once_with(req)
 
 
-def test_transfer_pending_prealloc_abort_cleans_receiver_and_pending_alias_once():
+def test_prefill_pending_prealloc_abort_cleans_receiver_and_pending_alias_once():
     req = SimpleNamespace(
         rid="seed",
         return_logprob=False,
         finished_reason=None,
         welm_deferred_decode_state=_state(
             [11, 12, 13],
-            schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING,
+            schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING,
         ),
     )
     receiver = MagicMock()
@@ -260,7 +260,7 @@ def test_transfer_pending_prealloc_abort_cleans_receiver_and_pending_alias_once(
     scheduler.stream_output.assert_called_once_with([req], False)
 
 
-def test_transfer_pending_transfer_abort_releases_owned_resources_once():
+def test_prefill_pending_transfer_abort_releases_owned_resources_once():
     req = SimpleNamespace(
         rid="seed",
         bootstrap_host="prefill",
@@ -269,7 +269,7 @@ def test_transfer_pending_transfer_abort_releases_owned_resources_once():
         finished_reason=None,
         welm_deferred_decode_state=_state(
             [11, 12, 13],
-            schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING,
+            schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING,
         ),
     )
     receiver = MagicMock()
@@ -419,6 +419,7 @@ def test_consumed_state_may_enter_legacy_prebuilt_resume_path():
         enable_overlap=False,
         spec_algorithm=object(),
         future_map=object(),
+        _should_isolate_welm_mtp_prebuilt=lambda: False,
     )
     new_batch = MagicMock()
 
@@ -453,6 +454,7 @@ def test_deferred_seed_scheduler_leaves_consumed_request_for_prebuilt():
     )
     scheduler = SimpleNamespace(
         server_args=_server_args(),
+        disaggregation_mode=DisaggregationMode.DECODE,
         waiting_queue=[req],
         enable_priority_scheduling=False,
         running_batch=SimpleNamespace(reqs=[]),
@@ -460,10 +462,7 @@ def test_deferred_seed_scheduler_leaves_consumed_request_for_prebuilt():
         max_running_requests=4,
     )
 
-    result = (
-        decode_module.SchedulerDisaggregationDecodeMixin
-        .get_new_welm_deferred_seed_batch(scheduler)
-    )
+    result = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
 
     assert result is None
     assert scheduler.waiting_queue == [req]

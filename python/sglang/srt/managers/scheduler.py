@@ -169,6 +169,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
+    is_welm_deferred_prefill_pending,
     validate_router_replay_experts,
 )
 from sglang.srt.managers.routed_experts_store import (
@@ -210,6 +213,10 @@ from sglang.srt.mem_cache.cp_sharded_capacity import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.models.welm_deferred_mirror import (
+    is_welm_deferred_mirror_enabled,
+    prepare_welm_deferred_prefill_span,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -2806,6 +2813,29 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        if (
+            session_id is not None
+            and self.disaggregation_mode is DisaggregationMode.NULL
+            and is_welm_deferred_mirror_enabled(self.server_args)
+        ):
+            error_msg = (
+                "WeLM deferred monolithic mode does not support session continuation"
+            )
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                return_logprob=getattr(recv_req, "return_logprob", False),
+                vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+                time_stats=recv_req.time_stats,
+            )
+            req.tokenizer = self.tokenizer
+            recv_req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+            prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.stream_output([req], req.return_logprob)
+            return
 
         if session_id is None:
             # Normal non-session request
@@ -3064,6 +3094,39 @@ class Scheduler(
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            if is_welm_deferred_mirror_enabled(self.server_args):
+                try:
+                    span = prepare_welm_deferred_prefill_span(req)
+                except ValueError as exc:
+                    message = str(exc)
+                    logger.error(message)
+                    trace_ctx = getattr(
+                        getattr(req, "time_stats", None), "trace_ctx", None
+                    )
+                    if trace_ctx is not None:
+                        trace_ctx.abort(abort_info={"reason": message})
+                    prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                    self.stream_output([req], req.return_logprob)
+                    return
+                state = vars(req).get("welm_deferred_decode_state")
+                if state is None:
+                    if is_retracted:
+                        raise RuntimeError(
+                            "retracted WeLM deferred request is missing lifecycle state"
+                        )
+                    if req.output_ids:
+                        raise RuntimeError(
+                            "WeLM deferred admission requires an empty output"
+                        )
+                    req.welm_deferred_decode_state = (
+                        WelmDeferredDecodeState.from_prefill_span(span)
+                    )
+                elif not isinstance(state, WelmDeferredDecodeState):
+                    raise RuntimeError(
+                        "WeLM deferred admission received invalid lifecycle state"
+                    )
+                else:
+                    state.validate_prefill_span(span, req.origin_input_ids)
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -3109,6 +3172,28 @@ class Scheduler(
             return False
         return True
 
+    def _release_queued_request_resources(self, req: Req) -> None:
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        elif getattr(self, "enable_hierarchical_cache", False):
+            self.tree_cache.terminate_prefetch(req.rid)
+
+        if self.disaggregation_mode is DisaggregationMode.DECODE:
+            release_kv_cache(req, self.tree_cache)
+            return
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+
+        state = vars(req).get("welm_deferred_decode_state")
+        if getattr(req, "mamba_pool_idx", None) is not None or (
+            self.disaggregation_mode is DisaggregationMode.NULL
+            and isinstance(state, WelmDeferredDecodeState)
+            and state.phase is WelmDeferredDecodePhase.READY
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -3135,12 +3220,8 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self._release_queued_request_resources(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -3167,9 +3248,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                self._release_queued_request_resources(req)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -3377,6 +3456,9 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        if self.disaggregation_mode is DisaggregationMode.NULL:
+            self._admit_new_welm_deferred_seed_batch()
+
         defer_prefill_prepare_for_dp_sync = (
             self.require_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -3456,6 +3538,134 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return ret
+
+    def get_new_welm_deferred_seed_batch(self) -> Optional[ScheduleBatch]:
+        if (
+            not is_welm_deferred_mirror_enabled(self.server_args)
+            or self.disaggregation_mode is DisaggregationMode.PREFILL
+            or len(self.waiting_queue) == 0
+        ):
+            return None
+
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
+        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        active_running = sum(
+            not req.finished() and not getattr(req, "is_retracted", False)
+            for req in self.running_batch.reqs
+        )
+        available_rows = batch_size - active_running
+        if available_rows <= 0:
+            return None
+
+        strict_decode_queue = self.disaggregation_mode is DisaggregationMode.DECODE
+        can_run_list: List[Req] = []
+        waiting_queue: List[Req] = []
+        for req in self.waiting_queue:
+            state = vars(req).get("welm_deferred_decode_state")
+            if state is None:
+                if strict_decode_queue:
+                    raise RuntimeError(
+                        "waiting WeLM deferred decode seed is missing lifecycle state"
+                    )
+                waiting_queue.append(req)
+                continue
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "waiting WeLM deferred decode seed has invalid lifecycle state"
+                )
+            if state.phase is WelmDeferredDecodePhase.CONSUMED:
+                waiting_queue.append(req)
+                continue
+            if state.phase is not WelmDeferredDecodePhase.READY:
+                if strict_decode_queue:
+                    raise RuntimeError(
+                        "waiting WeLM deferred decode seed is not READY: "
+                        f"rid={req.rid}, phase={state.phase.value}"
+                    )
+                waiting_queue.append(req)
+                continue
+            if len(can_run_list) < available_rows:
+                can_run_list.append(req)
+            else:
+                waiting_queue.append(req)
+
+        self.waiting_queue = waiting_queue
+        if len(can_run_list) == 0:
+            return None
+
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_welm_deferred_seed_decode()
+        return new_batch
+
+    def _admit_new_welm_deferred_seed_batch(self) -> None:
+        deferred_seed_batch = self.get_new_welm_deferred_seed_batch()
+        if deferred_seed_batch is None:
+            return
+        if self.running_batch.is_empty():
+            self.running_batch = deferred_seed_batch
+        else:
+            self.running_batch.merge_batch(deferred_seed_batch)
+
+    def process_deferred_prefill_without_forward(self, reqs: List[Req]) -> None:
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            SchedulerDisaggregationPrefillMixin.process_deferred_prefill_without_forward(
+                self, reqs
+            )
+            return
+        if (
+            self.disaggregation_mode is not DisaggregationMode.NULL
+            or not is_welm_deferred_mirror_enabled(self.server_args)
+        ):
+            raise RuntimeError(
+                "zero-forward deferred Prefill completion has invalid topology"
+            )
+
+        for req in reqs:
+            span = getattr(req, "welm_deferred_prefill_span", None)
+            state = vars(req).get("welm_deferred_decode_state")
+            if span is None or req.extend_input_len != 0:
+                raise RuntimeError(
+                    "zero-forward Prefill completion requires a deferred full hit"
+                )
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "zero-forward Prefill completion is missing lifecycle state"
+                )
+            if state.phase is not WelmDeferredDecodePhase.PREFILL_PENDING:
+                raise RuntimeError(
+                    "zero-forward Prefill completion requires PREFILL_PENDING state"
+                )
+            state.validate_prefill_span(span, req.origin_input_ids)
+            if req.output_ids:
+                raise RuntimeError(
+                    "zero-forward Prefill completion must not contain output tokens"
+                )
+            if (
+                req.kv_committed_len != span.committed_kv_len
+                or req.kv_allocated_len != span.committed_kv_len
+            ):
+                raise RuntimeError(
+                    "zero-forward Prefill completion KV length does not match span"
+                )
+            if req in self.waiting_queue:
+                raise RuntimeError(
+                    "zero-forward Prefill completion is already in the waiting queue"
+                )
+            req.time_stats.set_prefill_finished_time()
+            state.transition_to(WelmDeferredDecodePhase.READY)
+            self.waiting_queue.append(req)
+            req.time_stats.set_wait_queue_entry_time()
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
@@ -3587,6 +3797,12 @@ class Scheduler(
                 break
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                continue
+
+            if adder.can_run_list and (
+                is_welm_deferred_prefill_pending(req)
+                != is_welm_deferred_prefill_pending(adder.can_run_list[0])
+            ):
                 continue
 
             running_bs = len(self.running_batch.reqs)
@@ -4011,6 +4227,48 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _prepare_welm_deferred_prefill_result_for_decode(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> bool:
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            return False
+
+        validated_rows = self._validate_welm_deferred_prefill_completion(
+            batch,
+            result,
+            continuation_completed=False,
+        )
+        final_indices = [
+            index
+            for index, (_, _, is_final) in enumerate(validated_rows)
+            if is_final
+        ]
+        if final_indices:
+            # Publish the prefix before READY exposes the seed to overlap scheduling.
+            cache_stream_ctx = (
+                self.device_module.StreamContext(self.schedule_stream)
+                if self.enable_overlap
+                else nullcontext()
+            )
+            with cache_stream_ctx:
+                for final_index in final_indices:
+                    maybe_cache_unfinished_req(
+                        validated_rows[final_index][0], self.tree_cache
+                    )
+            seed_token_ids = [
+                validated_rows[index][1].seed_token_id for index in final_indices
+            ]
+            index = result.next_token_ids.new_tensor(final_indices, dtype=torch.long)
+            seeds = result.next_token_ids.new_tensor(seed_token_ids)
+            result.next_token_ids.index_copy_(0, index, seeds)
+            for final_index in final_indices:
+                validated_rows[final_index][1].transition_to(
+                    WelmDeferredDecodePhase.READY
+                )
+        return True
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -4058,6 +4316,10 @@ class Scheduler(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    if batch_result.welm_deferred_prefill_completion is not None:
+                        self._prepare_welm_deferred_prefill_result_for_decode(
+                            batch, batch_result
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -4089,6 +4351,10 @@ class Scheduler(
                     batch.seq_lens = batch.spec_info.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                if batch_result.welm_deferred_prefill_completion is not None:
+                    self._prepare_welm_deferred_prefill_result_for_decode(
+                        batch, batch_result
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 kwargs = (
@@ -4099,6 +4365,10 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
+                if batch_result.welm_deferred_prefill_completion is not None:
+                    self._prepare_welm_deferred_prefill_result_for_decode(
+                        batch, batch_result
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -4609,25 +4879,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                release_req_to_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-
-            # For mamba radix cache
-            if (
-                req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._release_queued_request_resources(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

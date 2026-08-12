@@ -12,12 +12,20 @@ from sglang.srt.disaggregation.common.welm_deferred_protocol import (
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
+)
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.models.welm_deferred_mirror import (
     WelmDeferredPrefillSpan,
     build_welm_deferred_prefill_span,
+    prepare_welm_deferred_prefill_span,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -106,6 +114,22 @@ def test_req_preserves_origin_but_exposes_only_committed_prefill_tokens():
     assert req.prefill_kv_len() == 3
 
 
+def test_consumed_deferred_request_restores_ordinary_reprefill_tokens():
+    req = _make_req([11, 22, 33, 44], deferred=True)
+    state = WelmDeferredDecodeState.from_prefill_span(
+        req.welm_deferred_prefill_span
+    )
+    state.transition_to(WelmDeferredDecodePhase.READY)
+    state.transition_to(WelmDeferredDecodePhase.INFLIGHT)
+    state.transition_to(WelmDeferredDecodePhase.CONSUMED)
+    req.welm_deferred_decode_state = state
+    req.output_ids = [55, 66]
+
+    assert req.prefill_kv_token_ids() == [11, 22, 33, 44, 55, 66]
+    assert req.prefill_kv_len() == 6
+    assert req._compute_max_prefix_len(6) == 5
+
+
 def test_bootstrap_prepares_deferred_span_before_capacity_check():
     queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
     queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
@@ -115,7 +139,17 @@ def test_bootstrap_prepares_deferred_span_before_capacity_check():
     assert queue._prepare_deferred_req(req)
 
     assert req.welm_deferred_prefill_span.committed_kv_len == 3
+    assert vars(req).get("welm_deferred_decode_state") is None
     assert queue._check_if_req_exceed_kv_capacity(req) is False
+
+
+def test_topology_neutral_span_preparation_rejects_changed_prompt():
+    req = _make_req([11, 22, 33, 44], deferred=False)
+    prepare_welm_deferred_prefill_span(req)
+    req.origin_input_ids[-1] = 55
+
+    with pytest.raises(RuntimeError, match="span changed"):
+        prepare_welm_deferred_prefill_span(req)
 
 
 def test_deferred_output_logprob_is_preserved_but_not_requested_from_prefill():
@@ -362,13 +396,12 @@ def test_zero_forward_completion_enters_transfer_without_output_token():
         time_stats=MagicMock(),
     )
     scheduler = SimpleNamespace(
+        disaggregation_mode=DisaggregationMode.PREFILL,
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=MagicMock(),
     )
 
-    prefill_module.SchedulerDisaggregationPrefillMixin.process_deferred_prefill_without_forward(
-        scheduler, [req]
-    )
+    Scheduler.process_deferred_prefill_without_forward(scheduler, [req])
 
     assert req.output_ids == []
     scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)

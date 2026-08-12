@@ -424,6 +424,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_reqs_cpu: Optional[List[int]] = None
     global_forward_modes: Optional[List[int]] = None
     welm_kv_mirror_contract_flags: Optional[List[bool]] = None
+    welm_deferred_prefill_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
@@ -440,6 +441,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Uniform marker for runtime WeLM deferred Prefill cutoff.
+    welm_deferred_prefill: bool = False
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
@@ -525,12 +529,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_reqs_cpu=batch.global_num_reqs,
             global_forward_modes=batch.global_forward_modes,
             welm_kv_mirror_contract_flags=batch.welm_kv_mirror_contract_flags,
+            welm_deferred_prefill_flags=batch.welm_deferred_prefill_flags,
             welm_mtp_global_prefill_num_tokens=(
                 batch.welm_mtp_global_prefill_num_tokens
             ),
             router_replay_topk_ids=batch.router_replay_topk_ids,
             router_replay_mask=batch.router_replay_mask,
             is_prefill_only=batch.is_prefill_only,
+            welm_deferred_prefill=batch.welm_deferred_prefill,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
@@ -1255,6 +1261,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         bs = self.batch_size
 
         if isinstance(logits_output, WelmDeferredPrefillCompletion):
+            if not self.welm_deferred_prefill:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion requires an explicitly marked batch"
+                )
             if self.spec_info is not None:
                 raise RuntimeError(
                     "WeLM deferred Prefill completion does not support speculative execution"

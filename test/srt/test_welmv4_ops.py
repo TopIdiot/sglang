@@ -447,7 +447,6 @@ class TestWelmKvMirrorDpMetadata(CustomTestCase):
         set_dp_buffer_len.assert_called_once_with(3, 2, False, [1, 2])
         set_is_extend_in_batch.assert_called_once_with(True)
 
-
 num_tokens_list = [127]
 
 

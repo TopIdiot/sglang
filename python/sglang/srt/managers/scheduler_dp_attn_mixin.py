@@ -24,6 +24,7 @@ _WELM_MTP_PREFILL_INFO_REQ_MASK = (1 << _WELM_MTP_PREFILL_INFO_SHIFT) - 1
 _MLP_SYNC_FLAG_ROUTER_REPLAY = 1 << 0
 _MLP_SYNC_FLAG_CACHE_HIT_EXTEND = 1 << 1
 _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT = 1 << 2
+_MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL = 1 << 3
 
 # WeLM fused sched-sync (SGLANG_WELM_FUSED_SCHED_SYNC): the mlp-sync row is
 # widened so one all_gather can also carry the per-round scheduling intent
@@ -72,6 +73,8 @@ def _has_cache_hit_extend(batch: Optional[ScheduleBatch]) -> bool:
 def _will_contract_welm_kv_mirror(batch: Optional[ScheduleBatch]) -> bool:
     if batch is None or not batch.forward_mode.is_extend_without_speculative():
         return False
+    if batch.welm_deferred_prefill:
+        return False
     if not batch.return_logprob:
         return True
     return not any(
@@ -99,6 +102,7 @@ class MLPSyncBatchInfo:
     has_router_replay: bool = False
     has_cache_hit_extend: bool = False
     will_contract_welm_kv_mirror: bool = False
+    is_welm_deferred_prefill: bool = False
     welm_mtp_prefill_num_tokens: int = 0
     # WeLM fused sched-sync extras (zero on classic gathers)
     fused_intent: int = 0
@@ -112,6 +116,7 @@ class MLPSyncBatchInfo:
     global_num_reqs: list[int] = None
     global_forward_modes: list[int] = None
     welm_kv_mirror_contract_flags: list[bool] = None
+    welm_deferred_prefill_flags: list[bool] = None
     welm_mtp_global_prefill_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
@@ -132,6 +137,8 @@ class MLPSyncBatchInfo:
                     * _MLP_SYNC_FLAG_CACHE_HIT_EXTEND
                     | int(self.will_contract_welm_kv_mirror)
                     * _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT
+                    | int(self.is_welm_deferred_prefill)
+                    * _MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL
                 ),
                 _pack_welm_mtp_prefill_info(
                     self.welm_mtp_prefill_num_tokens,
@@ -248,6 +255,10 @@ class MLPSyncBatchInfo:
             bool(value & _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT)
             for value in packed_flags
         ]
+        self.welm_deferred_prefill_flags = [
+            bool(value & _MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL)
+            for value in packed_flags
+        ]
         prefill_info = [
             _unpack_welm_mtp_prefill_info(value) for value in cpu_data[:, 6].tolist()
         ]
@@ -302,6 +313,9 @@ def _update_gather_batch(
         batch.has_cache_hit_extend_in_batch = mlp_sync_info.has_cache_hit_extend
         batch.welm_kv_mirror_contract_flags = (
             mlp_sync_info.welm_kv_mirror_contract_flags
+        )
+        batch.welm_deferred_prefill_flags = (
+            mlp_sync_info.welm_deferred_prefill_flags
         )
         batch.welm_mtp_global_prefill_num_tokens = (
             mlp_sync_info.welm_mtp_global_prefill_num_tokens
@@ -397,10 +411,15 @@ def compute_local_mlp_sync_info(
     )
     has_cache_hit_extend = _has_cache_hit_extend(local_batch)
     will_contract_welm_kv_mirror = _will_contract_welm_kv_mirror(local_batch)
+    is_welm_deferred_prefill = bool(
+        local_batch is not None and local_batch.welm_deferred_prefill
+    )
     welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
 
     tbo_preparer = TboDPAttentionPreparer()
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+    if is_welm_deferred_prefill:
+        local_can_run_tbo = False
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -416,6 +435,7 @@ def compute_local_mlp_sync_info(
         has_router_replay=has_router_replay,
         has_cache_hit_extend=has_cache_hit_extend,
         will_contract_welm_kv_mirror=will_contract_welm_kv_mirror,
+        is_welm_deferred_prefill=is_welm_deferred_prefill,
         welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
     )
     return mlp_sync_info, tbo_preparer

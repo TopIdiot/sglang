@@ -135,6 +135,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_deferred_mirror import (
+    WelmDeferredExecutionRole,
     WelmDeferredModelExecution,
     get_welm_deferred_model_execution,
 )
@@ -160,7 +161,6 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_cuda,
-    log_info_on_rank0,
     make_layers,
     set_weight_attrs,
 )
@@ -764,8 +764,33 @@ def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
+    local_contract_enabled = getattr(
+        forward_batch, "_welm_local_kv_mirror_contract_enabled", None
+    )
+    if local_contract_enabled is None:
+        contract_flags = getattr(
+            forward_batch, "welm_kv_mirror_contract_flags", None
+        )
+        if contract_flags is not None:
+            from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+            dp_rank = get_attention_dp_rank()
+            if not 0 <= dp_rank < len(contract_flags):
+                raise RuntimeError(
+                    "WeLM KV mirror contraction flags do not cover the local DP "
+                    f"rank: dp_rank={dp_rank}, flags={contract_flags}"
+                )
+            local_contract_enabled = bool(contract_flags[dp_rank])
+        else:
+            local_contract_enabled = True
+        forward_batch._welm_local_kv_mirror_contract_enabled = (
+            local_contract_enabled
+        )
+
     return (
         forward_batch.enable_welm_kv_mirror_opt
+        and local_contract_enabled
+        and not getattr(forward_batch, "welm_deferred_prefill", False)
         and (
             forward_batch.forward_mode.is_extend_without_speculative()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
@@ -808,8 +833,13 @@ def _welm_needs_empty_dp_collectives(
         or getattr(forward_batch, "global_num_tokens_gpu", None) is None
     ):
         return False
-    return is_nextn or (
-        forward_batch.forward_mode.is_idle() and forward_batch.is_extend_in_batch
+    return (
+        getattr(forward_batch, "welm_deferred_prefill_suffix_active", False)
+        or is_nextn
+        or (
+            forward_batch.forward_mode.is_idle()
+            and forward_batch.is_extend_in_batch
+        )
     )
 
 
@@ -1763,6 +1793,9 @@ def _welm_update_contracted_dp_metadata(
     marker_attr: Optional[str] = None,
     contract_to_request_counts: bool = False,
     logprob_local_num_tokens: Optional[int] = None,
+    synchronized_global_num_tokens: Optional[List[int]] = None,
+    synchronized_global_num_tokens_for_logprob: Optional[List[int]] = None,
+    force_sum_len: bool = False,
 ) -> None:
     if (
         not is_dp_attention_enabled()
@@ -1804,7 +1837,68 @@ def _welm_update_contracted_dp_metadata(
     dp_rank = get_attention_dp_rank()
     scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
     local_dp_buffer_len = new_local_num_tokens
-    if contract_to_request_counts:
+    if synchronized_global_num_tokens is not None:
+        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
+        raw_global_num_tokens = [int(x) for x in synchronized_global_num_tokens]
+        if (
+            len(raw_global_num_tokens) != num_dp_slots
+            or not 0 <= dp_rank < num_dp_slots
+            or any(count < 0 for count in raw_global_num_tokens)
+        ):
+            raise RuntimeError(
+                "WeLM synchronized DP metadata has invalid token counts: "
+                f"dp_rank={dp_rank}, counts={raw_global_num_tokens}, "
+                f"num_dp_slots={num_dp_slots}"
+            )
+        if raw_global_num_tokens[dp_rank] != new_local_num_tokens:
+            raise RuntimeError(
+                "WeLM synchronized DP metadata does not match local rows: "
+                f"dp_rank={dp_rank}, local_rows={new_local_num_tokens}, "
+                f"counts={raw_global_num_tokens}"
+            )
+
+        if force_sum_len:
+            forward_batch.is_extend_in_batch = True
+            forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+        else:
+            forward_batch.dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+                forward_batch.is_extend_in_batch,
+                raw_global_num_tokens,
+            )
+        if forward_batch.dp_padding_mode.is_max_len():
+            max_num_tokens = max(raw_global_num_tokens)
+            new_global_num_tokens = [max_num_tokens] * num_dp_slots
+        else:
+            new_global_num_tokens = raw_global_num_tokens
+        local_dp_buffer_len = new_global_num_tokens[dp_rank]
+        copy_dp_counts_to_gpu(
+            forward_batch.global_num_tokens_gpu, new_global_num_tokens
+        )
+        forward_batch.global_num_tokens_cpu = new_global_num_tokens
+
+        if synchronized_global_num_tokens_for_logprob is None:
+            new_global_num_tokens_for_logprob = new_global_num_tokens
+        else:
+            new_global_num_tokens_for_logprob = [
+                int(x) for x in synchronized_global_num_tokens_for_logprob
+            ]
+            if (
+                len(new_global_num_tokens_for_logprob) != num_dp_slots
+                or any(count < 0 for count in new_global_num_tokens_for_logprob)
+            ):
+                raise RuntimeError(
+                    "WeLM synchronized DP metadata has invalid logprob counts: "
+                    f"counts={new_global_num_tokens_for_logprob}, "
+                    f"num_dp_slots={num_dp_slots}"
+                )
+        copy_dp_counts_to_gpu(
+            forward_batch.global_num_tokens_for_logprob_gpu,
+            new_global_num_tokens_for_logprob,
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = (
+            new_global_num_tokens_for_logprob
+        )
+    elif contract_to_request_counts:
         num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
         raw_global_num_tokens = None
         new_global_num_tokens_for_logprob = None
@@ -2014,8 +2108,8 @@ def _welm_update_contracted_dp_metadata(
         and not getattr(forward_batch, "_welm_force_low_latency_deepep", False)
     )
     if (
-        contract_to_request_counts
-        and forward_batch.num_token_non_padded is not None
+        (contract_to_request_counts or synchronized_global_num_tokens is not None)
+        and getattr(forward_batch, "num_token_non_padded", None) is not None
         and not _welm_cuda_graph_capture_active()
     ):
         # The DeepEP top-k mask consumes an attn-TP-rank-LOCAL non-padded
@@ -2026,11 +2120,13 @@ def _welm_update_contracted_dp_metadata(
             compute_local_num_token_non_padded,
         )
 
-        real_rows = max(
-            new_local_num_tokens
-            - getattr(forward_batch, "_welm_kv_mirror_row_pad", 0),
-            0,
-        )
+        real_rows = new_local_num_tokens
+        if synchronized_global_num_tokens is None:
+            real_rows = max(
+                new_local_num_tokens
+                - getattr(forward_batch, "_welm_kv_mirror_row_pad", 0),
+                0,
+            )
         forward_batch.num_token_non_padded = compute_local_num_token_non_padded(
             forward_batch.num_token_non_padded.new_tensor(real_rows),
             new_local_num_tokens,
@@ -2047,11 +2143,114 @@ def _welm_update_contracted_dp_metadata(
         setattr(forward_batch, marker_attr, new_local_num_tokens)
 
 
+def _welm_apply_deferred_prefill_dp_cutoff(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, bool]:
+    flags = getattr(forward_batch, "welm_deferred_prefill_flags", None)
+    if not flags or not any(flags):
+        forward_batch.welm_deferred_prefill_suffix_active = False
+        return hidden_states, residual, positions, False
+
+    from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+    dp_rank = get_attention_dp_rank()
+    global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    global_num_tokens_for_logprob = getattr(
+        forward_batch, "global_num_tokens_for_logprob_cpu", None
+    )
+    global_num_tokens_gpu = getattr(forward_batch, "global_num_tokens_gpu", None)
+    global_num_tokens_for_logprob_gpu = getattr(
+        forward_batch, "global_num_tokens_for_logprob_gpu", None
+    )
+    if (
+        not is_dp_attention_enabled()
+        or welm_use_previous_precision()
+        or not 0 <= dp_rank < len(flags)
+        or global_num_tokens is None
+        or global_num_tokens_for_logprob is None
+        or len(global_num_tokens) != len(flags)
+        or len(global_num_tokens_for_logprob) != len(flags)
+        or global_num_tokens_gpu is None
+        or global_num_tokens_for_logprob_gpu is None
+        or int(global_num_tokens_gpu.numel()) != len(flags)
+        or int(global_num_tokens_for_logprob_gpu.numel()) != len(flags)
+    ):
+        raise RuntimeError(
+            "WeLM deferred Prefill cutoff has inconsistent DP metadata: "
+            f"dp_rank={dp_rank}, flags={flags}, tokens={global_num_tokens}, "
+            f"logprob_tokens={global_num_tokens_for_logprob}"
+        )
+
+    try:
+        global_num_tokens = [int(count) for count in global_num_tokens]
+        global_num_tokens_for_logprob = [
+            int(count) for count in global_num_tokens_for_logprob
+        ]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "WeLM deferred Prefill cutoff received non-integral DP counts"
+        ) from exc
+    if any(count < 0 for count in global_num_tokens) or any(
+        count < 0 for count in global_num_tokens_for_logprob
+    ):
+        raise RuntimeError(
+            "WeLM deferred Prefill cutoff received negative DP counts: "
+            f"tokens={global_num_tokens}, "
+            f"logprob_tokens={global_num_tokens_for_logprob}"
+        )
+
+    local_deferred = bool(flags[dp_rank])
+    if local_deferred != bool(
+        getattr(forward_batch, "welm_deferred_prefill", False)
+    ):
+        raise RuntimeError(
+            "WeLM deferred Prefill cutoff flag does not match the local batch: "
+            f"dp_rank={dp_rank}, local_flag={local_deferred}"
+        )
+    if residual is not None and residual.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            "WeLM deferred Prefill cutoff tensors have inconsistent row counts: "
+            f"hidden={hidden_states.shape[0]}, positions={positions.shape[0]}, "
+            f"residual={None if residual is None else residual.shape[0]}"
+        )
+    synchronized_num_tokens = [
+        0 if deferred else count
+        for deferred, count in zip(flags, global_num_tokens)
+    ]
+    synchronized_logprob_tokens = [
+        0 if deferred else count
+        for deferred, count in zip(flags, global_num_tokens_for_logprob)
+    ]
+    suffix_is_empty = not any(synchronized_num_tokens)
+    if local_deferred:
+        hidden_states = hidden_states[:0]
+        positions = positions[:0]
+        if residual is not None:
+            residual = residual[:0]
+    forward_batch.welm_deferred_prefill_suffix_active = (
+        local_deferred and not suffix_is_empty
+    )
+    _welm_update_contracted_dp_metadata(
+        forward_batch,
+        synchronized_num_tokens[dp_rank],
+        synchronized_global_num_tokens=synchronized_num_tokens,
+        synchronized_global_num_tokens_for_logprob=synchronized_logprob_tokens,
+        force_sum_len=True,
+    )
+    return hidden_states, residual, positions, suffix_is_empty
+
+
 def _welm_effective_kv_mirror_pairs(
     config: PretrainedConfig,
 ) -> Tuple[List[int], List[int]]:
     execution = get_welm_deferred_model_execution(config)
-    if execution is None or execution.role != "prefill":
+    if execution is None or execution.role not in {
+        WelmDeferredExecutionRole.PREFILL,
+        WelmDeferredExecutionRole.MONOLITHIC,
+    }:
         return (
             list(getattr(config, "kv_mirror_layers", [])),
             list(getattr(config, "kv_mirror_imitated_layers", [])),
@@ -2748,6 +2947,18 @@ class MirrorQProjection(BaseWelmQkvProjection):
         )
         kv_activation = kv_mirror_states.pop(pop_key, None)
         if kv_activation is None:
+            if (
+                hidden_states.shape[0] == 0
+                and getattr(forward_batch, "welm_deferred_prefill", False)
+                and getattr(
+                    forward_batch,
+                    "welm_deferred_prefill_suffix_active",
+                    False,
+                )
+            ):
+                q = hidden_states.new_empty((0, attn.q_size))
+                empty_kv = hidden_states.new_empty((0, attn.kv_size))
+                return q, empty_kv, empty_kv, project_hidden_states
             raise RuntimeError(
                 f"Missing mirrored KV activation for pop_key={pop_key} "
                 f"(imitated={self.imitated_layer_idx}, mirror={self.mirror_layer_idx})"
@@ -3692,13 +3903,6 @@ class WelmDeferredKVCacheLayer:
     v_scale: Optional[float] = None
 
 
-@dataclass(frozen=True)
-class WelmDeferredWeightLoadStats:
-    relocated_tensors: int
-    omitted_tensors: int
-    omitted_bytes: int
-
-
 class WelmDeferredTargetKVFinalizer(nn.Module):
     def __init__(
         self,
@@ -3734,6 +3938,28 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
             qk_head_dim=head_dim,
             v_head_dim=head_dim,
         )
+
+    @classmethod
+    def borrow_from_target_attention(
+        cls,
+        target_attention: "Qwen2MoeAttention",
+    ) -> "WelmDeferredTargetKVFinalizer":
+        finalizer = cls.__new__(cls)
+        nn.Module.__init__(finalizer)
+        finalizer.target_layer_id = target_attention.layer_idx
+        finalizer.num_kv_heads = target_attention.num_kv_heads
+        finalizer.head_dim = target_attention.head_dim
+        finalizer.scale_seq_factor = target_attention.scale_seq_factor
+        finalizer.scale_rope_positions = (
+            target_attention.scale_seq_attn_per_suffix
+        )
+        finalizer.apply_k_norm = (
+            target_attention.qk_norm or target_attention.only_k_norm
+        )
+        object.__setattr__(finalizer, "k_norm", target_attention.k_norm)
+        object.__setattr__(finalizer, "rotary_emb", target_attention.rotary_emb)
+        object.__setattr__(finalizer, "cache_layer", target_attention.attn)
+        return finalizer
 
     def forward(
         self,
@@ -4103,7 +4329,10 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
             self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
         self.deferred_target_kv_finalizers = nn.ModuleDict()
         deferred_execution = get_welm_deferred_model_execution(config)
-        if deferred_execution is not None and deferred_execution.role == "prefill":
+        if (
+            deferred_execution is not None
+            and deferred_execution.role is WelmDeferredExecutionRole.PREFILL
+        ):
             for target_layer_id in imitated_to_mirrors.get(
                 self.kv_mirror_layer_idx, []
             ):
@@ -4244,7 +4473,9 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
             )
         else:
             q, k, v = fused_qkv
-        if self.deferred_target_kv_finalizers:
+        if self.deferred_target_kv_finalizers and getattr(
+            forward_batch, "welm_deferred_prefill", False
+        ):
             _welm_finalize_deferred_target_kv(
                 self.deferred_target_kv_finalizers,
                 positions,
@@ -5380,6 +5611,7 @@ class Qwen2MoeModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        self._bind_monolithic_deferred_target_kv_finalizers()
         self.mk_moe_router = None
         mk_moe_router_mode = get_mk_moe_router_mode()
         if mk_moe_router_mode is not MkMoeRouterMode.OFF:
@@ -5418,6 +5650,36 @@ class Qwen2MoeModel(nn.Module):
 
         # For EAGLE3 support
         self.layers_to_capture = []
+
+    def _bind_monolithic_deferred_target_kv_finalizers(self) -> None:
+        if (
+            self.deferred_execution is None
+            or self.deferred_execution.role
+            is not WelmDeferredExecutionRole.MONOLITHIC
+        ):
+            return
+        for pair in self.deferred_execution.plan.pairs:
+            if not (
+                self.start_layer <= pair.source_layer < self.end_layer
+                and self.start_layer <= pair.target_layer < self.end_layer
+            ):
+                raise RuntimeError(
+                    "WeLM deferred monolithic finalizers require source and target "
+                    "layers on the same pipeline rank"
+                )
+            source_attention = self.layers[pair.source_layer].self_attn
+            target_attention = self.layers[pair.target_layer].self_attn
+            target_key = str(pair.target_layer)
+            if target_key in source_attention.deferred_target_kv_finalizers:
+                raise RuntimeError(
+                    "duplicate WeLM deferred target finalizer for layer "
+                    f"{pair.target_layer}"
+                )
+            source_attention.deferred_target_kv_finalizers[target_key] = (
+                WelmDeferredTargetKVFinalizer.borrow_from_target_attention(
+                    target_attention
+                )
+            )
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
         self.layers_to_capture = layers_to_capture
@@ -5494,6 +5756,55 @@ class Qwen2MoeModel(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.token_owner_runtime is not None:
             self.token_owner_runtime.begin_forward(forward_batch)
+
+        deferred_prefill = bool(
+            getattr(forward_batch, "welm_deferred_prefill", False)
+        )
+        deferred_prefill_flags = getattr(
+            forward_batch, "welm_deferred_prefill_flags", None
+        )
+        monolithic_deferred_dp = bool(
+            self.deferred_execution is not None
+            and self.deferred_execution.role is WelmDeferredExecutionRole.MONOLITHIC
+            and deferred_prefill_flags
+            and any(deferred_prefill_flags)
+        )
+        if (
+            deferred_prefill
+            and self.deferred_execution is not None
+            and self.deferred_execution.role is WelmDeferredExecutionRole.MONOLITHIC
+            and is_dp_attention_enabled()
+            and not monolithic_deferred_dp
+        ):
+            raise RuntimeError(
+                "WeLM deferred monolithic Prefill is missing synchronized DP flags"
+            )
+        if monolithic_deferred_dp and forward_batch.can_run_tbo:
+            raise RuntimeError(
+                "WeLM deferred monolithic DP forward cannot enter two-batch overlap"
+            )
+        if deferred_prefill:
+            if self.deferred_execution is None or self.deferred_execution.role not in {
+                WelmDeferredExecutionRole.PREFILL,
+                WelmDeferredExecutionRole.MONOLITHIC,
+            }:
+                raise RuntimeError(
+                    "marked WeLM deferred Prefill batch has no compatible model execution"
+                )
+            if forward_batch.forward_mode is not ForwardMode.EXTEND:
+                raise RuntimeError(
+                    "WeLM deferred Prefill runtime cutoff requires EXTEND mode"
+                )
+            if forward_batch.spec_info is not None:
+                raise RuntimeError(
+                    "WeLM deferred Prefill runtime cutoff does not support speculative metadata"
+                )
+            runtime_end_layer = self.deferred_execution.prefill_execution_end_layer
+            if monolithic_deferred_dp:
+                runtime_end_layer = self.execution_end_layer
+        else:
+            runtime_end_layer = self.execution_end_layer
+
         if _WELM_DUMP_ENABLED:
             _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
@@ -5540,8 +5851,10 @@ class Qwen2MoeModel(nn.Module):
         use_previous_precision = welm_use_previous_precision()
         pre_norm_hidden_states = None
         if (
-            forward_batch.can_run_tbo
-            and self.execution_end_layer == self.config.num_hidden_layers
+            not deferred_prefill
+            and forward_batch.can_run_tbo
+            and not monolithic_deferred_dp
+            and runtime_end_layer == self.config.num_hidden_layers
             and not _welm_should_contract_kv_mirror(forward_batch)
         ):
             hidden_states, residual = model_forward_maybe_tbo(
@@ -5557,7 +5870,7 @@ class Qwen2MoeModel(nn.Module):
             kv_mirror_indices_initialized = False
             for i in range(
                 self.start_layer,
-                min(self.end_layer, self.execution_end_layer),
+                min(self.end_layer, runtime_end_layer),
             ):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
@@ -5595,11 +5908,28 @@ class Qwen2MoeModel(nn.Module):
                         mtp_kv_mirror_states = _clone_welm_kv_mirror_states(
                             kv_mirror_states
                         )
-        omit_final_output = (
+                if (
+                    monolithic_deferred_dp
+                    and i + 1
+                    == self.deferred_execution.prefill_execution_end_layer
+                ):
+                    hidden_states, residual, positions, suffix_is_empty = (
+                        _welm_apply_deferred_prefill_dp_cutoff(
+                            hidden_states,
+                            residual,
+                            positions,
+                            forward_batch,
+                        )
+                    )
+                    if self.token_owner_runtime is not None and not suffix_is_empty:
+                        self.token_owner_runtime.invalidate()
+                    if suffix_is_empty:
+                        break
+        omit_final_output = deferred_prefill or (
             self.deferred_execution is not None
             and self.deferred_execution.omit_final_output
         )
-        if omit_final_output and kv_mirror_states:
+        if deferred_prefill and kv_mirror_states:
             raise RuntimeError(
                 "WeLM deferred Prefill retained temporary mirror K/V "
                 f"for target layers {sorted(kv_mirror_states)}"
@@ -5824,10 +6154,17 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_oe_fusion=skip_oe_fusion,
         )
-        if (
-            self.deferred_execution is not None
-            and self.deferred_execution.omit_final_output
-        ):
+        deferred_prefill = bool(
+            getattr(forward_batch, "welm_deferred_prefill", False)
+        )
+        if deferred_prefill:
+            if self.deferred_execution is None or self.deferred_execution.role not in {
+                WelmDeferredExecutionRole.PREFILL,
+                WelmDeferredExecutionRole.MONOLITHIC,
+            }:
+                raise RuntimeError(
+                    "marked WeLM deferred Prefill batch has no compatible causal LM"
+                )
             if not self.pp_group.is_last_rank:
                 raise RuntimeError(
                     "WeLM deferred Prefill completion does not support pipeline parallelism"
@@ -5851,6 +6188,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     "WeLM deferred Prefill does not support logprob or hidden-state output payloads"
                 )
             return WelmDeferredPrefillCompletion()
+        if (
+            self.deferred_execution is not None
+            and self.deferred_execution.omit_final_output
+        ):
+            raise RuntimeError(
+                "WeLM deferred Prefill model received an unmarked forward batch"
+            )
 
         aux_hidden_states = None
         if isinstance(model_output, tuple):
@@ -6085,7 +6429,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
         deferred_execution = getattr(self, "deferred_execution", None)
         is_deferred_prefill = (
-            deferred_execution is not None and deferred_execution.role == "prefill"
+            deferred_execution is not None
+            and deferred_execution.role is WelmDeferredExecutionRole.PREFILL
         )
         deferred_finalizer_route = {}
         if is_deferred_prefill:
@@ -6105,9 +6450,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 deferred_finalizer_route[hf_name] = k_norm_weight
 
         relocated_weight_names = set()
-        relocated_tensors = 0
-        omitted_tensors = 0
-        omitted_bytes = 0
         omitted_layer_ids = (
             frozenset(deferred_execution.omitted_layer_ids)
             if is_deferred_prefill
@@ -6142,16 +6484,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
             return True
 
         def record_relocated_weight(name: str) -> None:
-            nonlocal relocated_tensors
             if name in relocated_weight_names:
                 raise RuntimeError(f"duplicate relocated weight {name}")
             relocated_weight_names.add(name)
-            relocated_tensors += 1
-
-        def record_omitted_weight(loaded_weight: torch.Tensor) -> None:
-            nonlocal omitted_tensors, omitted_bytes
-            omitted_tensors += 1
-            omitted_bytes += loaded_weight.numel() * loaded_weight.element_size()
 
         if is_nextn:
             is_welm_mtp_nextn = bool(
@@ -6267,7 +6602,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 if is_pruned_layer or name.startswith("model.norm.") or name.startswith(
                     "lm_head."
                 ):
-                    record_omitted_weight(loaded_weight)
                     continue
             if (
                 layer_id is not None
@@ -6395,20 +6729,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     f"extra_steps={sorted(extra_nextn_steps)}, "
                     f"num_nextn_predict_layers={num_nextn_layers}."
                 )
-
-        if is_deferred_prefill:
-            self.welm_deferred_weight_load_stats = WelmDeferredWeightLoadStats(
-                relocated_tensors=relocated_tensors,
-                omitted_tensors=omitted_tensors,
-                omitted_bytes=omitted_bytes,
-            )
-            log_info_on_rank0(
-                logger,
-                "WeLM deferred Prefill weight load: "
-                f"relocated_tensors={relocated_tensors}, "
-                f"omitted_tensors={omitted_tensors}, "
-                f"omitted_bytes={omitted_bytes}",
-            )
 
     def get_embed_and_head(self):
         return [

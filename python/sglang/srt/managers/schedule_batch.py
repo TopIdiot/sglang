@@ -953,7 +953,7 @@ class OverEncodingContext:
 
 
 class WelmDeferredDecodePhase(str, Enum):
-    TRANSFER_PENDING = "transfer_pending"
+    PREFILL_PENDING = "prefill_pending"
     READY = "ready"
     INFLIGHT = "inflight"
     CONSUMED = "consumed"
@@ -972,8 +972,14 @@ class WelmDeferredDecodeState:
         cls, prompt_token_ids: List[int]
     ) -> "WelmDeferredDecodeState":
         span = build_welm_deferred_prefill_span(prompt_token_ids)
+        return cls.from_prefill_span(span)
+
+    @classmethod
+    def from_prefill_span(
+        cls, span: WelmDeferredPrefillSpan
+    ) -> "WelmDeferredDecodeState":
         return cls(
-            phase=WelmDeferredDecodePhase.TRANSFER_PENDING,
+            phase=WelmDeferredDecodePhase.PREFILL_PENDING,
             committed_kv_len=span.committed_kv_len,
             seed_position=span.seed_position,
             seed_token_id=span.seed_token_id,
@@ -983,8 +989,8 @@ class WelmDeferredDecodeState:
     def validate_prompt_tokens(self, prompt_token_ids: List[int]) -> None:
         if len(prompt_token_ids) != self.committed_kv_len + 1:
             raise RuntimeError(
-                "WeLM deferred decode prompt length changed after transfer "
-                f"admission: expected {self.committed_kv_len + 1}, "
+                "WeLM deferred decode prompt length changed after admission: "
+                f"expected {self.committed_kv_len + 1}, "
                 f"got {len(prompt_token_ids)}"
             )
         if self.seed_position != self.committed_kv_len:
@@ -993,11 +999,31 @@ class WelmDeferredDecodeState:
             )
         if int(prompt_token_ids[self.seed_position]) != self.seed_token_id:
             raise RuntimeError(
-                "WeLM deferred decode seed token changed after transfer admission"
+                "WeLM deferred decode seed token changed after admission"
             )
         if self.input_kind is not DeferredDecodeInputKind.TOKEN_ID:
             raise RuntimeError(
                 "WeLM deferred decode currently requires TOKEN_ID seed input"
+            )
+
+    def validate_prefill_span(
+        self,
+        span: WelmDeferredPrefillSpan,
+        prompt_token_ids: List[int],
+    ) -> None:
+        span.validate_prompt_tokens(prompt_token_ids)
+        self.validate_prompt_tokens(prompt_token_ids)
+        if (
+            self.committed_kv_len,
+            self.seed_position,
+            self.seed_token_id,
+        ) != (
+            span.committed_kv_len,
+            span.seed_position,
+            span.seed_token_id,
+        ):
+            raise RuntimeError(
+                "WeLM deferred lifecycle state does not match Prefill span"
             )
 
     def committed_token_ids(self, prompt_token_ids: List[int]) -> List[int]:
@@ -1006,7 +1032,7 @@ class WelmDeferredDecodeState:
 
     def transition_to(self, next_phase: WelmDeferredDecodePhase) -> None:
         expected_next = {
-            WelmDeferredDecodePhase.TRANSFER_PENDING: WelmDeferredDecodePhase.READY,
+            WelmDeferredDecodePhase.PREFILL_PENDING: WelmDeferredDecodePhase.READY,
             WelmDeferredDecodePhase.READY: WelmDeferredDecodePhase.INFLIGHT,
             WelmDeferredDecodePhase.INFLIGHT: WelmDeferredDecodePhase.CONSUMED,
         }.get(self.phase)
@@ -1024,6 +1050,32 @@ class WelmDeferredDecodeState:
                 f"expected inflight, got {self.phase.value}"
             )
         self.phase = WelmDeferredDecodePhase.READY
+
+    def rollback_ready_to_prefill_pending(self) -> None:
+        if self.phase is not WelmDeferredDecodePhase.READY:
+            raise RuntimeError(
+                "invalid WeLM deferred Prefill rollback: "
+                f"expected ready, got {self.phase.value}"
+            )
+        self.phase = WelmDeferredDecodePhase.PREFILL_PENDING
+
+
+def is_welm_deferred_prefill_pending(req: "Req") -> bool:
+    span = getattr(req, "welm_deferred_prefill_span", None)
+    state = getattr(req, "welm_deferred_decode_state", None)
+    if state is not None and not isinstance(state, WelmDeferredDecodeState):
+        raise RuntimeError("WeLM deferred Prefill batch has invalid lifecycle state")
+    if (
+        state is not None
+        and state.phase is WelmDeferredDecodePhase.PREFILL_PENDING
+        and span is None
+    ):
+        raise RuntimeError(
+            "WeLM deferred Prefill state is missing its immutable span"
+        )
+    return span is not None and (
+        state is None or state.phase is WelmDeferredDecodePhase.PREFILL_PENDING
+    )
 
 
 class Req(ReqDllmMixin):
@@ -1546,7 +1598,14 @@ class Req(ReqDllmMixin):
         )
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
-        if getattr(self, "welm_deferred_prefill_span", None) is not None:
+        deferred_state = getattr(self, "welm_deferred_decode_state", None)
+        if (
+            getattr(self, "welm_deferred_prefill_span", None) is not None
+            and not (
+                isinstance(deferred_state, WelmDeferredDecodeState)
+                and deferred_state.phase is WelmDeferredDecodePhase.CONSUMED
+            )
+        ):
             return input_len
         # The matched length is at most 1 less than the input length to enable logprob computation.
         max_prefix_len = input_len - 1
@@ -1562,13 +1621,21 @@ class Req(ReqDllmMixin):
 
     def prefill_kv_token_ids(self) -> List[int]:
         span = getattr(self, "welm_deferred_prefill_span", None)
-        if span is None:
+        state = getattr(self, "welm_deferred_decode_state", None)
+        if span is None or (
+            isinstance(state, WelmDeferredDecodeState)
+            and state.phase is WelmDeferredDecodePhase.CONSUMED
+        ):
             return self.origin_input_ids + self.output_ids
         return span.committed_token_ids(self.origin_input_ids)
 
     def prefill_kv_len(self) -> int:
         span = getattr(self, "welm_deferred_prefill_span", None)
-        if span is None:
+        state = getattr(self, "welm_deferred_decode_state", None)
+        if span is None or (
+            isinstance(state, WelmDeferredDecodeState)
+            and state.phase is WelmDeferredDecodePhase.CONSUMED
+        ):
             return len(self.origin_input_ids) + len(self.output_ids)
         return span.committed_kv_len
 
@@ -1594,6 +1661,12 @@ class Req(ReqDllmMixin):
         )
 
     def requires_logprob_payload(self) -> bool:
+        deferred_state = getattr(self, "welm_deferred_decode_state", None)
+        if isinstance(deferred_state, WelmDeferredDecodeState):
+            return (
+                self.return_logprob
+                and deferred_state.phase is not WelmDeferredDecodePhase.PREFILL_PENDING
+            )
         return self.return_logprob and (
             getattr(self, "welm_deferred_prefill_span", None) is None
             or Req.requires_prompt_logprobs(self)
@@ -2033,6 +2106,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_reqs: Optional[List[int]] = None
     global_forward_modes: Optional[List[int]] = None
     welm_kv_mirror_contract_flags: Optional[List[bool]] = None
+    welm_deferred_prefill_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     has_cache_hit_extend_in_batch: bool = False
@@ -2124,6 +2198,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     oe_context: Optional[OverEncodingContext] = None
     scale_seq_factor: int = 1
 
+    # WeLM deferred Prefill metadata. The request-aligned final mask remains
+    # scheduler-local; only the uniform marker crosses into model execution.
+    welm_deferred_prefill: bool = False
+    welm_deferred_prefill_final_mask: Optional[Tuple[bool, ...]] = None
+
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
@@ -2185,7 +2264,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=dllm_config,
             attn_cp_prefill_split_specs=attn_cp_prefill_split_specs,
         )
+        batch._freeze_welm_deferred_prefill_metadata()
         return batch
+
+    def _freeze_welm_deferred_prefill_metadata(self) -> None:
+        deferred_rows = [is_welm_deferred_prefill_pending(req) for req in self.reqs]
+
+        if any(deferred_rows) and not all(deferred_rows):
+            raise RuntimeError(
+                "mixed deferred Prefill and ordinary rows are not supported"
+            )
+        self.welm_deferred_prefill = bool(deferred_rows and all(deferred_rows))
+        if not self.welm_deferred_prefill:
+            self.welm_deferred_prefill_final_mask = None
+            return
+
+        final_mask = []
+        for req in self.reqs:
+            span = req.welm_deferred_prefill_span
+            span.validate_prompt_tokens(req.origin_input_ids)
+            scheduled_len = len(req.fill_ids)
+            if scheduled_len > span.committed_kv_len:
+                raise RuntimeError(
+                    "WeLM deferred Prefill chunk exceeds its committed span: "
+                    f"rid={req.rid}, scheduled_len={scheduled_len}, "
+                    f"committed_kv_len={span.committed_kv_len}"
+                )
+            final_mask.append(scheduled_len == span.committed_kv_len)
+        self.welm_deferred_prefill_final_mask = tuple(final_mask)
+
+    def _clear_welm_deferred_prefill_metadata(self) -> None:
+        self.welm_deferred_prefill = False
+        self.welm_deferred_prefill_final_mask = None
 
     def batch_size(self):
         return len(self.reqs)
@@ -2972,6 +3082,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         else:
             release_kv_cache(req, self.tree_cache, is_insert=False)
+        if allow_uncommitted_tail and server_args.disaggregation_mode != "decode":
+            req.welm_deferred_decode_state.rollback_ready_to_prefill_pending()
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -2984,6 +3096,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
+        self._clear_welm_deferred_prefill_metadata()
         self._clear_attn_cp_prefill_split_specs(clear_reqs=True)
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -3000,6 +3113,73 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def prepare_for_welm_deferred_seed_decode(self):
+        """Populate ready deferred seeds as ordinary decode rows."""
+        if not self.reqs:
+            raise RuntimeError("WeLM deferred seed batch must not be empty")
+
+        seed_token_ids = []
+        committed_lens = []
+        req_pool_indices = []
+        for req in self.reqs:
+            state = vars(req).get("welm_deferred_decode_state")
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "WeLM deferred seed admission is missing lifecycle state"
+                )
+            if state.phase is not WelmDeferredDecodePhase.READY:
+                raise RuntimeError(
+                    "WeLM deferred seed admission requires READY state: "
+                    f"rid={req.rid}, phase={state.phase.value}"
+                )
+            state.validate_prompt_tokens(req.origin_input_ids)
+            if req.output_ids:
+                raise RuntimeError(
+                    "WeLM deferred seed admission requires an empty output"
+                )
+            if req.kv_allocated_len != state.committed_kv_len:
+                raise RuntimeError(
+                    "WeLM deferred seed allocation length mismatch: "
+                    f"rid={req.rid}, allocated={req.kv_allocated_len}, "
+                    f"committed={state.committed_kv_len}"
+                )
+            if req.kv_committed_len != state.committed_kv_len:
+                raise RuntimeError(
+                    "WeLM deferred seed committed length mismatch: "
+                    f"rid={req.rid}, request={req.kv_committed_len}, "
+                    f"state={state.committed_kv_len}"
+                )
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    f"WeLM deferred seed {req.rid} has no decode request slot"
+                )
+
+            seed_token_ids.append(state.seed_token_id)
+            committed_lens.append(state.committed_kv_len)
+            req_pool_indices.append(req.req_pool_idx)
+
+        self.output_ids = torch.tensor(
+            seed_token_ids, dtype=torch.int64, device=self.device
+        )
+        self.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        self.seq_lens = torch.tensor(
+            committed_lens, dtype=torch.int64, device=self.device
+        )
+        self.seq_lens_cpu = torch.tensor(committed_lens, dtype=torch.int64)
+        self.orig_seq_lens = torch.tensor(
+            committed_lens, dtype=torch.int32, device=self.device
+        )
+        self.seq_lens_sum = sum(committed_lens)
+        if self.return_logprob:
+            self.top_logprobs_nums = [req.top_logprobs_num for req in self.reqs]
+            self.token_ids_logprobs = [req.token_ids_logprob for req in self.reqs]
+        self.multimodal_inputs = [req.multimodal_inputs for req in self.reqs]
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self, self.model_config.vocab_size
+        )
+
     @property
     def is_spec_v2(self):
         # FIXME: finally deprecate is_spec_v2
@@ -3010,8 +3190,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         scale = self._get_scale_seq_factor()
         self.forward_mode = ForwardMode.DECODE
+        self._clear_welm_deferred_prefill_metadata()
         bs = len(self.reqs)
         deferred_seed_states = []
+        deferred_seed_requires_logprob = False
         deferred_penalty_active_mask = []
         has_inactive_deferred_penalty_row = False
         for req in self.reqs:
@@ -3023,9 +3205,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 raise RuntimeError(
                     "decode batch received invalid WeLM deferred lifecycle state"
                 )
-            if state.phase is WelmDeferredDecodePhase.TRANSFER_PENDING:
+            if state.phase is WelmDeferredDecodePhase.PREFILL_PENDING:
                 raise RuntimeError(
-                    "WeLM deferred seed entered decode before transfer completion"
+                    "WeLM deferred seed entered decode before Prefill completion"
                 )
             is_ready_seed = state.phase is WelmDeferredDecodePhase.READY
             penalty_active = state.phase is WelmDeferredDecodePhase.CONSUMED
@@ -3041,7 +3223,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     raise RuntimeError(
                         "WeLM deferred seed committed length changed before decode"
                     )
+                if self.enable_overlap:
+                    # The seed is the current input but still lives in the prompt.
+                    req._overlap_decode_count = -1
                 deferred_seed_states.append(state)
+                deferred_seed_requires_logprob |= req.return_logprob
+
+        if deferred_seed_states:
+            self.return_logprob |= deferred_seed_requires_logprob
+            self.top_logprobs_nums = (
+                [req.top_logprobs_num for req in self.reqs]
+                if self.return_logprob
+                else None
+            )
+            self.token_ids_logprobs = (
+                [req.token_ids_logprob for req in self.reqs]
+                if self.return_logprob
+                else None
+            )
 
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
@@ -3530,6 +3729,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_reqs=self.global_num_reqs,
             global_forward_modes=self.global_forward_modes,
             welm_kv_mirror_contract_flags=self.welm_kv_mirror_contract_flags,
+            welm_deferred_prefill_flags=self.welm_deferred_prefill_flags,
             welm_mtp_global_prefill_num_tokens=(
                 self.welm_mtp_global_prefill_num_tokens
             ),
@@ -3592,6 +3792,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             forward_iter=self.forward_iter,
+            welm_deferred_prefill=self.welm_deferred_prefill,
         )
 
     def _get_welm_kv_mirror_last_q_indices(
@@ -3654,6 +3855,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            welm_deferred_prefill=self.welm_deferred_prefill,
+            welm_deferred_prefill_final_mask=(
+                self.welm_deferred_prefill_final_mask
+            ),
         )
 
     def _clear_attn_cp_prefill_split_specs(self, *, clear_reqs: bool) -> None:
@@ -3802,6 +4007,7 @@ class ModelWorkerBatch:
     global_num_reqs: Optional[List[int]]
     global_forward_modes: Optional[List[int]]
     welm_kv_mirror_contract_flags: Optional[List[bool]]
+    welm_deferred_prefill_flags: Optional[List[bool]]
     welm_mtp_global_prefill_num_tokens: Optional[List[int]]
     is_extend_in_batch: bool
     all_extend_in_batch: bool
@@ -3837,6 +4043,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # Uniform model-execution marker; request-aligned finality stays in scheduler.
+    welm_deferred_prefill: bool = False
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None

@@ -192,6 +192,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+WELM_DEFERRED_WARMUP_INPUT_LEN = 16 * 1024
 
 
 # Store global states
@@ -1978,6 +1979,12 @@ def _execute_server_warmup(server_args: ServerArgs):
         return success
 
     model_info = res.json()
+    is_monolithic_welm_deferred = (
+        server_args.disaggregation_mode == "null"
+        and server_args.welm_kv_mirror_pd_mode == "deferred-last-prompt"
+        and model_info["is_generation"]
+        and not model_info.get("has_image_understanding", False)
+    )
 
     # Construct a warmup request
     is_vlm = bool(model_info.get("has_image_understanding", False))
@@ -2037,6 +2044,18 @@ def _execute_server_warmup(server_args: ServerArgs):
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
+    if is_monolithic_welm_deferred:
+        input_ids = [10] * WELM_DEFERRED_WARMUP_INPUT_LEN
+        json_data.pop("text", None)
+        json_data["input_ids"] = [input_ids] * server_args.dp_size
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = input_ids
+        json_data["sampling_params"]["ignore_eos"] = True
+        logger.info(
+            "Running monolithic WeLM deferred warmup with %d input tokens",
+            WELM_DEFERRED_WARMUP_INPUT_LEN,
+        )
+
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
@@ -2057,6 +2076,21 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if is_monolithic_welm_deferred:
+                flush_timeout = warmup_timeout if warmup_timeout > 0 else 600
+                flush_headers = (
+                    {"Authorization": f"Bearer {server_args.admin_api_key}"}
+                    if server_args.admin_api_key
+                    else headers
+                )
+                flush_res = requests.post(
+                    url + "/flush_cache",
+                    headers=flush_headers,
+                    params={"timeout": flush_timeout},
+                    timeout=flush_timeout,
+                    verify=ssl_verify,
+                )
+                assert flush_res.status_code == 200, f"{flush_res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:

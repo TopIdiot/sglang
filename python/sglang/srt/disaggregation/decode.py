@@ -93,8 +93,8 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.models.welm_deferred_mirror import (
-    WelmPDExecutionMode,
     get_welm_deferred_request_unsupported_reason,
+    is_welm_deferred_mirror_enabled,
 )
 from sglang.srt.managers.scheduler_decode_profile import (
     decode_scheduler_profile_enabled,
@@ -131,20 +131,11 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-def _welm_deferred_decode_enabled(server_args: ServerArgs) -> bool:
-    raw_mode = vars(server_args).get("welm_kv_mirror_pd_mode", "legacy")
-    try:
-        mode = WelmPDExecutionMode(raw_mode)
-    except ValueError as exc:
-        raise RuntimeError(f"unknown runtime WeLM mirror P/D mode {raw_mode!r}") from exc
-    return mode is WelmPDExecutionMode.DEFERRED_LAST_PROMPT
-
-
 def _get_welm_deferred_transfer_state(
     req: Req, server_args: ServerArgs
 ) -> Optional[WelmDeferredDecodeState]:
     """Return state only while the request still uses deferred transfer semantics."""
-    enabled = _welm_deferred_decode_enabled(server_args)
+    enabled = is_welm_deferred_mirror_enabled(server_args)
     state = vars(req).get("welm_deferred_decode_state")
     if enabled:
         if not isinstance(state, WelmDeferredDecodeState):
@@ -614,7 +605,7 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
-        deferred_enabled = _welm_deferred_decode_enabled(self.scheduler.server_args)
+        deferred_enabled = is_welm_deferred_mirror_enabled(self.scheduler.server_args)
         deferred_state = vars(req).get("welm_deferred_decode_state")
         if deferred_enabled:
             unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
@@ -1761,7 +1752,7 @@ class DecodeTransferQueue:
         state: WelmDeferredDecodeState,
     ) -> List[int]:
         req = decode_req.req
-        if state.phase is not WelmDeferredDecodePhase.TRANSFER_PENDING:
+        if state.phase is not WelmDeferredDecodePhase.PREFILL_PENDING:
             raise ValueError(
                 "duplicate or out-of-order WeLM deferred transfer completion: "
                 f"phase={state.phase.value}"
@@ -2255,12 +2246,7 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
-        deferred_seed_batch = self.get_new_welm_deferred_seed_batch()
-        if deferred_seed_batch is not None:
-            if self.running_batch.is_empty():
-                self.running_batch = deferred_seed_batch
-            else:
-                self.running_batch.merge_batch(deferred_seed_batch)
+        self._admit_new_welm_deferred_seed_batch()
 
         # Process pending prebuilt batch: output processing + filter + merge
         if (
@@ -2296,64 +2282,6 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
-    def get_new_welm_deferred_seed_batch(
-        self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
-        if not _welm_deferred_decode_enabled(self.server_args):
-            return None
-        if len(self.waiting_queue) == 0:
-            return None
-
-        if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, self.running_batch)
-
-        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
-        active_running = sum(
-            not req.finished() and not getattr(req, "is_retracted", False)
-            for req in self.running_batch.reqs
-        )
-        available_rows = batch_size - active_running
-        if available_rows <= 0:
-            return None
-
-        can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
-        for req in self.waiting_queue:
-            state = vars(req).get("welm_deferred_decode_state")
-            if not isinstance(state, WelmDeferredDecodeState):
-                raise RuntimeError(
-                    "waiting WeLM deferred decode seed is missing lifecycle state"
-                )
-            if state.phase is WelmDeferredDecodePhase.CONSUMED:
-                waiting_queue.append(req)
-                continue
-            if state.phase is not WelmDeferredDecodePhase.READY:
-                raise RuntimeError(
-                    "waiting WeLM deferred decode seed is not READY: "
-                    f"rid={req.rid}, phase={state.phase.value}"
-                )
-            if len(can_run_list) < available_rows:
-                can_run_list.append(req)
-            else:
-                waiting_queue.append(req)
-
-        self.waiting_queue = waiting_queue
-        if len(can_run_list) == 0:
-            return None
-
-        set_time_batch(can_run_list, "set_forward_entry_time")
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-        )
-        new_batch.prepare_for_welm_deferred_seed_decode()
-        return new_batch
-
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -2377,7 +2305,7 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        deferred_enabled = _welm_deferred_decode_enabled(self.server_args)
+        deferred_enabled = is_welm_deferred_mirror_enabled(self.server_args)
         # WeLM MTP prebuilt batches must be uniform in request-level fake
         # transfer: the deferred draft-prefill mask is all-or-nothing (mixed
         # rows are rejected in draft()), so pin the batch to the first

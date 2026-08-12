@@ -52,6 +52,7 @@ def _server_args(**overrides):
         "attn_cp_size": 1,
         "enable_lora": False,
         "enable_suffix_parallel": False,
+        "enable_mixed_chunk": False,
         "kv_cache_dtype": "auto",
         "tp_size": 4,
         "dp_size": 1,
@@ -182,12 +183,51 @@ def test_deferred_mode_resolves_same_rank_free_plan_for_both_roles(role):
     assert not hasattr(plan, "dp_rank")
 
 
+def test_deferred_mode_resolves_monolithic_without_transfer_backend():
+    plan = resolve_welm_deferred_mirror_plan(
+        _server_args(
+            disaggregation_mode="null",
+            disaggregation_transfer_backend=None,
+        ),
+        _model_config(),
+        use_previous_precision=False,
+    )
+
+    assert plan is not None
+    assert plan.execution_end_layer == 33
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_deferred_pd_roles_still_require_mooncake(role):
+    with pytest.raises(ValueError, match="mooncake"):
+        resolve_welm_deferred_mirror_plan(
+            _server_args(
+                disaggregation_mode=role,
+                disaggregation_transfer_backend="nixl",
+            ),
+            _model_config(),
+            use_previous_precision=False,
+        )
+
+
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+def test_deferred_mode_rejects_mixed_chunk_for_every_role(role):
+    with pytest.raises(ValueError, match="mixed chunk"):
+        resolve_welm_deferred_mirror_plan(
+            _server_args(
+                disaggregation_mode=role,
+                enable_mixed_chunk=True,
+            ),
+            _model_config(),
+            use_previous_precision=False,
+        )
+
+
 @pytest.mark.parametrize(
     ("args_overrides", "model_overrides", "previous_precision", "message"),
     [
         ({"welm_kv_mirror_pd_mode": "broken"}, {}, False, "unknown"),
         ({"enable_welm_kv_mirror_opt": False}, {}, False, "mirror-opt"),
-        ({"disaggregation_mode": "null"}, {}, False, "prefill or decode"),
         (
             {"disaggregation_transfer_backend": "nixl"},
             {},

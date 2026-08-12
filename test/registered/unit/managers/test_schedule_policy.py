@@ -8,7 +8,12 @@ from sglang.srt.context_parallel.prefill_layout import (
     build_cp_prefill_split_spec,
 )
 from sglang.srt.managers import schedule_policy, scheduler as scheduler_module
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -293,6 +298,38 @@ def test_scheduler_completes_deferred_full_hit_without_gpu_batch():
     assert scheduler.waiting_queue == []
     scheduler.process_deferred_prefill_without_forward.assert_called_once_with([first])
     new_batch.prepare_for_extend.assert_not_called()
+
+
+@pytest.mark.parametrize("pending_first", [True, False])
+def test_scheduler_separates_deferred_pending_from_consumed_reprefill(pending_first):
+    scheduler, adder, new_batch, first, second, _ = (
+        _make_sharded_prefill_ordering_fixture()
+    )
+    scheduler.attn_cp_size = 1
+    scheduler.server_args.attn_cp_mode = "none"
+    adder.cp_sharded_allocator = None
+
+    pending, consumed = (first, second) if pending_first else (second, first)
+    for req in (pending, consumed):
+        req.welm_deferred_prefill_span = build_welm_deferred_prefill_span(
+            req.origin_input_ids
+        )
+        req.welm_deferred_decode_state = WelmDeferredDecodeState.from_prefill_span(
+            req.welm_deferred_prefill_span
+        )
+    consumed.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.READY)
+    consumed.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.INFLIGHT)
+    consumed.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.CONSUMED)
+    consumed.output_ids = [5]
+
+    result = _run_sharded_prefill_ordering_fixture(scheduler, adder, new_batch)
+
+    admitted, skipped = first, second
+    assert result is new_batch
+    assert adder.can_run_list == [admitted]
+    assert scheduler.waiting_queue == [skipped]
+    admitted.init_next_round_input.assert_called_once()
+    skipped.init_next_round_input.assert_not_called()
 
 
 def test_cache_aware_policy_uses_deferred_committed_token_ids():
@@ -700,6 +737,7 @@ def test_prefill_result_completion_clears_request_split_spec():
         extend_logprob_start_len_per_req=None,
         draft_continuation_state=None,
         can_run_cuda_graph=False,
+        welm_deferred_prefill_completion=None,
     )
     scheduler = SimpleNamespace(
         is_generation=True,
@@ -745,6 +783,7 @@ def test_stale_prefill_completion_preserves_next_chunk_split_spec():
         extend_logprob_start_len_per_req=None,
         draft_continuation_state=None,
         can_run_cuda_graph=False,
+        welm_deferred_prefill_completion=None,
     )
     scheduler = SimpleNamespace(
         is_generation=True,

@@ -26,6 +26,19 @@ class WelmPDExecutionMode(str, Enum):
     DEFERRED_LAST_PROMPT = "deferred-last-prompt"
 
 
+class WelmDeferredExecutionRole(str, Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+    MONOLITHIC = "monolithic"
+
+
+def is_welm_deferred_mirror_enabled(server_args: Any) -> bool:
+    return (
+        getattr(server_args, "welm_kv_mirror_pd_mode", "legacy")
+        == WelmPDExecutionMode.DEFERRED_LAST_PROMPT.value
+    )
+
+
 class DeferredDecodeInputKind(IntEnum):
     TOKEN_ID = 1
     EMBEDDING = 2
@@ -50,12 +63,17 @@ _WELM_DEFERRED_MODEL_EXECUTION_ATTR = "_sglang_welm_deferred_model_execution"
 
 @dataclass(frozen=True)
 class WelmDeferredModelExecution:
-    role: str
+    role: WelmDeferredExecutionRole
     plan: WelmDeferredMirrorPlan
 
     def __post_init__(self) -> None:
-        if self.role not in {"prefill", "decode"}:
-            raise ValueError("WeLM deferred model role must be prefill or decode")
+        try:
+            role = WelmDeferredExecutionRole(self.role)
+        except ValueError as exc:
+            raise ValueError(
+                "WeLM deferred model role must be prefill or decode, or monolithic"
+            ) from exc
+        object.__setattr__(self, "role", role)
 
     @property
     def logical_num_layers(self) -> int:
@@ -65,8 +83,16 @@ class WelmDeferredModelExecution:
     def execution_end_layer(self) -> int:
         return (
             self.plan.execution_end_layer
-            if self.role == "prefill"
+            if self.role is WelmDeferredExecutionRole.PREFILL
             else self.plan.num_hidden_layers
+        )
+
+    @property
+    def prefill_execution_end_layer(self) -> int:
+        return (
+            self.plan.num_hidden_layers
+            if self.role is WelmDeferredExecutionRole.DECODE
+            else self.plan.execution_end_layer
         )
 
     @property
@@ -75,14 +101,14 @@ class WelmDeferredModelExecution:
 
     @property
     def omit_final_output(self) -> bool:
-        return self.role == "prefill"
+        return self.role is WelmDeferredExecutionRole.PREFILL
 
 
 def bind_welm_deferred_model_execution(
     config: Any,
     plan: WelmDeferredMirrorPlan,
     *,
-    role: str,
+    role: WelmDeferredExecutionRole | str,
 ) -> WelmDeferredModelExecution:
     execution = WelmDeferredModelExecution(role=role, plan=plan)
     setattr(config, _WELM_DEFERRED_MODEL_EXECUTION_ATTR, execution)
@@ -102,14 +128,17 @@ class WelmDeferredPrefillSpan:
     seed_position: int
     seed_token_id: int
 
-    def committed_token_ids(self, prompt_token_ids: Sequence[int]) -> list[int]:
+    def validate_prompt_tokens(self, prompt_token_ids: Sequence[int]) -> None:
         if len(prompt_token_ids) != self.prompt_len:
             raise RuntimeError(
                 "WeLM deferred prompt length changed after span construction: "
                 f"expected {self.prompt_len}, got {len(prompt_token_ids)}"
-        )
+            )
         if int(prompt_token_ids[self.seed_position]) != self.seed_token_id:
             raise RuntimeError("WeLM deferred seed token changed after span construction")
+
+    def committed_token_ids(self, prompt_token_ids: Sequence[int]) -> list[int]:
+        self.validate_prompt_tokens(prompt_token_ids)
         return list(prompt_token_ids[: self.committed_kv_len])
 
 
@@ -153,6 +182,23 @@ def get_welm_deferred_request_unsupported_reason(req: Any) -> Optional[str]:
     if getattr(req, "multimodal_inputs", None) is not None:
         return "multimodal inputs"
     return None
+
+
+def prepare_welm_deferred_prefill_span(req: Any) -> WelmDeferredPrefillSpan:
+    unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
+    if unsupported_reason is not None:
+        raise ValueError(
+            f"WeLM deferred mirror does not support {unsupported_reason}"
+        )
+
+    span = build_welm_deferred_prefill_span(req.origin_input_ids)
+    existing = getattr(req, "welm_deferred_prefill_span", None)
+    if existing is not None:
+        if existing != span:
+            raise RuntimeError("WeLM deferred prefill span changed after admission")
+        return existing
+    req.welm_deferred_prefill_span = span
+    return span
 
 
 def _canonical_plan_payload(
@@ -296,14 +342,22 @@ def resolve_welm_deferred_mirror_plan(
         )
 
     role = getattr(server_args, "disaggregation_mode", "null")
-    if role not in {"prefill", "decode"}:
+    if role not in {"null", "prefill", "decode"}:
         raise ValueError(
-            "deferred WeLM mirror mode requires --disaggregation-mode prefill or decode"
+            "deferred WeLM mirror mode requires --disaggregation-mode "
+            "null, prefill, or decode"
         )
-    if getattr(server_args, "disaggregation_transfer_backend", None) != "mooncake":
+    if role in {"prefill", "decode"} and getattr(
+        server_args, "disaggregation_transfer_backend", None
+    ) != "mooncake":
         raise ValueError(
             "deferred WeLM mirror mode currently requires "
             "--disaggregation-transfer-backend mooncake"
+        )
+    if getattr(server_args, "enable_mixed_chunk", False):
+        raise ValueError(
+            "deferred WeLM mirror mode does not support mixed chunk "
+            "(--enable-mixed-chunk)"
         )
 
     prefill_backend, decode_backend = _resolve_attention_backends(server_args)

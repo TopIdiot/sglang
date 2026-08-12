@@ -68,8 +68,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     request_timing_fields,
 )
 from sglang.srt.models.welm_deferred_mirror import (
-    build_welm_deferred_prefill_span,
-    get_welm_deferred_request_unsupported_reason,
+    prepare_welm_deferred_prefill_span,
 )
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
@@ -307,13 +306,10 @@ class PrefillBootstrapQueue:
         if getattr(self.kv_manager, "welm_deferred_mirror_capability", None) is None:
             return True
 
-        unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
-
-        if unsupported_reason is not None:
-            message = (
-                "WeLM deferred mirror prefill does not support "
-                f"{unsupported_reason}"
-            )
+        try:
+            prepare_welm_deferred_prefill_span(req)
+        except ValueError as exc:
+            message = str(exc)
             logger.error(message)
             trace_ctx = getattr(getattr(req, "time_stats", None), "trace_ctx", None)
             if trace_ctx is not None:
@@ -321,12 +317,6 @@ class PrefillBootstrapQueue:
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return False
-
-        span = build_welm_deferred_prefill_span(req.origin_input_ids)
-        existing = getattr(req, "welm_deferred_prefill_span", None)
-        if existing is not None and existing != span:
-            raise RuntimeError("WeLM deferred prefill span changed before bootstrap")
-        req.welm_deferred_prefill_span = span
         return True
 
     def _process_req(self, req: Req) -> None:

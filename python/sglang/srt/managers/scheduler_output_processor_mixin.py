@@ -19,6 +19,8 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
     ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
 )
 from sglang.srt.managers.scheduler_decode_profile import (
     decode_scheduler_profile_enabled,
@@ -29,6 +31,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     hicache_timing_enabled,
     log_hicache_timing,
     request_timing_fields,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    WelmDeferredPrefillCompletion,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
@@ -208,6 +213,132 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _validate_welm_deferred_prefill_completion(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        *,
+        continuation_completed: bool,
+    ):
+        if not isinstance(
+            result.welm_deferred_prefill_completion,
+            WelmDeferredPrefillCompletion,
+        ):
+            raise RuntimeError("invalid WeLM deferred Prefill completion marker")
+        if self.disaggregation_mode is not DisaggregationMode.NULL:
+            raise RuntimeError(
+                "local WeLM deferred Prefill completion requires monolithic P+D"
+            )
+        if not batch.forward_mode.is_extend():
+            raise RuntimeError("WeLM deferred Prefill completion requires EXTEND mode")
+        if not batch.welm_deferred_prefill:
+            raise RuntimeError(
+                "WeLM deferred Prefill completion requires an explicitly marked batch"
+            )
+        final_mask = batch.welm_deferred_prefill_final_mask
+        if final_mask is None or len(final_mask) != len(batch.reqs):
+            raise RuntimeError(
+                "WeLM deferred Prefill final mask must be request-aligned"
+            )
+        if batch.return_logprob or batch.return_hidden_states:
+            raise RuntimeError(
+                "WeLM deferred Prefill does not support an output payload"
+            )
+        if result.logits_output is not None:
+            raise RuntimeError("WeLM deferred Prefill completion must not carry logits")
+        if result.delay_sample_func is not None:
+            raise RuntimeError(
+                "WeLM deferred Prefill does not support delayed sampling"
+            )
+        if result.draft_continuation_state is not None or batch.spec_info is not None:
+            raise RuntimeError("WeLM deferred Prefill does not support speculation")
+        if (
+            not torch.is_tensor(result.next_token_ids)
+            or result.next_token_ids.ndim != 1
+            or result.next_token_ids.numel() != len(batch.reqs)
+        ):
+            raise RuntimeError(
+                "WeLM deferred Prefill completion requires request-aligned bookkeeping IDs"
+            )
+
+        validated_rows = []
+        for req, is_final in zip(batch.reqs, final_mask, strict=True):
+            span = getattr(req, "welm_deferred_prefill_span", None)
+            state = vars(req).get("welm_deferred_decode_state")
+            if span is None or not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "WeLM deferred Prefill row is missing span or lifecycle state"
+                )
+            state.validate_prefill_span(span, req.origin_input_ids)
+            if (
+                is_final
+                and not continuation_completed
+                and len(req.fill_ids) != span.committed_kv_len
+            ):
+                raise RuntimeError(
+                    "WeLM deferred Prefill final row does not cover its committed span"
+                )
+            if req.output_ids:
+                raise RuntimeError(
+                    "WeLM deferred Prefill completion must not contain output tokens"
+                )
+
+            if not continuation_completed:
+                allowed_phases = (WelmDeferredDecodePhase.PREFILL_PENDING,)
+            elif is_final:
+                allowed_phases = (
+                    WelmDeferredDecodePhase.READY,
+                    WelmDeferredDecodePhase.INFLIGHT,
+                )
+            else:
+                allowed_phases = (
+                    WelmDeferredDecodePhase.PREFILL_PENDING,
+                    WelmDeferredDecodePhase.READY,
+                )
+            if state.phase not in allowed_phases:
+                expected = " or ".join(phase.value.upper() for phase in allowed_phases)
+                raise RuntimeError(
+                    "WeLM deferred Prefill row requires "
+                    f"{expected} state, got {state.phase.value}"
+                )
+
+            if continuation_completed and not is_final and req.is_chunked <= 0:
+                raise RuntimeError(
+                    "WeLM deferred Prefill intermediate row has no chunk bookkeeping"
+                )
+
+            if is_final:
+                expected_kv_len = span.committed_kv_len + int(
+                    state.phase is WelmDeferredDecodePhase.INFLIGHT
+                )
+                if (
+                    req.kv_committed_len != expected_kv_len
+                    or req.kv_allocated_len != expected_kv_len
+                ):
+                    raise RuntimeError(
+                        "WeLM deferred Prefill final row KV length does not match "
+                        "its lifecycle phase"
+                    )
+            validated_rows.append((req, state, bool(is_final)))
+        return validated_rows
+
+    def _process_welm_deferred_monolithic_prefill_completion(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        validated_rows = self._validate_welm_deferred_prefill_completion(
+            batch,
+            result,
+            continuation_completed=True,
+        )
+        for req, _, is_final in validated_rows:
+            if is_final:
+                req.time_stats.set_prefill_finished_time()
+            else:
+                req.is_chunked -= 1
+                req.time_stats.set_last_chunked_prefill_finish_time()
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -234,6 +365,17 @@ class SchedulerOutputProcessorMixin:
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
+
+            if result.welm_deferred_prefill_completion is not None:
+                self._process_welm_deferred_monolithic_prefill_completion(batch, result)
+                can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+                self.report_prefill_stats(
+                    batch=batch,
+                    prefill_stats=batch.prefill_stats,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    dp_cooperation_info=batch.dp_cooperation_info,
+                )
+                return
 
             (
                 logits_output,

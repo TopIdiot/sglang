@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation import decode as decode_module
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import overlap_utils
 from sglang.srt.managers import schedule_batch as schedule_batch_module
 from sglang.srt.managers import scheduler_dp_attn_mixin
@@ -22,11 +22,12 @@ def test_deferred_seed_state_is_not_duplicated_in_batch_metadata():
         assert "welm_deferred_seed_mask" not in batch_type.__dataclass_fields__
 
 
-def _server_args():
+def _server_args(disaggregation_mode=DisaggregationMode.DECODE):
     return SimpleNamespace(
         welm_kv_mirror_pd_mode=(
             WelmPDExecutionMode.DEFERRED_LAST_PROMPT.value
         ),
+        disaggregation_mode=disaggregation_mode.value,
         disaggregation_decode_enable_radix_cache=False,
     )
 
@@ -80,7 +81,13 @@ def _normal_req(rid: str, *, finished=False):
     )
 
 
-def _scheduler(waiting_queue, running_reqs=(), *, capacity=4):
+def _scheduler(
+    waiting_queue,
+    running_reqs=(),
+    *,
+    capacity=4,
+    disaggregation_mode=DisaggregationMode.DECODE,
+):
     running_batch = SimpleNamespace(
         reqs=list(running_reqs),
         batch_size=lambda: len(running_batch.reqs),
@@ -97,24 +104,28 @@ def _scheduler(waiting_queue, running_reqs=(), *, capacity=4):
         enable_overlap=False,
         spec_algorithm=_spec_algorithm_none(),
         max_running_requests=capacity,
-        server_args=_server_args(),
+        server_args=_server_args(disaggregation_mode),
+        disaggregation_mode=disaggregation_mode,
     )
 
 
-def test_seed_only_admission_builds_standard_decode_row_metadata():
+@pytest.mark.parametrize(
+    "disaggregation_mode",
+    [DisaggregationMode.DECODE, DisaggregationMode.NULL],
+)
+def test_seed_only_admission_builds_standard_decode_row_metadata(
+    disaggregation_mode,
+):
     req = _seed_req("seed-0", [11, 12, 13])
-    scheduler = _scheduler([req])
+    scheduler = _scheduler([req], disaggregation_mode=disaggregation_mode)
     sampling_info = MagicMock()
 
     with patch(
-        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+        "sglang.srt.managers.schedule_batch."
         "SamplingBatchInfo.from_schedule_batch",
         return_value=sampling_info,
     ):
-        batch = (
-            decode_module.SchedulerDisaggregationDecodeMixin
-            .get_new_welm_deferred_seed_batch(scheduler)
-        )
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
 
     assert batch.forward_mode is None
     assert batch.reqs == [req]
@@ -135,22 +146,32 @@ def test_seed_only_admission_builds_standard_decode_row_metadata():
 def test_overlap_seed_oe_history_starts_before_last_prompt_token():
     req = _seed_req("seed-0", [10, 11, 12, 13])
     req._overlap_decode_count = 0
-    batch = ScheduleBatch(
-        reqs=[req],
-        req_to_token_pool=object(),
-        token_to_kv_pool_allocator=object(),
-        tree_cache=object(),
-        model_config=SimpleNamespace(vocab_size=128),
-        device="cpu",
-        enable_overlap=True,
+    batch = _decode_batch(
+        [req],
+        output_ids=[13],
+        seq_lens=[2],
+    )
+    batch.enable_overlap = True
+    server_args = SimpleNamespace(
+        prepare_n_gram_inputs=False,
+        enable_mamba_extra_buffer=lambda: False,
     )
 
-    with patch(
-        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-        "SamplingBatchInfo.from_schedule_batch",
-        return_value=MagicMock(),
+    with (
+        patch(
+            "sglang.srt.managers.schedule_batch.get_global_server_args",
+            return_value=server_args,
+        ),
+        patch(
+            "sglang.srt.managers.schedule_batch.build_router_replay_decode_batch",
+            return_value=(None, None),
+        ),
+        patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.tensor([37], dtype=torch.int64),
+        ),
     ):
-        batch.prepare_for_welm_deferred_seed_decode()
+        batch.prepare_for_decode()
 
     context = schedule_batch_module.OverEncodingContext.from_decode_hash_kernel(
         [req],
@@ -176,14 +197,11 @@ def test_seed_decode_preserves_output_logprob_and_sampling_configuration():
     sampling_info = MagicMock()
 
     with patch(
-        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+        "sglang.srt.managers.schedule_batch."
         "SamplingBatchInfo.from_schedule_batch",
         return_value=sampling_info,
     ) as build_sampling_info:
-        batch = (
-            decode_module.SchedulerDisaggregationDecodeMixin
-            .get_new_welm_deferred_seed_batch(scheduler)
-        )
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
 
     assert batch.return_logprob is True
     assert batch.top_logprobs_nums == [2]
@@ -200,23 +218,16 @@ def test_seed_admission_waits_for_capacity_then_uses_freed_slot():
     normal = _normal_req("normal", finished=False)
     scheduler = _scheduler([req], [normal], capacity=1)
 
-    assert (
-        decode_module.SchedulerDisaggregationDecodeMixin
-        .get_new_welm_deferred_seed_batch(scheduler)
-        is None
-    )
+    assert Scheduler.get_new_welm_deferred_seed_batch(scheduler) is None
     assert scheduler.waiting_queue == [req]
 
     normal.finished = lambda: True
     with patch(
-        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+        "sglang.srt.managers.schedule_batch."
         "SamplingBatchInfo.from_schedule_batch",
         return_value=MagicMock(),
     ):
-        batch = (
-            decode_module.SchedulerDisaggregationDecodeMixin
-            .get_new_welm_deferred_seed_batch(scheduler)
-        )
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
 
     assert batch.reqs == [req]
     assert scheduler.waiting_queue == []
@@ -231,14 +242,11 @@ def test_seed_admission_fills_all_available_decode_rows():
     scheduler = _scheduler(seeds, [_normal_req("normal")], capacity=3)
 
     with patch(
-        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+        "sglang.srt.managers.schedule_batch."
         "SamplingBatchInfo.from_schedule_batch",
         return_value=MagicMock(),
     ):
-        batch = (
-            decode_module.SchedulerDisaggregationDecodeMixin
-            .get_new_welm_deferred_seed_batch(scheduler)
-        )
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
 
     assert [req.rid for req in batch.reqs] == ["seed-0", "seed-1"]
     assert batch.output_ids.tolist() == [1, 3]
@@ -246,10 +254,54 @@ def test_seed_admission_fills_all_available_decode_rows():
     assert [req.rid for req in scheduler.waiting_queue] == ["seed-2"]
 
 
+def test_monolithic_seed_selector_ignores_ordinary_and_pending_prefill_rows():
+    ordinary = _normal_req("ordinary")
+    pending = _seed_req("seed-1", [11, 12])
+    pending.welm_deferred_decode_state.phase = (
+        schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING
+    )
+    ready = _seed_req("seed-2", [21, 22, 23])
+    scheduler = _scheduler(
+        [ordinary, pending, ready],
+        disaggregation_mode=DisaggregationMode.NULL,
+    )
+
+    with patch(
+        "sglang.srt.managers.schedule_batch."
+        "SamplingBatchInfo.from_schedule_batch",
+        return_value=MagicMock(),
+    ):
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
+
+    assert batch.reqs == [ready]
+    assert scheduler.waiting_queue == [ordinary, pending]
+
+
+def test_seed_admission_applies_priority_before_capacity_limit():
+    first = _seed_req("seed-0", [1])
+    second = _seed_req("seed-1", [2])
+    scheduler = _scheduler([first, second], capacity=1)
+    scheduler.enable_priority_scheduling = True
+    scheduler.policy = SimpleNamespace(
+        calc_priority=lambda waiting, _running: waiting.reverse()
+    )
+
+    with patch(
+        "sglang.srt.managers.schedule_batch."
+        "SamplingBatchInfo.from_schedule_batch",
+        return_value=MagicMock(),
+    ):
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
+
+    assert batch.reqs == [second]
+    assert scheduler.waiting_queue == [first]
+
+
 def test_disagg_decode_scheduler_runs_seed_only_batch_immediately():
     req = _seed_req("seed-0", [11, 12, 13])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.server_args = _server_args()
+    scheduler.disaggregation_mode = DisaggregationMode.DECODE
     scheduler.server_args.enable_welm_kv_mirror_opt = True
     scheduler.spec_algorithm = SimpleNamespace(
         is_none=lambda: True,
@@ -285,7 +337,7 @@ def test_disagg_decode_scheduler_runs_seed_only_batch_immediately():
 
     with (
         patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "sglang.srt.managers.schedule_batch."
             "SamplingBatchInfo.from_schedule_batch",
             return_value=SimpleNamespace(
                 penalizer_orchestrator=SimpleNamespace(is_required=False)
@@ -322,6 +374,7 @@ def test_disagg_decode_scheduler_mixes_seed_with_running_decode_rows():
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.server_args = _server_args()
+    scheduler.disaggregation_mode = DisaggregationMode.DECODE
     scheduler.server_args.enable_welm_kv_mirror_opt = True
     scheduler.spec_algorithm = SimpleNamespace(
         is_none=lambda: True,
@@ -356,7 +409,7 @@ def test_disagg_decode_scheduler_mixes_seed_with_running_decode_rows():
 
     with (
         patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "sglang.srt.managers.schedule_batch."
             "SamplingBatchInfo.from_schedule_batch",
             return_value=SimpleNamespace(
                 penalizer_orchestrator=SimpleNamespace(is_required=False)
@@ -452,10 +505,62 @@ def test_prepare_for_decode_runs_seed_through_normal_decode_allocation(
     )
 
 
-def test_prepare_for_decode_rejects_transfer_pending_seed_row():
+def test_prefill_batch_restores_seed_logprob_metadata_before_decode():
+    req = _seed_req("seed-0", [11, 12, 13])
+    req.return_logprob = True
+    req.top_logprobs_num = 2
+    req.token_ids_logprob = [7, 9]
+    batch = ScheduleBatch(
+        reqs=[req],
+        req_to_token_pool=object(),
+        token_to_kv_pool_allocator=object(),
+        tree_cache=object(),
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        spec_algorithm=_spec_algorithm_none(),
+        device="cpu",
+        output_ids=torch.tensor([13], dtype=torch.int64),
+        req_pool_indices=torch.tensor([req.req_pool_idx], dtype=torch.int64),
+        seq_lens=torch.tensor([2], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([2], dtype=torch.int64),
+        orig_seq_lens=torch.tensor([2], dtype=torch.int32),
+        seq_lens_sum=2,
+        return_logprob=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
+        ),
+    )
+    server_args = SimpleNamespace(
+        prepare_n_gram_inputs=False,
+        enable_mamba_extra_buffer=lambda: False,
+    )
+
+    with (
+        patch(
+            "sglang.srt.managers.schedule_batch.get_global_server_args",
+            return_value=server_args,
+        ),
+        patch(
+            "sglang.srt.managers.schedule_batch.build_router_replay_decode_batch",
+            return_value=(None, None),
+        ),
+        patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.tensor([37], dtype=torch.int64),
+        ),
+    ):
+        batch.prepare_for_decode()
+
+    assert batch.return_logprob is True
+    assert batch.top_logprobs_nums == [2]
+    assert batch.token_ids_logprobs == [[7, 9]]
+
+
+def test_prepare_for_decode_rejects_prefill_pending_seed_row():
     req = _seed_req("seed-0", [11, 12, 13])
     req.welm_deferred_decode_state.phase = (
-        schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING
+        schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING
     )
     batch = ScheduleBatch(
         reqs=[req],
@@ -470,7 +575,7 @@ def test_prepare_for_decode_rejects_transfer_pending_seed_row():
         ),
     )
 
-    with pytest.raises(RuntimeError, match="before transfer completion"):
+    with pytest.raises(RuntimeError, match="before Prefill completion"):
         batch.prepare_for_decode()
 
 
@@ -510,6 +615,7 @@ def test_deferred_seed_remains_dp_cuda_graph_eligible():
         global_num_reqs=[1],
         has_cache_hit_extend=False,
         welm_kv_mirror_contract_flags=[False],
+        welm_deferred_prefill_flags=[False],
         welm_mtp_global_prefill_num_tokens=[0],
         can_cuda_graph=True,
         global_num_tokens=[1],
@@ -524,6 +630,7 @@ def test_deferred_seed_remains_dp_cuda_graph_eligible():
     )
 
     assert batch.can_run_dp_cuda_graph
+    assert batch.welm_deferred_prefill_flags == [False]
 
 
 def test_overlap_resolution_leaves_non_negative_seed_token_untouched():

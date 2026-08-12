@@ -166,6 +166,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_deferred_mirror import (
+    WelmDeferredExecutionRole,
     WelmPDExecutionMode,
     bind_welm_deferred_model_execution,
     resolve_welm_deferred_mirror_plan,
@@ -622,10 +623,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if plan is None:
             raise RuntimeError(
-                "non-legacy WeLM mirror P/D mode resolved without an execution plan"
+                "non-legacy WeLM mirror mode resolved without an execution plan"
             )
         self.welm_deferred_mirror_plan = plan
-        role = self.server_args.disaggregation_mode
+        role = (
+            WelmDeferredExecutionRole.MONOLITHIC
+            if self.server_args.disaggregation_mode == "null"
+            else WelmDeferredExecutionRole(self.server_args.disaggregation_mode)
+        )
         bind_welm_deferred_model_execution(
             self.model_config.hf_config,
             plan,
@@ -640,12 +645,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.tp_rank == 0 and self.pp_rank == 0:
             logger.info(
-                "WeLM deferred mirror P/D enabled: role=%s cutoff=%d pairs=%d "
-                "fingerprint=%s topology=tp%d/dp%d/dp_attention=%s/attn_cp%d:%s",
-                self.server_args.disaggregation_mode,
+                "WeLM deferred mirror enabled: role=%s cutoff=%d pairs=%d "
+                "fingerprint=%s full_model=%s "
+                "topology=tp%d/dp%d/dp_attention=%s/attn_cp%d:%s",
+                role.value,
                 plan.execution_end_layer,
                 len(plan.pairs),
                 plan.fingerprint,
+                role is not WelmDeferredExecutionRole.PREFILL,
                 self.tp_size,
                 self.dp_size,
                 self.server_args.enable_dp_attention,

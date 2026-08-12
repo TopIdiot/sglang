@@ -92,7 +92,7 @@ def test_deferred_decode_state_enforces_linear_lifecycle():
     phase = schedule_batch_module.WelmDeferredDecodePhase
     state = _deferred_state([11, 12, 13])
 
-    assert state.phase is phase.TRANSFER_PENDING
+    assert state.phase is phase.PREFILL_PENDING
     assert state.committed_kv_len == 2
     assert state.seed_position == 2
     assert state.seed_token_id == 13
@@ -107,7 +107,7 @@ def test_deferred_decode_state_enforces_linear_lifecycle():
         state.transition_to(phase.READY)
 
 
-def test_decode_prealloc_admission_creates_transfer_pending_state():
+def test_decode_prealloc_admission_creates_prefill_pending_state():
     req = SimpleNamespace(
         rid="req-0",
         origin_input_ids=[11, 12, 13],
@@ -126,7 +126,7 @@ def test_decode_prealloc_admission_creates_transfer_pending_state():
 
     assert (
         req.welm_deferred_decode_state.phase
-        is schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING
+        is schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING
     )
     assert req.welm_deferred_decode_state.committed_kv_len == 2
     receiver.init.assert_called_once_with(0)
@@ -632,7 +632,7 @@ def test_transfer_waits_for_bootstrap_room_before_marking_ready():
     assert not queue._commit_transfer_to_req(decode_req)
     assert (
         req.welm_deferred_decode_state.phase
-        is schedule_batch_module.WelmDeferredDecodePhase.TRANSFER_PENDING
+        is schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING
     )
     metadata_buffers.get_welm_deferred_completion.assert_not_called()
     decode_req.kv_receiver.clear.assert_not_called()
@@ -828,6 +828,7 @@ def test_ready_deferred_seed_is_not_consumed_by_legacy_prebuilt_path():
         req_to_token_pool=SimpleNamespace(size=8),
         max_running_requests=8,
         server_args=_deferred_server_args(),
+        _should_isolate_welm_mtp_prebuilt=lambda: False,
     )
 
     batch = decode_module.SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(

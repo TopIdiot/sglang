@@ -9,6 +9,7 @@ from sglang.srt.layers.rotary_embedding import base as rotary_base
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.models import welmv4 as welmv4_model
 from sglang.srt.models.welm_deferred_mirror import (
+    WelmDeferredExecutionRole,
     WelmDeferredModelExecution,
     bind_welm_deferred_model_execution,
     build_welm_deferred_mirror_plan,
@@ -51,6 +52,7 @@ def test_role_specific_execution_keeps_logical_layers_but_prunes_only_prefill():
 
     prefill = WelmDeferredModelExecution(role="prefill", plan=plan)
     decode = WelmDeferredModelExecution(role="decode", plan=plan)
+    monolithic = WelmDeferredModelExecution(role="monolithic", plan=plan)
 
     assert prefill.logical_num_layers == 48
     assert prefill.execution_end_layer == 33
@@ -60,6 +62,11 @@ def test_role_specific_execution_keeps_logical_layers_but_prunes_only_prefill():
     assert decode.execution_end_layer == 48
     assert decode.omitted_layer_ids == ()
     assert not decode.omit_final_output
+    assert monolithic.logical_num_layers == 48
+    assert monolithic.execution_end_layer == 48
+    assert monolithic.prefill_execution_end_layer == 33
+    assert monolithic.omitted_layer_ids == ()
+    assert not monolithic.omit_final_output
 
 
 def test_execution_binding_is_explicit_and_round_trips_through_config():
@@ -73,9 +80,10 @@ def test_execution_binding_is_explicit_and_round_trips_through_config():
         bind_welm_deferred_model_execution(config, plan, role="invalid")
 
 
-def test_prefill_filters_nextn_pair_but_decode_keeps_existing_pairs():
+def test_prefill_and_monolithic_filter_nextn_pair_but_decode_keeps_existing_pairs():
     prefill_config = _model_config("prefill")
     decode_config = _model_config("decode")
+    monolithic_config = _model_config("monolithic")
 
     assert welmv4_model._welm_effective_kv_mirror_pairs(prefill_config) == (
         list(range(33, 48)),
@@ -84,6 +92,10 @@ def test_prefill_filters_nextn_pair_but_decode_keeps_existing_pairs():
     assert welmv4_model._welm_effective_kv_mirror_pairs(decode_config) == (
         list(range(48, 32, -1)),
         list(range(16)),
+    )
+    assert welmv4_model._welm_effective_kv_mirror_pairs(monolithic_config) == (
+        list(range(33, 48)),
+        list(range(15, 0, -1)),
     )
 
 
@@ -101,6 +113,9 @@ def _patch_model_construction(monkeypatch):
         world_size=1,
     )
     monkeypatch.setattr(welmv4_model, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        welmv4_model, "_welm_token_owner_enabled", lambda **_kwargs: False
+    )
     monkeypatch.setattr(
         welmv4_model,
         "get_global_server_args",
@@ -131,11 +146,21 @@ def _patch_model_construction(monkeypatch):
         return layers, 0, num_layers
 
     monkeypatch.setattr(welmv4_model, "make_layers", make_layers)
+    monkeypatch.setattr(
+        welmv4_model.Qwen2MoeModel,
+        "_bind_monolithic_deferred_target_kv_finalizers",
+        lambda _self: None,
+    )
 
 
 @pytest.mark.parametrize(
     ("role", "expected_real_layers", "expect_missing_norm"),
-    [("prefill", 33, True), ("decode", 48, False), (None, 48, False)],
+    [
+        ("prefill", 33, True),
+        ("decode", 48, False),
+        ("monolithic", 48, False),
+        (None, 48, False),
+    ],
 )
 def test_model_construction_preserves_48_logical_slots(
     monkeypatch, role, expected_real_layers, expect_missing_norm
@@ -218,6 +243,26 @@ def test_deferred_prefill_skips_decode_cuda_graph_capture(monkeypatch):
 
     assert runner.graph_runner is None
     assert runner.graph_mem_usage == 0
+
+
+def test_monolithic_does_not_take_prefill_cuda_graph_skip(caplog):
+    from sglang.srt.model_executor import model_runner as model_runner_module
+
+    runner = model_runner_module.ModelRunner.__new__(model_runner_module.ModelRunner)
+    runner.is_generation = True
+    runner.device = "cpu"
+    runner.gpu_id = 0
+    runner.welm_deferred_mirror_plan = object()
+    runner.server_args = SimpleNamespace(
+        disaggregation_mode="null",
+        disable_cuda_graph=False,
+        enable_torch_compile=False,
+        model_impl="auto",
+    )
+
+    runner.init_device_graphs()
+
+    assert "Skip decode CUDA graph capture" not in caplog.text
 
 
 @pytest.mark.parametrize("target_layer_id", [33, 34])
@@ -668,11 +713,6 @@ def test_deferred_weight_loader_relocates_target_kv_and_knorm(monkeypatch):
     assert torch.equal(loaded["projection"]["v2_0"], target_v)
     finalizer = model.model.layers[15].self_attn.deferred_target_kv_finalizers["33"]
     assert torch.equal(finalizer.k_norm.weight, target_k_norm)
-    assert model.welm_deferred_weight_load_stats.relocated_tensors == 3
-    assert model.welm_deferred_weight_load_stats.omitted_tensors == 3
-    assert model.welm_deferred_weight_load_stats.omitted_bytes == (
-        omitted_q.nbytes + omitted_norm.nbytes + omitted_head.nbytes
-    )
 
 
 def test_deferred_weight_loader_rejects_missing_required_target_kv_route(monkeypatch):

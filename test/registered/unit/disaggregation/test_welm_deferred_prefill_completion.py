@@ -34,7 +34,10 @@ def test_generation_result_preserves_legacy_positional_field_order():
     assert result.welm_deferred_prefill_completion is None
 
 
-def test_deferred_prefill_model_returns_typed_completion_without_logits():
+@pytest.mark.parametrize("omit_final_output", [True, False])
+def test_deferred_prefill_model_returns_typed_completion_without_logits(
+    omit_final_output,
+):
     class FakeBaseModel(nn.Module):
         scale_seq_times = 0
 
@@ -46,7 +49,14 @@ def test_deferred_prefill_model_returns_typed_completion_without_logits():
     )
     nn.Module.__init__(model)
     model.model = FakeBaseModel()
-    model.deferred_execution = SimpleNamespace(omit_final_output=True)
+    model.deferred_execution = SimpleNamespace(
+        omit_final_output=omit_final_output,
+        role=(
+            welmv4_model.WelmDeferredExecutionRole.PREFILL
+            if omit_final_output
+            else welmv4_model.WelmDeferredExecutionRole.MONOLITHIC
+        ),
+    )
     model.pp_group = SimpleNamespace(is_last_rank=True)
     model.logits_processor = MagicMock(
         side_effect=AssertionError("deferred Prefill must not compute logits")
@@ -56,6 +66,9 @@ def test_deferred_prefill_model_returns_typed_completion_without_logits():
     )
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_extend=lambda **_kwargs: True),
+        welm_deferred_prefill=True,
+        spec_info=None,
+        enable_welm_kv_mirror_opt=False,
     )
 
     output = model(
@@ -77,6 +90,7 @@ def test_post_forward_sync_restores_batch_without_slicing_completion():
         _original_forward_mode=original_forward_mode,
         _original_batch_size=1,
         spec_info=None,
+        welm_deferred_prefill=True,
         seq_lens_sum=2,
     )
 
@@ -87,6 +101,21 @@ def test_post_forward_sync_restores_batch_without_slicing_completion():
 
     assert forward_batch.forward_mode is original_forward_mode
     assert forward_batch.batch_size == 1
+
+
+def test_post_forward_sync_rejects_unmarked_deferred_completion():
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda **_kwargs: True),
+        batch_size=1,
+        spec_info=None,
+        welm_deferred_prefill=False,
+    )
+
+    with pytest.raises(RuntimeError, match="explicitly marked"):
+        forward_batch_info.ForwardBatch.post_forward_mlp_sync_batch(
+            forward_batch,
+            _completion(),
+        )
 
 
 def test_tp_worker_skips_sampler_and_returns_only_internal_bookkeeping_ids(monkeypatch):
