@@ -236,7 +236,7 @@ impl WorkerManager {
         let workers = worker_registry.get_all();
 
         if workers.is_empty() {
-            return EngineMetricsResult::Err("No available workers".to_string());
+            return EngineMetricsResult::Ok(String::new());
         }
 
         let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;

@@ -143,6 +143,33 @@ mod health_tests {
 }
 
 #[cfg(test)]
+mod engine_metrics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_engine_metrics_without_workers_is_empty_success() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/engine_metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod generation_tests {
     use super::*;
 
