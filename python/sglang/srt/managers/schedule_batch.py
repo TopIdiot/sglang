@@ -2760,9 +2760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # cover positions past logprob_start_len.
                 req.extend_logprob_start_len = req.extend_input_len
             elif req.logprob_start_len >= pre_len:
-                if self.is_prefill_only and req.logprob_start_len == len(
-                    req.origin_input_ids
-                ):
+                if req.logprob_start_len == len(req.origin_input_ids):
                     req.extend_logprob_start_len = req.extend_input_len
                 else:
                     req.extend_logprob_start_len = min(
