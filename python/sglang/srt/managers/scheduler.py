@@ -1134,6 +1134,8 @@ class Scheduler(
         self.welm_mtp_kv_mirror_state_buffers = None
         if not self.server_args.enable_welm_kv_mirror_opt:
             return
+        if self.disaggregation_mode is DisaggregationMode.NULL:
+            return
 
         draft_runner = self._get_draft_model_runner()
         if draft_runner is None:
