@@ -2108,6 +2108,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     welm_kv_mirror_contract_flags: Optional[List[bool]] = None
     welm_deferred_prefill_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
+    global_has_non_greedy_sampling: bool = False
+    global_needs_top_p_sampling: bool = False
     is_extend_in_batch: bool = False
     has_cache_hit_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
@@ -3733,6 +3735,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             welm_mtp_global_prefill_num_tokens=(
                 self.welm_mtp_global_prefill_num_tokens
             ),
+            global_has_non_greedy_sampling=self.global_has_non_greedy_sampling,
+            global_needs_top_p_sampling=self.global_needs_top_p_sampling,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
@@ -4009,6 +4013,8 @@ class ModelWorkerBatch:
     welm_kv_mirror_contract_flags: Optional[List[bool]]
     welm_deferred_prefill_flags: Optional[List[bool]]
     welm_mtp_global_prefill_num_tokens: Optional[List[int]]
+    global_has_non_greedy_sampling: bool
+    global_needs_top_p_sampling: bool
     is_extend_in_batch: bool
     all_extend_in_batch: bool
     can_run_dp_cuda_graph: bool

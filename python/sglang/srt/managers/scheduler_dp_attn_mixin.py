@@ -25,6 +25,8 @@ _MLP_SYNC_FLAG_ROUTER_REPLAY = 1 << 0
 _MLP_SYNC_FLAG_CACHE_HIT_EXTEND = 1 << 1
 _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT = 1 << 2
 _MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL = 1 << 3
+_MLP_SYNC_FLAG_NON_GREEDY_SAMPLING = 1 << 4
+_MLP_SYNC_FLAG_TOP_P_SAMPLING = 1 << 5
 
 # WeLM fused sched-sync (SGLANG_WELM_FUSED_SCHED_SYNC): the mlp-sync row is
 # widened so one all_gather can also carry the per-round scheduling intent
@@ -70,6 +72,33 @@ def _has_cache_hit_extend(batch: Optional[ScheduleBatch]) -> bool:
     return any(getattr(req, "cached_tokens", 0) > 0 for req in extend_reqs)
 
 
+def _has_non_greedy_sampling(batch: Optional[ScheduleBatch]) -> bool:
+    if batch is None:
+        return False
+
+    sampling_info = getattr(batch, "sampling_info", None)
+    if sampling_info is not None:
+        return not sampling_info.is_all_greedy
+
+    # DP speculative prefill may deliberately defer prepare_for_extend() until
+    # after this gather. SamplingBatchInfo does not exist yet in that path, but
+    # SamplingParams has already normalized greedy requests to top_k == 1.
+    return any(req.sampling_params.top_k > 1 for req in batch.reqs)
+
+
+def _needs_top_p_sampling(batch: Optional[ScheduleBatch]) -> bool:
+    if batch is None:
+        return False
+
+    sampling_info = getattr(batch, "sampling_info", None)
+    if sampling_info is not None:
+        return bool(sampling_info.need_top_p_sampling)
+
+    # Keep this available on the deferred speculative-prefill path for the
+    # same reason as _has_non_greedy_sampling above.
+    return any(req.sampling_params.top_p != 1.0 for req in batch.reqs)
+
+
 def _will_contract_welm_kv_mirror(batch: Optional[ScheduleBatch]) -> bool:
     if batch is None or not batch.forward_mode.is_extend_without_speculative():
         return False
@@ -103,6 +132,8 @@ class MLPSyncBatchInfo:
     has_cache_hit_extend: bool = False
     will_contract_welm_kv_mirror: bool = False
     is_welm_deferred_prefill: bool = False
+    local_has_non_greedy_sampling: bool = False
+    local_needs_top_p_sampling: bool = False
     welm_mtp_prefill_num_tokens: int = 0
     # WeLM fused sched-sync extras (zero on classic gathers)
     fused_intent: int = 0
@@ -115,6 +146,8 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     global_num_reqs: list[int] = None
     global_forward_modes: list[int] = None
+    global_has_non_greedy_sampling: bool = False
+    global_needs_top_p_sampling: bool = False
     welm_kv_mirror_contract_flags: list[bool] = None
     welm_deferred_prefill_flags: list[bool] = None
     welm_mtp_global_prefill_num_tokens: list[int] = None
@@ -139,6 +172,10 @@ class MLPSyncBatchInfo:
                     * _MLP_SYNC_FLAG_WELM_KV_MIRROR_CONTRACT
                     | int(self.is_welm_deferred_prefill)
                     * _MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL
+                    | int(self.local_has_non_greedy_sampling)
+                    * _MLP_SYNC_FLAG_NON_GREEDY_SAMPLING
+                    | int(self.local_needs_top_p_sampling)
+                    * _MLP_SYNC_FLAG_TOP_P_SAMPLING
                 ),
                 _pack_welm_mtp_prefill_info(
                     self.welm_mtp_prefill_num_tokens,
@@ -259,6 +296,12 @@ class MLPSyncBatchInfo:
             bool(value & _MLP_SYNC_FLAG_WELM_DEFERRED_PREFILL)
             for value in packed_flags
         ]
+        self.global_has_non_greedy_sampling = any(
+            value & _MLP_SYNC_FLAG_NON_GREEDY_SAMPLING for value in packed_flags
+        )
+        self.global_needs_top_p_sampling = any(
+            value & _MLP_SYNC_FLAG_TOP_P_SAMPLING for value in packed_flags
+        )
         prefill_info = [
             _unpack_welm_mtp_prefill_info(value) for value in cpu_data[:, 6].tolist()
         ]
@@ -320,6 +363,10 @@ def _update_gather_batch(
         batch.welm_mtp_global_prefill_num_tokens = (
             mlp_sync_info.welm_mtp_global_prefill_num_tokens
         )
+        batch.global_has_non_greedy_sampling = (
+            mlp_sync_info.global_has_non_greedy_sampling
+        )
+        batch.global_needs_top_p_sampling = mlp_sync_info.global_needs_top_p_sampling
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
@@ -414,6 +461,8 @@ def compute_local_mlp_sync_info(
     is_welm_deferred_prefill = bool(
         local_batch is not None and local_batch.welm_deferred_prefill
     )
+    has_non_greedy_sampling = _has_non_greedy_sampling(local_batch)
+    needs_top_p_sampling = _needs_top_p_sampling(local_batch)
     welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
 
     tbo_preparer = TboDPAttentionPreparer()
@@ -436,6 +485,8 @@ def compute_local_mlp_sync_info(
         has_cache_hit_extend=has_cache_hit_extend,
         will_contract_welm_kv_mirror=will_contract_welm_kv_mirror,
         is_welm_deferred_prefill=is_welm_deferred_prefill,
+        local_has_non_greedy_sampling=has_non_greedy_sampling,
+        local_needs_top_p_sampling=needs_top_p_sampling,
         welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
     )
     return mlp_sync_info, tbo_preparer

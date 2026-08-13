@@ -426,6 +426,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     welm_kv_mirror_contract_flags: Optional[List[bool]] = None
     welm_deferred_prefill_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
+    global_has_non_greedy_sampling: bool = False
+    global_needs_top_p_sampling: bool = False
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
@@ -533,6 +535,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             welm_mtp_global_prefill_num_tokens=(
                 batch.welm_mtp_global_prefill_num_tokens
             ),
+            global_has_non_greedy_sampling=batch.global_has_non_greedy_sampling,
+            global_needs_top_p_sampling=batch.global_needs_top_p_sampling,
             router_replay_topk_ids=batch.router_replay_topk_ids,
             router_replay_mask=batch.router_replay_mask,
             is_prefill_only=batch.is_prefill_only,

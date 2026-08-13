@@ -380,6 +380,108 @@ def test_welm_mtp_non_owner_graph_does_not_publish_num_token_non_padded():
 
 
 @pytest.mark.parametrize(
+    (
+        "sample_draft",
+        "has_fixed_sampling_params",
+        "fixed_top_p",
+        "global_has_non_greedy_sampling",
+        "global_needs_top_p_sampling",
+        "expected_mode",
+    ),
+    [
+        (True, False, None, False, False, (False, False)),
+        (True, False, None, True, False, (True, False)),
+        (True, False, None, True, True, (True, True)),
+        (True, True, None, False, False, (True, False)),
+        (True, True, None, False, True, (True, True)),
+        (True, True, 0.95, False, False, (True, True)),
+        (True, True, 1.0, True, True, (True, False)),
+        (False, False, None, True, True, (False, False)),
+    ],
+)
+def test_welm_mtp_proposal_graph_uses_global_sampling_mode(
+    sample_draft,
+    has_fixed_sampling_params,
+    fixed_top_p,
+    global_has_non_greedy_sampling,
+    global_needs_top_p_sampling,
+    expected_mode,
+):
+    runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+        WelmMTPDraftProposalCudaGraphRunner
+    )
+    runner.eagle_worker = SimpleNamespace(
+        _is_welmv4_mtp_draft_sampling_enabled=lambda: sample_draft,
+        welmv4_mtp_draft_fixed_top_p=fixed_top_p,
+        _has_welmv4_mtp_fixed_draft_sampling_params=(lambda: has_fixed_sampling_params),
+    )
+    runner.topk = 1
+    runner.use_dp_sampling_consensus = True
+    runner.supports_draft_top_p = True
+    forward_batch = SimpleNamespace(
+        global_has_non_greedy_sampling=global_has_non_greedy_sampling,
+        global_needs_top_p_sampling=global_needs_top_p_sampling,
+    )
+
+    assert runner._required_draft_sampling_mode(forward_batch) == expected_mode
+
+
+def test_welm_mtp_proposal_graph_keeps_local_mode_without_dp_consensus():
+    runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+        WelmMTPDraftProposalCudaGraphRunner
+    )
+    runner.use_dp_sampling_consensus = False
+    runner.eagle_worker = SimpleNamespace(
+        _should_sample_welmv4_mtp_draft=lambda _batch: True,
+        _should_use_welmv4_mtp_draft_top_p=lambda _batch: True,
+    )
+
+    assert runner._required_draft_sampling_mode(SimpleNamespace()) == (True, True)
+
+
+def test_welm_mtp_proposal_graph_rejects_skip_all_gather(monkeypatch):
+    import sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner as mtp_graph
+
+    monkeypatch.setenv("SGLANG_SCHEDULER_SKIP_ALL_GATHER", "1")
+
+    with pytest.raises(ValueError, match="scheduler all-gather"):
+        mtp_graph._validate_dp_proposal_graph_consensus_config(
+            enable_dp_attention=True,
+            dp_size=4,
+        )
+
+    mtp_graph._validate_dp_proposal_graph_consensus_config(
+        enable_dp_attention=False,
+        dp_size=1,
+    )
+
+
+def test_welm_mtp_owner_graph_fails_fast_on_sampling_mode_mismatch():
+    runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+        WelmMTPDraftProposalCudaGraphRunner
+    )
+    runner.use_token_owner = True
+    runner.use_dp_sampling_consensus = True
+    runner.supports_draft_top_p = True
+    runner.topk = 1
+    runner.sample_draft = True
+    runner.use_top_p = False
+    runner.eagle_worker = SimpleNamespace(
+        _is_welmv4_mtp_draft_sampling_enabled=lambda: True,
+        welmv4_mtp_draft_fixed_top_p=None,
+        _has_welmv4_mtp_fixed_draft_sampling_params=lambda: True,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=welmv4.ForwardMode.DRAFT_EXTEND,
+        global_has_non_greedy_sampling=True,
+        global_needs_top_p_sampling=True,
+    )
+
+    with pytest.raises(RuntimeError, match="sampling mode mismatch"):
+        runner.can_run(forward_batch)
+
+
+@pytest.mark.parametrize(
     ("graphs", "max_bs", "can_run_dp_cuda_graph", "reason"),
     [
         ({1: object()}, 1, True, "capture bucket"),
@@ -403,8 +505,10 @@ def test_welm_mtp_owner_graph_rejects_unexpected_fast_path_miss(
     runner.max_bs = max_bs
     runner.num_tokens_per_bs = 4
     runner.sample_draft = False
+    runner.use_top_p = False
+    runner.use_dp_sampling_consensus = False
     runner.eagle_worker = SimpleNamespace(
-        _should_sample_welmv4_mtp_draft=lambda _batch: False
+        _should_sample_welmv4_mtp_draft=lambda _batch: False,
     )
     forward_batch = SimpleNamespace(
         forward_mode=welmv4.ForwardMode.DRAFT_EXTEND,

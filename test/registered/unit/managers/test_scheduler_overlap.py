@@ -12,6 +12,8 @@ from sglang.srt.managers.scheduler import (
 from sglang.srt.managers.scheduler_dp_attn_mixin import (
     MLPSyncBatchInfo,
     _has_cache_hit_extend,
+    _has_non_greedy_sampling,
+    _needs_top_p_sampling,
     _will_contract_welm_kv_mirror,
     prepare_mlp_sync_batch_raw,
 )
@@ -49,10 +51,20 @@ def _batch(
     welm_deferred_prefill: bool = False,
     welm_deferred_prefill_flags=None,
 ):
-    reqs = [SimpleNamespace(cached_tokens=cached_tokens)]
+    reqs = [
+        SimpleNamespace(
+            cached_tokens=cached_tokens,
+            sampling_params=SimpleNamespace(top_k=1, top_p=1.0),
+        )
+    ]
     decoding_reqs = None
     if decoding_cached_tokens is not None:
-        decoding_reqs = [SimpleNamespace(cached_tokens=decoding_cached_tokens)]
+        decoding_reqs = [
+            SimpleNamespace(
+                cached_tokens=decoding_cached_tokens,
+                sampling_params=SimpleNamespace(top_k=1, top_p=1.0),
+            )
+        ]
         reqs.extend(decoding_reqs)
 
     batch = SimpleNamespace(
@@ -95,6 +107,22 @@ def _scheduler(
 
 
 class TestSchedulerOverlap(unittest.TestCase):
+    def test_sampling_intent_is_available_before_sampling_info_is_built(self):
+        batch = SimpleNamespace(
+            sampling_info=None,
+            reqs=[
+                SimpleNamespace(sampling_params=SimpleNamespace(top_k=1000, top_p=0.95))
+            ],
+        )
+
+        self.assertTrue(_has_non_greedy_sampling(batch))
+        self.assertTrue(_needs_top_p_sampling(batch))
+
+        batch.reqs[0].sampling_params.top_k = 1
+        batch.reqs[0].sampling_params.top_p = 1.0
+        self.assertFalse(_has_non_greedy_sampling(batch))
+        self.assertFalse(_needs_top_p_sampling(batch))
+
     def test_only_extend_batches_publish_cache_hit_flag(self):
         self.assertFalse(
             _has_cache_hit_extend(_batch(is_extend=False, cached_tokens=8192))
@@ -195,11 +223,18 @@ class TestSchedulerOverlap(unittest.TestCase):
             has_router_replay=True,
             has_cache_hit_extend=True,
             will_contract_welm_kv_mirror=True,
+            local_has_non_greedy_sampling=True,
+            local_needs_top_p_sampling=True,
         )
 
         # All booleans share the already-gathered flags element, so the fix
         # does not add a collective or increase its payload.
-        self.assertEqual(info._get_local_tensor(device="cpu")[6].item(), 7)
+        row = info._get_local_tensor(device="cpu")
+        self.assertEqual(row[6].item(), 55)
+
+        info._finish_parse(row.unsqueeze(0))
+        self.assertTrue(info.global_has_non_greedy_sampling)
+        self.assertTrue(info.global_needs_top_p_sampling)
 
     def test_mlp_sync_packs_deferred_prefill_in_existing_flags_word(self):
         info = MLPSyncBatchInfo(
@@ -276,6 +311,8 @@ class TestSchedulerOverlap(unittest.TestCase):
             info.welm_kv_mirror_contract_flags = [False, False]
             info.welm_deferred_prefill_flags = [info.is_welm_deferred_prefill, False]
             info.welm_mtp_global_prefill_num_tokens = [0, 0]
+            info.global_has_non_greedy_sampling = False
+            info.global_needs_top_p_sampling = False
             info.tp0_info = torch.zeros((2, 8), dtype=torch.int64)
 
         all_gather.side_effect = gather

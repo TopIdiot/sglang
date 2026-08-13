@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -61,6 +62,22 @@ if _is_cuda or _is_musa:
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+
+def _validate_dp_proposal_graph_consensus_config(
+    *, enable_dp_attention: bool, dp_size: int
+) -> None:
+    if (
+        enable_dp_attention
+        and dp_size > 1
+        and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    ):
+        raise ValueError(
+            "WeLM MTP draft proposal CUDA graph with DP attention requires the "
+            "scheduler all-gather for rank-consistent graph selection; unset "
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER or disable "
+            "SGLANG_WELM_MTP_DRAFT_CUDA_GRAPH."
+        )
 
 
 @dataclass
@@ -151,6 +168,14 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
+        self.use_dp_sampling_consensus = (
+            model_runner.server_args.enable_dp_attention and self.dp_size > 1
+        )
+        _validate_dp_proposal_graph_consensus_config(
+            enable_dp_attention=model_runner.server_args.enable_dp_attention,
+            dp_size=self.dp_size,
+        )
+        self.supports_draft_top_p = _is_cuda or _is_musa
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -180,7 +205,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             self.sample_draft
             and eagle_worker.welmv4_mtp_draft_fixed_top_p is not None
             and eagle_worker.welmv4_mtp_draft_fixed_top_p < 1.0
-            and (_is_cuda or _is_musa)
+            and self.supports_draft_top_p
         )
         self.fused_topk_sample = get_bool_env_var(
             "SGLANG_WELM_MTP_FUSED_DRAFT_TOPK_SAMPLE"
@@ -1391,18 +1416,50 @@ class WelmMTPDraftProposalCudaGraphRunner:
             )
         return False
 
+    def _required_draft_sampling_mode(
+        self, forward_batch: ForwardBatch
+    ) -> tuple[bool, bool]:
+        """Return the rank-consistent (sample, use_top_p) proposal mode."""
+        if not self.use_dp_sampling_consensus:
+            should_sample = self.eagle_worker._should_sample_welmv4_mtp_draft(
+                forward_batch
+            )
+            should_use_top_p = (
+                should_sample
+                and self.eagle_worker._should_use_welmv4_mtp_draft_top_p(forward_batch)
+            )
+            return should_sample, should_use_top_p
+
+        should_sample = (
+            self.eagle_worker._is_welmv4_mtp_draft_sampling_enabled()
+            and self.topk == 1
+            and (
+                self.eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params()
+                or forward_batch.global_has_non_greedy_sampling
+            )
+        )
+        if not should_sample:
+            return False, False
+
+        fixed_top_p = self.eagle_worker.welmv4_mtp_draft_fixed_top_p
+        should_use_top_p = self.supports_draft_top_p and (
+            fixed_top_p < 1.0
+            if fixed_top_p is not None
+            else forward_batch.global_needs_top_p_sampling
+        )
+        return True, should_use_top_p
+
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if not forward_batch.forward_mode.is_draft_extend(include_v2=True):
             return False
-        if self.eagle_worker._should_sample_welmv4_mtp_draft(forward_batch):
-            if not self.sample_draft:
-                return False
-            if self.use_top_p != self.eagle_worker._should_use_welmv4_mtp_draft_top_p(
-                forward_batch
-            ):
-                return False
-        elif self.sample_draft:
-            return False
+        required_sampling_mode = self._required_draft_sampling_mode(forward_batch)
+        captured_sampling_mode = self.sample_draft, self.use_top_p
+        if required_sampling_mode != captured_sampling_mode:
+            return self._reject_token_owner_graph_miss(
+                "sampling mode mismatch "
+                f"(required={required_sampling_mode}, "
+                f"captured={captured_sampling_mode})"
+            )
         if forward_batch.input_ids is None or forward_batch.out_cache_loc is None:
             return False
         raw_bs = int(forward_batch.batch_size)

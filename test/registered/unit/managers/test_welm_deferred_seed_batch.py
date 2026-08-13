@@ -617,6 +617,8 @@ def test_deferred_seed_remains_dp_cuda_graph_eligible():
         welm_kv_mirror_contract_flags=[False],
         welm_deferred_prefill_flags=[False],
         welm_mtp_global_prefill_num_tokens=[0],
+        global_has_non_greedy_sampling=False,
+        global_needs_top_p_sampling=False,
         can_cuda_graph=True,
         global_num_tokens=[1],
         global_num_tokens_for_logprob=[1],
