@@ -32,10 +32,10 @@ MTP serving 需要使用真正带 MTP/NextN 权重的 WeLMV4 checkpoint。模型
 | 环境变量 | 默认值 | 含义和限制 |
 | --- | --- | --- |
 | `SGLANG_ENABLE_SPEC_V2` | `1` | WeLMV4 MTP 必须使用 Spec V2/overlap schedule。建议启动命令里显式设置为 `1`；不要设为 `0`，也不要传 `--disable-overlap-schedule`。 |
-| `SGLANG_WELM_MTP_SAMPLE_DRAFT` | 未设置 | `--speculative-eagle-topk 1` 时自动继承 verify 的采样语义：verify greedy 则 draft greedy；verify 随机采样则 draft 继承请求的 temperature、top-p、top-k。设为 `0` 强制 draft greedy；设为 `1` 显式启用该自动行为。tree proposal（`topk > 1`）不支持随机 draft sampling。 |
-| `SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE` | 未设置 | 显式覆盖 draft temperature；未设置时继承 verify。值必须大于 `0`。 |
-| `SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P` | 未设置 | 显式覆盖 draft top-p；未设置时继承 verify。值必须在 `(0, 1]`。 |
-| `SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK` | 未设置 | 正值会将 draft sampling 截断到前 K 个 token，从而显式覆盖 verify 的 top-k；未设置或 `<=0` 时继承 verify 的 top-k。值必须小于 vocab size。 |
+| `SGLANG_WELM_MTP_SAMPLE_DRAFT` | `0` | 开启 draft sampling。只支持 `--speculative-eagle-topk 1`；`topk > 1` 时设置为 `1` 会直接启动失败。|
+| `SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE` | 未设置 | draft sampling 使用固定 temperature。只在 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1` 时有意义；值必须大于 `0`。 |
+| `SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P` | 未设置 | draft sampling 使用固定 top-p。只在 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1` 时有意义；值必须在 `(0, 1]`。 |
+| `SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK` | `0` | 限制 draft sampling 只在前 K 个 token 内采样。`<=0` 表示关闭；值必须小于 vocab size，否则会被忽略。只建议和 `topk=1` 的 draft sampling 一起使用。 |
 | `SGLANG_WELM_V4D5_80A3_MTP_VERIFY_ATTENTION_BACKEND` | `fa3` | 只控制 WeLM V4D5 80A3 的 MTP target-verify attention。`fa3` 保持当前实现；`mk` 在满足下述固定契约时使用 MK verify kernel，不支持或启动自检失败时打印明确原因并回退 FA3。 |
 
 ### WeLM V4D5 80A3 MK verify attention

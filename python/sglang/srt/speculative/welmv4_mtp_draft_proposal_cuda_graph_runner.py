@@ -192,7 +192,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.welm_mtp_mirror_padding_index = 0
         self.welm_mtp_mirror_kv_len = 0
         self.sample_draft = (
-            eagle_worker._is_welmv4_mtp_draft_sampling_enabled()
+            eagle_worker.welmv4_mtp_sample_draft
             and eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params()
             and eagle_worker._get_welmv4_mtp_draft_sampling_topk() > 0
         )
