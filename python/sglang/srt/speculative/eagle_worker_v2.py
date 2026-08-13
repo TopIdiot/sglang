@@ -126,6 +126,7 @@ _WELM_MTP_DRAFT_CUDA_GRAPH_ENABLED = (
     os.environ.get("SGLANG_WELM_MTP_DRAFT_CUDA_GRAPH", "1").strip().lower()
     not in _WELM_FALSE_VALUES
 )
+_WELM_MTP_SAMPLE_DRAFT_ENV = "SGLANG_WELM_MTP_SAMPLE_DRAFT"
 _WELM_MTP_DRAFT_FIXED_TEMPERATURE_ENV = "SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE"
 _WELM_MTP_DRAFT_FIXED_TOP_P_ENV = "SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P"
 _WELM_MTP_DRAFT_SAMPLING_TOPK_ENV = "SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK"
@@ -143,8 +144,19 @@ def _welm_mtp_trace(message: str) -> None:
         print(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
 
 
-def _welm_mtp_env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in _WELM_TRUE_VALUES
+def _parse_optional_bool_env(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    normalized = raw.strip().lower()
+    if normalized in _WELM_TRUE_VALUES:
+        return True
+    if normalized in _WELM_FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{name} must be one of {sorted(_WELM_TRUE_VALUES | _WELM_FALSE_VALUES)}, "
+        f"got {raw!r}."
+    )
 
 
 def _parse_optional_float_env(name: str) -> Optional[float]:
@@ -252,9 +264,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.welmv4_mtp_sample_draft = _welm_mtp_env_flag(
-            "SGLANG_WELM_MTP_SAMPLE_DRAFT"
+        self.welmv4_mtp_draft_sampling_mode = _parse_optional_bool_env(
+            _WELM_MTP_SAMPLE_DRAFT_ENV
         )
+        self.welmv4_mtp_sample_draft = self.welmv4_mtp_draft_sampling_mode is True
         self.welmv4_mtp_draft_fixed_temperature = _parse_optional_float_env(
             _WELM_MTP_DRAFT_FIXED_TEMPERATURE_ENV
         )
@@ -1208,11 +1221,21 @@ class EagleDraftWorker(BaseDraftWorker):
             f"WeLMV4 MTP {label} token id OOB vs vocab_size={high}",
         )
 
+    def _is_welmv4_mtp_draft_sampling_enabled(self) -> bool:
+        return self.welmv4_mtp_draft_sampling_mode is not False
+
+    @staticmethod
+    def _copy_welmv4_mtp_oe_hash_inputs(
+        source: ForwardBatch, target: ForwardBatch
+    ) -> None:
+        cached_welm_oe_hash = getattr(source, "welm_oe_decode_hashed_inputs", None)
+        if cached_welm_oe_hash is not None:
+            target.welm_oe_decode_hashed_inputs = cached_welm_oe_hash
+
     def _should_use_welmv4_mtp_greedy_draft(self, forward_batch: ForwardBatch) -> bool:
-        if (
-            self.welmv4_mtp_sample_draft
-            and self._has_welmv4_mtp_fixed_draft_sampling_params()
-        ):
+        if self.welmv4_mtp_draft_sampling_mode is False:
+            return self.topk == 1 and not forward_batch.forward_mode.is_idle()
+        if self._has_welmv4_mtp_fixed_draft_sampling_params():
             return False
         sampling_info = forward_batch.sampling_info
         return (
@@ -1229,7 +1252,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def _should_sample_welmv4_mtp_draft(self, forward_batch: ForwardBatch) -> bool:
         should_sample = (
-            self.welmv4_mtp_sample_draft
+            self._is_welmv4_mtp_draft_sampling_enabled()
             and self.topk == 1
             and not forward_batch.forward_mode.is_idle()
         )
@@ -4205,16 +4228,19 @@ class EagleDraftWorker(BaseDraftWorker):
                     and self.cuda_graph_runner_for_draft_proposal.can_run(forward_batch)
                 )
                 use_variable_decode_extend = (
-                    self.topk == 1
-                    and self.welmv4_mtp_sample_draft
+                    self._should_sample_welmv4_mtp_draft(forward_batch)
                     and self._get_welmv4_mtp_draft_sampling_topk() == 0
                     and not can_cuda_graph
                 )
                 if use_variable_decode_extend and not is_idle_decode:
+                    previous_forward_batch = forward_batch
                     batch.forward_mode = ForwardMode.EXTEND
                     draft_input.num_tokens_per_req = 1
                     draft_input.num_tokens_for_logprob_per_req = 1
                     forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+                    self._copy_welmv4_mtp_oe_hash_inputs(
+                        previous_forward_batch, forward_batch
+                    )
                     forward_batch.return_logprob = False
                     forward_batch.welm_mtp_variable_decode_extend = True
                     real_last_index = (
