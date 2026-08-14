@@ -192,7 +192,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.welm_mtp_mirror_padding_index = 0
         self.welm_mtp_mirror_kv_len = 0
         self.sample_draft = (
-            eagle_worker.welmv4_mtp_sample_draft
+            eagle_worker._is_welmv4_mtp_draft_sampling_enabled()
             and eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params()
             and eagle_worker._get_welmv4_mtp_draft_sampling_topk() > 0
         )
@@ -1863,6 +1863,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
     def can_replay_from_verify(self, batch, batch_result) -> bool:
         """Whether the fixed top-k=1 verify result can bypass ragged staging."""
         if not self.persistent_handoff or self.topk != 1 or self.dp_size != 1:
+            return False
+        required_sampling_mode = self._required_draft_sampling_mode(batch)
+        captured_sampling_mode = self.sample_draft, self.use_top_p
+        if required_sampling_mode != captured_sampling_mode:
             return False
         if batch.forward_mode.is_idle() or batch.seq_lens_cpu is None:
             return False

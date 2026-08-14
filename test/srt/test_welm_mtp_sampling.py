@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -122,3 +124,49 @@ def test_packed_distributed_topk_rejects_inexact_fp32_token_ids():
         )
         is None
     )
+
+
+def test_persistent_handoff_requires_captured_sampling_mode():
+    from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
+        WelmMTPDraftProposalCudaGraphRunner,
+    )
+
+    runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+        WelmMTPDraftProposalCudaGraphRunner
+    )
+    runner.persistent_handoff = True
+    runner.topk = 1
+    runner.dp_size = 1
+    runner.capture_bs = [1]
+    runner.num_tokens_per_bs = 5
+    runner.use_dp_sampling_consensus = False
+    runner.sample_draft = False
+    runner.use_top_p = False
+    runner.eagle_worker = SimpleNamespace(
+        _should_sample_welmv4_mtp_draft=lambda batch: True,
+        _should_use_welmv4_mtp_draft_top_p=lambda batch: runner.requires_top_p,
+    )
+    runner.requires_top_p = False
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        seq_lens_cpu=[1],
+        seq_lens=torch.tensor([1]),
+        out_cache_loc=torch.tensor([0]),
+        req_pool_indices=torch.tensor([0]),
+    )
+    batch_result = SimpleNamespace(
+        spec_accept_index=torch.zeros((1, 5), dtype=torch.long),
+        accept_lens=torch.ones(1, dtype=torch.long),
+        logits_output=SimpleNamespace(hidden_states=torch.empty((1, 1))),
+    )
+
+    assert not runner.can_replay_from_verify(batch, batch_result)
+
+    runner.sample_draft = True
+    assert runner.can_replay_from_verify(batch, batch_result)
+
+    runner.requires_top_p = True
+    assert not runner.can_replay_from_verify(batch, batch_result)
+
+    runner.use_top_p = True
+    assert runner.can_replay_from_verify(batch, batch_result)
