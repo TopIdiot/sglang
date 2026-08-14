@@ -4789,6 +4789,9 @@ class Scheduler(
             ),
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+            "pytorch_allocated": round(
+                torch.cuda.memory_allocated() / (1024**3), 2
+            ),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
