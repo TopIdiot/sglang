@@ -147,8 +147,8 @@ from sglang.srt.models.welmv4_token_owner import (
     WeLMTokenOwnerRuntime,
     welm_token_owner_enabled,
 )
-from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
-    welm_v45_80a3_fused_pre_attn_enabled,
+from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
+    welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
 )
 from sglang.srt.server_args import (
     MAX_AUTO_RUNNING_REQUESTS,
@@ -177,16 +177,16 @@ def _welm_token_owner_enabled(*, pp_size: int) -> bool:
     )
 
 
-if welm_v45_80a3_fused_pre_attn_enabled():
-    from sglang.srt.models.welm_v45_80a3_fused_pre_attn import (
-        WeLMV45_80A3FusedPreAttnMixin,
+if welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled():
+    from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2 import (
+        WeLMV45_80A3H2048HD256PreAttnV2Mixin,
     )
 else:
 
-    class WeLMV45_80A3FusedPreAttnMixin:
-        """No-op base used when the optional fused pre-attention is disabled."""
+    class WeLMV45_80A3H2048HD256PreAttnV2Mixin:
+        """No-op base used when the optional Pre-Attn V2 is disabled."""
 
-        def _try_mk_fused_qkv_knorm_rope_kv_write(self, *args, **kwargs):
+        def _try_mk_h2048_hd256_pre_attn_v2(self, *args, **kwargs):
             return None
 
 
@@ -496,9 +496,7 @@ def _set_welm_custom_last_prefill_cache_loc(forward_batch: ForwardBatch) -> None
         custom_last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
         forward_batch.custom_last_index = custom_last_index
 
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
     if runtime_layout is not None:
         forward_batch.custom_last_cache_loc = (
@@ -736,9 +734,7 @@ def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
     else:
         tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
         reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
-        contract_flags = getattr(
-            forward_batch, "welm_kv_mirror_contract_flags", None
-        )
+        contract_flags = getattr(forward_batch, "welm_kv_mirror_contract_flags", None)
         if (
             contract_flags is not None
             and tokens is not None
@@ -752,8 +748,7 @@ def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
             and all(
                 _welm_ceil_align(int(r), align) < int(t)
                 for slot, (t, r) in enumerate(zip(tokens, reqs))
-                if int(t) > 0
-                and (contract_flags is None or contract_flags[slot])
+                if int(t) > 0 and (contract_flags is None or contract_flags[slot])
             )
         )
     # Known limitation: persistent CUDA-graph forward batches carry GPU-only
@@ -768,9 +763,7 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
         forward_batch, "_welm_local_kv_mirror_contract_enabled", None
     )
     if local_contract_enabled is None:
-        contract_flags = getattr(
-            forward_batch, "welm_kv_mirror_contract_flags", None
-        )
+        contract_flags = getattr(forward_batch, "welm_kv_mirror_contract_flags", None)
         if contract_flags is not None:
             from sglang.srt.layers.dp_attention import get_attention_dp_rank
 
@@ -783,9 +776,7 @@ def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
             local_contract_enabled = bool(contract_flags[dp_rank])
         else:
             local_contract_enabled = True
-        forward_batch._welm_local_kv_mirror_contract_enabled = (
-            local_contract_enabled
-        )
+        forward_batch._welm_local_kv_mirror_contract_enabled = local_contract_enabled
 
     return (
         forward_batch.enable_welm_kv_mirror_opt
@@ -836,10 +827,7 @@ def _welm_needs_empty_dp_collectives(
     return (
         getattr(forward_batch, "welm_deferred_prefill_suffix_active", False)
         or is_nextn
-        or (
-            forward_batch.forward_mode.is_idle()
-            and forward_batch.is_extend_in_batch
-        )
+        or (forward_batch.forward_mode.is_idle() and forward_batch.is_extend_in_batch)
     )
 
 
@@ -854,16 +842,17 @@ def _welm_cp_prefill_prefix_send_only(
         return False
 
     runtime_layout = forward_batch.attn_cp_prefill_runtime_layout
-    if getattr(
-        runtime_layout,
-        "kv_local_tokens",
-        getattr(runtime_layout, "active_local_tokens", 0),
-    ) != 0:
+    if (
+        getattr(
+            runtime_layout,
+            "kv_local_tokens",
+            getattr(runtime_layout, "active_local_tokens", 0),
+        )
+        != 0
+    ):
         return False
 
-    gather_plan = getattr(
-        forward_batch, "attn_cp_prefill_kv_gather_plan", None
-    )
+    gather_plan = getattr(forward_batch, "attn_cp_prefill_kv_gather_plan", None)
     if gather_plan is None:
         raise RuntimeError(
             "Phase 2 empty-Q attention is missing its KV participation plan; "
@@ -876,9 +865,7 @@ def _welm_cp_prefill_short_empty_rank(
     row_count: int,
     forward_batch: ForwardBatch,
 ) -> bool:
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     return bool(
         row_count == 0
         and runtime_layout is not None
@@ -897,9 +884,7 @@ def _welm_should_dispatch_attention(
     forward_batch: ForwardBatch,
     needs_empty_dp_collectives: bool,
 ) -> bool:
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     has_local_kv = (
         runtime_layout is not None
         and getattr(
@@ -933,9 +918,7 @@ def _welm_localize_cp_prefill_rows(
     if layout is None:
         return hidden_states, positions
     if hidden_states.shape[0] == layout.spec.extend_len:
-        hidden_states = hidden_states.index_select(
-            0, layout.local_extend_indices
-        )
+        hidden_states = hidden_states.index_select(0, layout.local_extend_indices)
     elif hidden_states.shape[0] != layout.active_local_tokens:
         raise RuntimeError(
             "WeLM Phase 2 hidden rows are neither global extend nor CP-local rows"
@@ -957,9 +940,7 @@ def _welm_prepare_cp_prefill_logits_states(
     aux_hidden_states: Optional[List[torch.Tensor]],
     forward_batch: ForwardBatch,
 ) -> _WelmPreparedLogits:
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     if runtime_layout is None:
         return _WelmPreparedLogits(
             hidden_states=hidden_states,
@@ -981,7 +962,7 @@ def _welm_prepare_cp_prefill_logits_states(
         if runtime_layout.q_is_contracted:
             raise RuntimeError(
                 "WeLM Phase 2 prompt logprobs require uncontracted CP hidden rows"
-        )
+            )
         extend_lens = logits_metadata.extend_seq_lens_cpu
         start_lens = logits_metadata.extend_logprob_start_lens_cpu
         if (
@@ -1025,9 +1006,7 @@ def _welm_prepare_cp_prefill_logits_states(
         hidden_states_to_store = None
         if logits_metadata.capture_hidden_mode.need_capture():
             final_logical = (
-                runtime_layout.spec.extend_start
-                + runtime_layout.spec.extend_len
-                - 1
+                runtime_layout.spec.extend_start + runtime_layout.spec.extend_len - 1
             )
             if aux_hidden_states is not None:
                 hidden_states_to_store = torch.cat(
@@ -1068,9 +1047,7 @@ def _welm_prepare_cp_prefill_logits_states(
         routed_aux_hidden_states = aux_hidden_states
     else:
         final_logical = (
-            runtime_layout.spec.extend_start
-            + runtime_layout.spec.extend_len
-            - 1
+            runtime_layout.spec.extend_start + runtime_layout.spec.extend_len - 1
         )
         if (
             logits_metadata.capture_hidden_mode.need_capture()
@@ -1323,17 +1300,11 @@ def _welm_create_tp_dp_attntp_fused_norm_managers(
     _welm_validate_attntp_fused_norm_speculation(server_args)
     dp_enabled = is_dp_attention_enabled()
     if dp_enabled:
-        if (
-            attention.o_proj.reduce_results
-            or not attention.o_norm_needs_attn_tp_reduce
-        ):
+        if attention.o_proj.reduce_results or not attention.o_norm_needs_attn_tp_reduce:
             return {}
         topology = "dp"
     else:
-        if (
-            not attention.o_proj.reduce_results
-            or attention.o_norm_needs_attn_tp_reduce
-        ):
+        if not attention.o_proj.reduce_results or attention.o_norm_needs_attn_tp_reduce:
             return {}
         topology = "tp"
 
@@ -1516,9 +1487,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
         return False
 
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     if runtime_layout is not None:
         scheduler_indices = getattr(
             forward_batch, "welm_kv_mirror_last_q_indices", None
@@ -1529,9 +1498,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
             )
         has_global_q = scheduler_indices is None or scheduler_indices.numel() == 1
         last_logical = (
-            runtime_layout.spec.extend_start
-            + runtime_layout.spec.extend_len
-            - 1
+            runtime_layout.spec.extend_start + runtime_layout.spec.extend_len - 1
         )
         local_index = (
             runtime_layout.local_index_for_logical(last_logical)
@@ -1560,9 +1527,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
         # two deployments are never combined today.
         forward_batch._welm_kv_mirror_row_pad = 0
     else:
-        last_q_indices = getattr(
-            forward_batch, "welm_kv_mirror_last_q_indices", None
-        )
+        last_q_indices = getattr(forward_batch, "welm_kv_mirror_last_q_indices", None)
         if last_q_indices is None:
             last_q_indices = getattr(forward_batch, "custom_last_index", None)
             if last_q_indices is None:
@@ -1622,9 +1587,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
                 "KV mirror CPU last-Q and active-request metadata must align"
             )
         forward_batch.welm_kv_mirror_last_q_indices_cpu = cpu_last_q_indices
-        forward_batch.welm_kv_mirror_active_batch_indices_cpu = (
-            cpu_active_batch_indices
-        )
+        forward_batch.welm_kv_mirror_active_batch_indices_cpu = cpu_active_batch_indices
     elif bool(getattr(get_global_server_args(), "enable_token_owner", False)):
         raise RuntimeError(
             "WeLM token-owner KV mirror requires CPU row metadata; refusing "
@@ -1639,9 +1602,7 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
 
 
 def _welm_contract_cp_prefill_kv_mirror_layout(forward_batch: ForwardBatch):
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     if runtime_layout is None or runtime_layout.q_is_contracted:
         return runtime_layout
     contracted = contract_cp_prefill_runtime_to_last_q(
@@ -1662,9 +1623,7 @@ def _welm_contract_cp_prefill_kv_mirror_layout(forward_batch: ForwardBatch):
 
 
 def _welm_prepare_cp_prefill_kv_mirror_layout(forward_batch: ForwardBatch):
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     if runtime_layout is None:
         return None
     _welm_init_kv_mirror_last_q_indices(forward_batch)
@@ -1738,9 +1697,7 @@ def _welm_write_kv_cache_only(
 ) -> None:
     if k is None or v is None:
         return
-    runtime_layout = getattr(
-        forward_batch, "attn_cp_prefill_runtime_layout", None
-    )
+    runtime_layout = getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
     cache_loc = (
         runtime_layout.local_out_cache_loc
         if runtime_layout is not None
@@ -1882,9 +1839,8 @@ def _welm_update_contracted_dp_metadata(
             new_global_num_tokens_for_logprob = [
                 int(x) for x in synchronized_global_num_tokens_for_logprob
             ]
-            if (
-                len(new_global_num_tokens_for_logprob) != num_dp_slots
-                or any(count < 0 for count in new_global_num_tokens_for_logprob)
+            if len(new_global_num_tokens_for_logprob) != num_dp_slots or any(
+                count < 0 for count in new_global_num_tokens_for_logprob
             ):
                 raise RuntimeError(
                     "WeLM synchronized DP metadata has invalid logprob counts: "
@@ -1919,9 +1875,7 @@ def _welm_update_contracted_dp_metadata(
         # deterministically from the synchronized contract flags instead:
         # contract flagged slots and preserve the existing padded row count
         # for every non-contracting slot.
-        contract_flags = getattr(
-            forward_batch, "welm_kv_mirror_contract_flags", None
-        )
+        contract_flags = getattr(forward_batch, "welm_kv_mirror_contract_flags", None)
         current_global_num_tokens = getattr(
             forward_batch, "global_num_tokens_cpu", None
         )
@@ -2203,9 +2157,7 @@ def _welm_apply_deferred_prefill_dp_cutoff(
         )
 
     local_deferred = bool(flags[dp_rank])
-    if local_deferred != bool(
-        getattr(forward_batch, "welm_deferred_prefill", False)
-    ):
+    if local_deferred != bool(getattr(forward_batch, "welm_deferred_prefill", False)):
         raise RuntimeError(
             "WeLM deferred Prefill cutoff flag does not match the local batch: "
             f"dp_rank={dp_rank}, local_flag={local_deferred}"
@@ -2217,8 +2169,7 @@ def _welm_apply_deferred_prefill_dp_cutoff(
             f"residual={None if residual is None else residual.shape[0]}"
         )
     synchronized_num_tokens = [
-        0 if deferred else count
-        for deferred, count in zip(flags, global_num_tokens)
+        0 if deferred else count for deferred, count in zip(flags, global_num_tokens)
     ]
     synchronized_logprob_tokens = [
         0 if deferred else count
@@ -2917,10 +2868,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
                     project_hidden_states = _welm_select_kv_mirror_rows(
                         hidden_states, forward_batch, first_contract=True
                     )
-                if (
-                    project_hidden_states.shape[0]
-                    != runtime_layout.active_local_tokens
-                ):
+                if project_hidden_states.shape[0] != runtime_layout.active_local_tokens:
                     raise RuntimeError(
                         "Phase 2 KV mirror Q rows do not match the contracted runtime"
                     )
@@ -3535,8 +3483,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate_weight=self.gate.weight,
                     expert_bias=self.expert_bias,
                 )
-                if self._mk_moe_router is not None
-                and router_context is None
+                if self._mk_moe_router is not None and router_context is None
                 else None
             )
             if mk_topk_output is not None:
@@ -3545,9 +3492,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             elif self.use_previous_precision_router:
                 if router_hidden_states_fp32 is None:
                     raise RuntimeError("previous-precision Router requires FP32 hidden")
-                router_logits = F.linear(
-                    router_hidden_states_fp32, self.gate.weight
-                )
+                router_logits = F.linear(router_hidden_states_fp32, self.gate.weight)
                 topk_output = self.topk(
                     router_hidden_states,
                     router_logits,
@@ -3950,9 +3895,7 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
         finalizer.num_kv_heads = target_attention.num_kv_heads
         finalizer.head_dim = target_attention.head_dim
         finalizer.scale_seq_factor = target_attention.scale_seq_factor
-        finalizer.scale_rope_positions = (
-            target_attention.scale_seq_attn_per_suffix
-        )
+        finalizer.scale_rope_positions = target_attention.scale_seq_attn_per_suffix
         finalizer.apply_k_norm = (
             target_attention.qk_norm or target_attention.only_k_norm
         )
@@ -3979,18 +3922,14 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
                 f"layer {self.target_layer_id}: {key.shape[0]} vs {positions.shape[0]}"
             )
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-        if key.shape[0] > 0 and (
-            out_cache_loc is None or out_cache_loc.numel() == 0
-        ):
+        if key.shape[0] > 0 and (out_cache_loc is None or out_cache_loc.numel() == 0):
             raise RuntimeError(
                 "WeLM deferred target K/V has rows but no cache destination for "
                 f"layer {self.target_layer_id}"
             )
 
         if self.apply_k_norm:
-            key_by_head = key.view(
-                key.shape[0], self.num_kv_heads, self.head_dim
-            )
+            key_by_head = key.view(key.shape[0], self.num_kv_heads, self.head_dim)
             key_by_head = mmq_style_k_rms_norm(
                 key_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
             )
@@ -4020,7 +3959,7 @@ def _welm_finalize_deferred_target_kv(
         finalizer(positions, *mirror_kv, forward_batch)
 
 
-class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
+class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
     @staticmethod
     def _normalize_sliding_window_size(config: PretrainedConfig, window) -> int:
         if window is None:
@@ -4109,7 +4048,7 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
         # normalization, and partial-RoPE contract. Keep the model gate
         # separate from the later tensor-shape checks so a lookalike model
         # cannot opt in merely by presenting compatible local tensors.
-        self._welm_v45_80a3_fused_pre_attn_model_contract = (
+        self._welm_v45_80a3_h2048_hd256_pre_attn_v2_model_contract = (
             getattr(config, "model_type", None) == "welmv4_moe"
             and getattr(config, "num_experts", None) == 512
             and hidden_size == 2048
@@ -4177,9 +4116,7 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
         )
         if self.enable_attention_sink:
             self.attn_sink = nn.Parameter(
-                torch.empty(
-                    self.num_heads, dtype=_get_welm_attention_sink_dtype()
-                ),
+                torch.empty(self.num_heads, dtype=_get_welm_attention_sink_dtype()),
                 requires_grad=False,
             )
         else:
@@ -4372,7 +4309,203 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
             return "mirror_source"
         if isinstance(self.qkv_proj, MirrorQProjection) and not self.is_nextn:
             return "mirror_consumer"
+        if isinstance(self.qkv_proj, NextnMirrorQProjection) and self.is_nextn:
+            return "nextn"
         return None
+
+    def _mk_runtime_projection_kind(self, forward_batch: ForwardBatch) -> Optional[str]:
+        kind = self._mk_projection_kind()
+        if kind != "nextn":
+            return kind
+        if forward_batch.forward_mode.is_idle() and not getattr(
+            forward_batch, "welm_mtp_merge_kv_fill_draft", False
+        ):
+            return "idle_mtp"
+        return "indexed_mtp"
+
+    def _mk_prepare_indexed_mtp_v2_inputs(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        kv_mirror_states: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+    ) -> Optional[Dict[str, Any]]:
+        """Describe NextN gathers without materializing their selected tensors."""
+        if (
+            not isinstance(self.qkv_proj, NextnMirrorQProjection)
+            or kv_mirror_states is None
+            or getattr(forward_batch, "attn_cp_prefill_runtime_layout", None)
+            is not None
+        ):
+            return None
+        merge_kv_fill = bool(
+            getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
+        )
+        if forward_batch.forward_mode.is_decode() and not merge_kv_fill:
+            return None
+
+        device = hidden_states.device
+        identity_buffer = getattr(forward_batch, "welm_mtp_identity_indices", None)
+
+        def identity_indices(rows: int) -> torch.Tensor:
+            if (
+                isinstance(identity_buffer, torch.Tensor)
+                and identity_buffer.device == device
+                and identity_buffer.dtype is torch.int64
+                and identity_buffer.numel() >= rows
+            ):
+                return identity_buffer[:rows]
+            return torch.arange(rows, device=device, dtype=torch.int64)
+
+        def as_indices(indices: torch.Tensor) -> Optional[torch.Tensor]:
+            if not isinstance(indices, torch.Tensor) or indices.device != device:
+                return None
+            if indices.dtype is not torch.int64:
+                indices = indices.to(dtype=torch.int64)
+            return indices.contiguous()
+
+        contract = _welm_should_contract_kv_mirror(forward_batch)
+        q_indices = None
+        active_indices = custom_last_indices = None
+        output_size = None
+        if contract:
+            _welm_init_kv_mirror_last_q_indices(forward_batch)
+            if _welm_kv_mirror_has_no_active_q(forward_batch):
+                return None
+            active_indices = as_indices(forward_batch.kv_mirror_active_batch_indices)
+            custom_last_indices = as_indices(forward_batch.custom_last_index)
+            if active_indices is None or custom_last_indices is None:
+                return None
+            output_size = int(forward_batch.kv_mirror_output_size)
+            if hidden_states.shape[0] == active_indices.numel():
+                q_indices = identity_indices(int(hidden_states.shape[0]))
+            elif hidden_states.shape[0] != output_size:
+                q_indices = custom_last_indices
+            else:
+                q_indices = active_indices
+        else:
+            q_indices = identity_indices(int(hidden_states.shape[0]))
+
+        pop_key = (
+            self.qkv_proj.mirror_layer_idx
+            if self.qkv_proj.mirror_layer_idx is not None
+            else self.qkv_proj.imitated_layer_idx
+        )
+        kv_activation = kv_mirror_states.get(pop_key)
+        if kv_activation is None:
+            return None
+        raw_k, raw_v = kv_activation
+        if (
+            not isinstance(raw_k, torch.Tensor)
+            or not isinstance(raw_v, torch.Tensor)
+            or raw_k.device != device
+            or raw_v.device != device
+            or tuple(raw_k.shape) != tuple(raw_v.shape)
+        ):
+            return None
+
+        mirrored_kv_indices = getattr(
+            getattr(forward_batch, "spec_info", None),
+            "mirrored_kv_indices",
+            None,
+        )
+        if (
+            forward_batch.forward_mode.is_draft_extend(include_v2=True) or merge_kv_fill
+        ) and mirrored_kv_indices is not None:
+            kv_indices = as_indices(mirrored_kv_indices)
+            if kv_indices is None:
+                return None
+        else:
+            kv_indices = identity_indices(int(raw_k.shape[0]))
+
+        q_rows = int(q_indices.numel())
+        kv_rows = int(kv_indices.numel())
+        kv_fill_positions = getattr(forward_batch, "welm_mtp_kv_fill_positions", None)
+        if merge_kv_fill and contract and q_rows > 0 and kv_rows != q_rows:
+            has_full_kv_positions = (
+                isinstance(kv_fill_positions, torch.Tensor)
+                and int(kv_fill_positions.shape[0]) == kv_rows
+            )
+            if not has_full_kv_positions:
+                if kv_rows < q_rows:
+                    raise RuntimeError(
+                        "WeLMV4 MTP merged mirror-KV rows are already more "
+                        "contracted than query rows: "
+                        f"k_rows={kv_rows} q_rows={q_rows}."
+                    )
+                if kv_rows == active_indices.numel():
+                    selection = identity_indices(kv_rows)
+                elif kv_rows != output_size:
+                    selection = custom_last_indices
+                else:
+                    selection = active_indices
+                kv_indices = kv_indices.index_select(0, selection).contiguous()
+                kv_rows = int(kv_indices.numel())
+
+        if q_rows == 0 or kv_rows == 0:
+            return None
+
+        def as_positions(value: torch.Tensor) -> Optional[torch.Tensor]:
+            if not isinstance(value, torch.Tensor):
+                return None
+            return value.to(device=device, dtype=torch.int64).contiguous()
+
+        q_positions = kv_positions = None
+        last_query_positions = None
+        if (
+            contract
+            and custom_last_indices is not None
+            and q_rows == custom_last_indices.numel()
+        ):
+            last_query_positions = as_positions(
+                getattr(forward_batch, "welm_mtp_query_positions", None)
+            )
+            if (
+                last_query_positions is not None
+                and last_query_positions.shape[0] == output_size
+                and active_indices.numel() != output_size
+            ):
+                last_query_positions = last_query_positions.index_select(
+                    0, active_indices
+                ).contiguous()
+            if last_query_positions is not None:
+                if last_query_positions.shape != (q_rows,):
+                    return None
+                q_positions = last_query_positions
+            elif positions.shape[0] == hidden_states.shape[0]:
+                q_positions = positions.index_select(0, q_indices).contiguous()
+            elif positions.shape == (q_rows,):
+                q_positions = positions.contiguous()
+
+            if merge_kv_fill and kv_rows != positions.shape[0]:
+                candidate = as_positions(kv_fill_positions)
+                if candidate is not None and candidate.shape == (kv_rows,):
+                    kv_positions = candidate
+                elif (
+                    last_query_positions is not None
+                    and last_query_positions.shape == (kv_rows,)
+                ):
+                    kv_positions = last_query_positions
+            elif positions.shape == (kv_rows,):
+                kv_positions = positions.contiguous()
+        else:
+            if positions.shape == (q_rows,):
+                q_positions = positions.contiguous()
+            elif positions.shape[0] == hidden_states.shape[0]:
+                q_positions = positions.index_select(0, q_indices).contiguous()
+            if positions.shape == (kv_rows,):
+                kv_positions = positions.contiguous()
+
+        if q_positions is None or kv_positions is None:
+            return None
+        return {
+            "raw_k": raw_k,
+            "raw_v": raw_v,
+            "q_indices": q_indices.contiguous(),
+            "kv_indices": kv_indices.contiguous(),
+            "q_positions": q_positions,
+            "kv_positions": kv_positions,
+        }
 
     def _mk_mirror_source_keys(self) -> tuple[int, ...]:
         if isinstance(self.qkv_proj, ImitateQkvMultiBankKvProjection):
@@ -4444,9 +4577,7 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
                 )
         communication_only = _welm_cp_prefill_prefix_send_only(
             hidden_states.shape[0], forward_batch
-        ) or _welm_cp_prefill_short_empty_rank(
-            hidden_states.shape[0], forward_batch
-        )
+        ) or _welm_cp_prefill_short_empty_rank(hidden_states.shape[0], forward_batch)
         if communication_only:
             if scp_per_suffix:
                 raise NotImplementedError(
@@ -4463,16 +4594,17 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3FusedPreAttnMixin):
             )
             self.attn(q, k, v, forward_batch, save_kv_cache=False)
             return hidden_states.new_empty((0, self.hidden_size))
-        fused_qkv = self._try_mk_fused_qkv_knorm_rope_kv_write(
+        fused_qkv = self._try_mk_h2048_hd256_pre_attn_v2(
             positions, hidden_states, forward_batch, kv_mirror_states
         )
-        kv_cache_written = fused_qkv is not None
+        kv_cache_written = bool(fused_qkv is not None and fused_qkv.kv_cache_written)
         if fused_qkv is None:
             q, k, v, hidden_states = self.qkv_proj.forward(
                 self, hidden_states, forward_batch, kv_mirror_states
             )
         else:
-            q, k, v = fused_qkv
+            q, k, v = fused_qkv.q, fused_qkv.k, fused_qkv.v
+            hidden_states = fused_qkv.hidden_states
         if self.deferred_target_kv_finalizers and getattr(
             forward_batch, "welm_deferred_prefill", False
         ):
@@ -4840,8 +4972,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_layers=(
                 1
                 if standalone_nextn
-                else total_layer_num
-                + (num_nextn_predict_layers if is_nextn else 0)
+                else total_layer_num + (num_nextn_predict_layers if is_nextn else 0)
             ),
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=True,
@@ -4938,16 +5069,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_communicator, use_prefill_cp_communicator = (
             _welm_select_layer_communicator(self, forward_batch)
         )
-        tp_dp_attntp_fused_norm_manager = (
-            _welm_select_tp_dp_attntp_fused_norm_manager(
-                self,
-                forward_batch,
-                use_prefill_cp_communicator=use_prefill_cp_communicator,
-            )
+        tp_dp_attntp_fused_norm_manager = _welm_select_tp_dp_attntp_fused_norm_manager(
+            self,
+            forward_batch,
+            use_prefill_cp_communicator=use_prefill_cp_communicator,
         )
-        use_tp_dp_attntp_fused_norm = (
-            tp_dp_attntp_fused_norm_manager is not None
-        )
+        use_tp_dp_attntp_fused_norm = tp_dp_attntp_fused_norm_manager is not None
         if use_prefill_cp_communicator and not self._prefill_cp_mlp_validated:
             layer_communicator.validate_mlp(self.mlp)
             self._prefill_cp_mlp_validated = True
@@ -4967,9 +5094,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_layer_communicator = (
             use_dp_layer_communicator or use_prefill_cp_communicator
         )
-        use_fp32_ppln_residual = (
-            residual_after_layernorm and not use_layer_communicator
-        )
+        use_fp32_ppln_residual = residual_after_layernorm and not use_layer_communicator
         if use_previous_precision:
             hidden_states, residual = self.input_layernorm(
                 hidden_states,
@@ -5005,8 +5130,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 # sparse layers. Layer 0 (input mode TP_ATTN_FULL) is untouched
                 # and is sliced in prepare_mlp.
                 if (
-                    self.layer_scatter_modes.layer_input_mode
-                    == ScatterMode.SCATTERED
+                    self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
                     and self.self_attn.attn_tp_size > 1
                 ):
                     # First contracting mirror layer with row alignment active
@@ -5021,15 +5145,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     # index-out-of-bounds.
                     if (
                         _welm_kv_mirror_row_alignment() > 1
-                        and self.self_attn.kv_mirror_layer_idx
-                        in self.kv_mirror_layers
+                        and self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
                         and _welm_should_contract_kv_mirror(forward_batch)
                     ):
                         _welm_init_kv_mirror_last_q_indices(forward_batch)
-                        if (
-                            residual.shape[0]
-                            != forward_batch.kv_mirror_output_size
-                        ):
+                        if residual.shape[0] != forward_batch.kv_mirror_output_size:
                             residual = _welm_scatter_kv_mirror_rows(
                                 _welm_select_kv_mirror_rows(
                                     residual, forward_batch, first_contract=True
@@ -5085,15 +5205,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
-        use_mmq_norm_after_attn = _welm_should_use_mmq_norm_after_attn(
-            use_previous_precision=use_previous_precision,
-            residual_after_layernorm=residual_after_layernorm,
-            use_o_norm=self.self_attn.use_o_norm,
-            o_norm_needs_attn_tp_reduce=(
-                self.self_attn.o_norm_needs_attn_tp_reduce
-            ),
-            use_prefill_cp_communicator=use_prefill_cp_communicator,
-        ) and not use_tp_dp_attntp_fused_norm and not enable_token_owner
+        use_mmq_norm_after_attn = (
+            _welm_should_use_mmq_norm_after_attn(
+                use_previous_precision=use_previous_precision,
+                residual_after_layernorm=residual_after_layernorm,
+                use_o_norm=self.self_attn.use_o_norm,
+                o_norm_needs_attn_tp_reduce=(
+                    self.self_attn.o_norm_needs_attn_tp_reduce
+                ),
+                use_prefill_cp_communicator=use_prefill_cp_communicator,
+            )
+            and not use_tp_dp_attntp_fused_norm
+            and not enable_token_owner
+        )
         use_prefill_cp_attntp2_fused_norm = (
             _welm_should_use_prefill_cp_attntp2_fused_norm(
                 use_previous_precision=use_previous_precision,
@@ -5111,9 +5235,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             forward_batch,
             is_nextn=self.is_nextn,
         )
-        is_kv_mirror_layer = (
-            self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
-        )
+        is_kv_mirror_layer = self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         if (
             use_prefill_cp_communicator
             and is_kv_mirror_layer
@@ -5162,9 +5284,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 enable_token_owner
                 and previous_contracted_rows is None
                 and contracted_rows is not None
-                and self.token_owner_runtime.local_contraction_active(
-                    forward_batch
-                )
+                and self.token_owner_runtime.local_contraction_active(forward_batch)
             )
         if (
             _welm_should_contract_kv_mirror(forward_batch)
@@ -5173,11 +5293,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         ):
             if enable_token_owner:
                 if mirror_owner_layout_just_contracted:
-                    residual = (
-                        self.token_owner_runtime.align_kv_mirror_residual(
-                            residual,
-                            forward_batch,
-                        )
+                    residual = self.token_owner_runtime.align_kv_mirror_residual(
+                        residual,
+                        forward_batch,
                     )
             elif residual.shape[0] != hidden_states.shape[0]:
                 # With row alignment active (DeepEP + DP-attention) the residual
@@ -5209,13 +5327,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     f"hidden_states.shape={tuple(hidden_states.shape)}, "
                     f"residual.shape={tuple(residual.shape)}"
                 )
-            hidden_states, residual = (
-                layer_communicator.prepare_mlp_fused_attntp2(
-                    hidden_states,
-                    residual,
-                    forward_batch,
-                    o_norm=self.self_attn.o_norm,
-                )
+            hidden_states, residual = layer_communicator.prepare_mlp_fused_attntp2(
+                hidden_states,
+                residual,
+                forward_batch,
+                o_norm=self.self_attn.o_norm,
             )
             hidden_states_fp32 = (
                 hidden_states.to(torch.float32) if dump_this_layer else None
@@ -5237,16 +5353,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 if tp_dp_attntp_fused_norm_manager.phase == "decode"
                 else "eager"
             )
-            hidden_states, residual, _ = (
-                tp_dp_attntp_fused_norm_manager.forward(
-                    hidden_states,
-                    residual,
-                    self.self_attn.o_norm.weight,
-                    self.post_attention_layernorm.weight,
-                    self.self_attn.o_norm.eps,
-                    self.post_attention_layernorm.eps,
-                    execution=execution,
-                )
+            hidden_states, residual, _ = tp_dp_attntp_fused_norm_manager.forward(
+                hidden_states,
+                residual,
+                self.self_attn.o_norm.weight,
+                self.post_attention_layernorm.weight,
+                self.self_attn.o_norm.eps,
+                self.post_attention_layernorm.eps,
+                execution=execution,
             )
             if use_dp_layer_communicator:
                 hidden_states, residual = (
@@ -5362,9 +5476,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and not layer_communicator.use_ep_dispatch
             and not skip_empty_cp_mlp
         ):
-            router_context = layer_communicator.build_router_context(
-                forward_batch
-            )
+            router_context = layer_communicator.build_router_context(forward_batch)
         elif token_owner_uses_global_tp_moe:
             router_context = self.token_owner_runtime.build_router_context(
                 forward_batch,
@@ -5468,9 +5580,7 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        enable_token_owner = _welm_token_owner_enabled(
-            pp_size=self.pp_group.world_size
-        )
+        enable_token_owner = _welm_token_owner_enabled(pp_size=self.pp_group.world_size)
         self.token_owner_runtime = (
             WeLMTokenOwnerRuntime() if enable_token_owner else None
         )
@@ -5654,8 +5764,7 @@ class Qwen2MoeModel(nn.Module):
     def _bind_monolithic_deferred_target_kv_finalizers(self) -> None:
         if (
             self.deferred_execution is None
-            or self.deferred_execution.role
-            is not WelmDeferredExecutionRole.MONOLITHIC
+            or self.deferred_execution.role is not WelmDeferredExecutionRole.MONOLITHIC
         ):
             return
         for pair in self.deferred_execution.plan.pairs:
@@ -5757,9 +5866,7 @@ class Qwen2MoeModel(nn.Module):
         if self.token_owner_runtime is not None:
             self.token_owner_runtime.begin_forward(forward_batch)
 
-        deferred_prefill = bool(
-            getattr(forward_batch, "welm_deferred_prefill", False)
-        )
+        deferred_prefill = bool(getattr(forward_batch, "welm_deferred_prefill", False))
         deferred_prefill_flags = getattr(
             forward_batch, "welm_deferred_prefill_flags", None
         )
@@ -5910,8 +6017,7 @@ class Qwen2MoeModel(nn.Module):
                         )
                 if (
                     monolithic_deferred_dp
-                    and i + 1
-                    == self.deferred_execution.prefill_execution_end_layer
+                    and i + 1 == self.deferred_execution.prefill_execution_end_layer
                 ):
                     hidden_states, residual, positions, suffix_is_empty = (
                         _welm_apply_deferred_prefill_dp_cutoff(
@@ -6033,9 +6139,7 @@ def _welm_nextn_target_layer_count(config: PretrainedConfig) -> int:
     return int(config.num_hidden_layers if count is None else count)
 
 
-def _welm_nextn_hf_to_local_name(
-    name: str, num_target_layers: int
-) -> Tuple[str, bool]:
+def _welm_nextn_hf_to_local_name(name: str, num_target_layers: int) -> Tuple[str, bool]:
     parts = name.split(".")
     step = int(parts[2]) - num_target_layers
     remainder = ".".join(parts[3:])
@@ -6046,9 +6150,7 @@ def _welm_nextn_hf_to_local_name(
     return f"model.decoder_layers.{step}.{remainder}", False
 
 
-def welm_nextn_local_to_hf_name(
-    config: PretrainedConfig, name: str
-) -> Optional[str]:
+def welm_nextn_local_to_hf_name(config: PretrainedConfig, name: str) -> Optional[str]:
     if name in ("", "model"):
         return name
 
@@ -6154,9 +6256,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_oe_fusion=skip_oe_fusion,
         )
-        deferred_prefill = bool(
-            getattr(forward_batch, "welm_deferred_prefill", False)
-        )
+        deferred_prefill = bool(getattr(forward_batch, "welm_deferred_prefill", False))
         if deferred_prefill:
             if self.deferred_execution is None or self.deferred_execution.role not in {
                 WelmDeferredExecutionRole.PREFILL,
@@ -6169,9 +6269,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 raise RuntimeError(
                     "WeLM deferred Prefill completion does not support pipeline parallelism"
                 )
-            if not forward_batch.forward_mode.is_extend(
-                include_draft_extend_v2=True
-            ):
+            if not forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                 raise RuntimeError(
                     "WeLM deferred Prefill completion requires an extend forward"
                 )
@@ -6181,8 +6279,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 )
             capture_hidden_mode = getattr(forward_batch, "capture_hidden_mode", None)
             if getattr(forward_batch, "return_logprob", False) or (
-                capture_hidden_mode is not None
-                and capture_hidden_mode.need_capture()
+                capture_hidden_mode is not None and capture_hidden_mode.need_capture()
             ):
                 raise RuntimeError(
                     "WeLM deferred Prefill does not support logprob or hidden-state output payloads"
@@ -6251,8 +6348,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 row_pad = getattr(forward_batch, "_welm_kv_mirror_row_pad", 0)
                 if (
                     row_pad > 0
-                    and hidden_states.shape[0]
-                    == forward_batch.kv_mirror_output_size
+                    and hidden_states.shape[0] == forward_batch.kv_mirror_output_size
                 ):
                     num_real_rows = forward_batch.kv_mirror_output_size - row_pad
                     hidden_states = hidden_states[:num_real_rows]
@@ -6285,10 +6381,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
     ):
-        if (
-            getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None
-            or _welm_has_cp_prefill_split_spec(forward_batch)
-        ):
+        if getattr(
+            forward_batch, "attn_cp_prefill_runtime_layout", None
+        ) is not None or _welm_has_cp_prefill_split_spec(forward_batch):
             raise NotImplementedError(
                 "WeLM Phase 2 prefill CP does not support split-prefill execution"
             )
@@ -6569,16 +6664,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     weight_loader(finalizer_param, loaded_weight)
                     continue
 
-                is_pruned_layer = (
-                    layer_id is not None and layer_id in omitted_layer_ids
-                )
+                is_pruned_layer = layer_id is not None and layer_id in omitted_layer_ids
                 if is_pruned_layer and (
-                    ".self_attn.k_proj." in name
-                    or ".self_attn.v_proj." in name
+                    ".self_attn.k_proj." in name or ".self_attn.v_proj." in name
                 ):
-                    projection_name = (
-                        "K" if ".self_attn.k_proj." in name else "V"
-                    )
+                    projection_name = "K" if ".self_attn.k_proj." in name else "V"
                     route_name = name.rpartition(".")[0]
                     if route_name not in kv_mirror_route:
                         raise RuntimeError(
@@ -6599,8 +6689,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         "WeLM deferred target K-norm has no relocated route for "
                         f"layer {layer_id}: {name}"
                     )
-                if is_pruned_layer or name.startswith("model.norm.") or name.startswith(
-                    "lm_head."
+                if (
+                    is_pruned_layer
+                    or name.startswith("model.norm.")
+                    or name.startswith("lm_head.")
                 ):
                     continue
             if (

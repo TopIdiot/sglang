@@ -8,66 +8,12 @@ Covers all usage patterns found in welmv4.py:
 """
 
 import itertools
-import os
 import unittest
-from unittest import mock
 
 import torch
 
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.welmv4_op import (
-    WELM_QKV_DIRECT_MAX_ROWS,
-    WelmV4FusedRMSNorm,
-    welm_rmsnorm_use_pdl,
-)
-
-
-class TestWelmRMSNormPDLDispatch(unittest.TestCase):
-    _FEATURE_ON = {
-        "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "1",
-        "SGLANG_WELM_RMSNORM_PDL": "1",
-    }
-
-    def test_large_m_boundary_tracks_mk(self):
-        if WELM_QKV_DIRECT_MAX_ROWS is None:
-            self.skipTest("matching MK route metadata is unavailable")
-        with mock.patch.dict(os.environ, self._FEATURE_ON):
-            self.assertFalse(welm_rmsnorm_use_pdl(WELM_QKV_DIRECT_MAX_ROWS))
-            self.assertTrue(welm_rmsnorm_use_pdl(WELM_QKV_DIRECT_MAX_ROWS + 1))
-
-    def test_kill_switch_disables_both_routes(self):
-        large_rows = (
-            WELM_QKV_DIRECT_MAX_ROWS + 1
-            if WELM_QKV_DIRECT_MAX_ROWS is not None
-            else 16384
-        )
-        with mock.patch.dict(
-            os.environ,
-            {
-                "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "1",
-                "SGLANG_WELM_RMSNORM_PDL": "0",
-            },
-        ):
-            self.assertFalse(welm_rmsnorm_use_pdl(1))
-            self.assertFalse(welm_rmsnorm_use_pdl(large_rows))
-
-    def test_feature_gate_disables_pdl(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "SGLANG_WELM_V45_80A3_FUSED_PRE_ATTN": "0",
-                "SGLANG_WELM_RMSNORM_PDL": "1",
-            },
-        ):
-            self.assertFalse(welm_rmsnorm_use_pdl(1))
-            self.assertFalse(welm_rmsnorm_use_pdl(16384))
-
-    def test_missing_mk_metadata_disables_only_large_m_pdl(self):
-        with mock.patch.dict(os.environ, self._FEATURE_ON), mock.patch(
-            "sglang.srt.layers.welmv4_op.WELM_QKV_DIRECT_MAX_ROWS", None
-        ):
-            self.assertTrue(welm_rmsnorm_use_pdl(1))
-            self.assertFalse(welm_rmsnorm_use_pdl(16384))
+from sglang.srt.layers.welmv4_op import WelmV4FusedRMSNorm
 
 
 class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
@@ -242,9 +188,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
     #    Mimics: input_layernorm(hidden_states, residual,
     #            residual_after_layernorm=True)  (ppln mode)
     # ------------------------------------------------------------------
-    def _run_residual_after_layernorm(
-        self, num_tokens, hidden_size, dtype, eps, seed
-    ):
+    def _run_residual_after_layernorm(self, num_tokens, hidden_size, dtype, eps, seed):
         torch.manual_seed(seed)
         ref, fused = self._make_shared_modules(hidden_size, eps)
 
@@ -380,9 +324,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
             rtol=1e-2,
             msg="clone_fp32_out: fp32 copy should match the normed output in float32",
         )
-        ref_fp32 = self._reference_rmsnorm(
-            (x + residual).float(), fused.weight, eps
-        )
+        ref_fp32 = self._reference_rmsnorm((x + residual).float(), fused.weight, eps)
         torch.testing.assert_close(
             fp32_out,
             ref_fp32,
@@ -420,9 +362,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
 
         with torch.inference_mode():
             ref_out = ref.forward_native(x.clone())
-            fused_out, _, fp32_out = fused.forward_cuda(
-                x.clone(), clone_fp32_out=True
-            )
+            fused_out, _, fp32_out = fused.forward_cuda(x.clone(), clone_fp32_out=True)
 
         torch.testing.assert_close(
             fused_out,
@@ -567,9 +507,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
     # ------------------------------------------------------------------
     # 12) Full pipeline: residual + clone_fp32_out + residual_after_layernorm
     # ------------------------------------------------------------------
-    def _run_full_combo(
-        self, num_tokens, hidden_size, dtype, residual_after_layernorm
-    ):
+    def _run_full_combo(self, num_tokens, hidden_size, dtype, residual_after_layernorm):
         torch.manual_seed(0)
         ref, fused = self._make_shared_modules(hidden_size, eps=1e-6)
 
@@ -645,9 +583,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
 
                 scale = 1 / (2 * hidden_size)
                 x = (
-                    torch.randn(
-                        num_tokens, hidden_size, dtype=dtype, device="cuda"
-                    )
+                    torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
                     * scale
                 )
                 residual = None
@@ -674,15 +610,24 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
                     )
 
                 torch.testing.assert_close(
-                    fused_h1, ref_h1, atol=1e-2, rtol=1e-2,
+                    fused_h1,
+                    ref_h1,
+                    atol=1e-2,
+                    rtol=1e-2,
                     msg="chained layer 1 output mismatch",
                 )
                 torch.testing.assert_close(
-                    fused_h2, ref_h2, atol=1e-2, rtol=1e-2,
+                    fused_h2,
+                    ref_h2,
+                    atol=1e-2,
+                    rtol=1e-2,
                     msg="chained layer 2 output mismatch",
                 )
                 torch.testing.assert_close(
-                    fused_r2, ref_r2, atol=1e-2, rtol=1e-2,
+                    fused_r2,
+                    ref_r2,
+                    atol=1e-2,
+                    rtol=1e-2,
                     msg="chained layer 2 residual mismatch",
                 )
 
@@ -720,9 +665,7 @@ class TestWelmV4FusedRMSNormVsRMSNorm(unittest.TestCase):
             self.assertEqual(out2[0].shape, (num_tokens, hidden_size))
             self.assertEqual(out2[1].shape, (num_tokens, hidden_size))
 
-            out3 = fused.forward_cuda(
-                x.clone(), residual.clone(), clone_fp32_out=True
-            )
+            out3 = fused.forward_cuda(x.clone(), residual.clone(), clone_fp32_out=True)
             self.assertEqual(len(out3), 3)
             self.assertEqual(out3[0].shape, (num_tokens, hidden_size))
             self.assertEqual(out3[1].shape, (num_tokens, hidden_size))

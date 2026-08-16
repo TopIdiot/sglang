@@ -7,7 +7,36 @@ from sglang.srt.speculative.welmv4_mtp_staging import (
     pack_welm_mtp_graph_inputs,
     pack_welm_mtp_linear_graph_outputs,
     pack_welm_mtp_verify_handoff,
+    translate_welm_mtp_cache_loc,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_translate_welm_mtp_cache_loc_is_cuda_graph_replayable():
+    full_cache_loc = torch.tensor([7, 0, -1, 3], dtype=torch.int64, device="cuda")
+    full_to_swa = torch.arange(128, dtype=torch.int64, device="cuda") + 100
+    full_to_swa[-1] = -1
+    swa_cache_loc = torch.empty(4, dtype=torch.int32, device="cuda")
+
+    graph = torch.cuda.CUDAGraph()
+    translate_welm_mtp_cache_loc(
+        full_cache_loc=full_cache_loc,
+        full_to_swa=full_to_swa,
+        swa_cache_loc=swa_cache_loc,
+    )
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        translate_welm_mtp_cache_loc(
+            full_cache_loc=full_cache_loc,
+            full_to_swa=full_to_swa,
+            swa_cache_loc=swa_cache_loc,
+        )
+
+    full_cache_loc.copy_(torch.tensor([2, 5, -1, 0], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert swa_cache_loc.cpu().tolist() == [102, 105, -1, 100]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

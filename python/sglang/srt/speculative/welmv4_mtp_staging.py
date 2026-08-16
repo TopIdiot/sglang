@@ -8,6 +8,49 @@ import triton.language as tl
 
 
 @triton.jit
+def _translate_cache_loc_kernel(
+    full_cache_loc,
+    full_to_swa,
+    swa_cache_loc,
+    num_tokens,
+    mapping_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_tokens
+    full_loc = tl.load(full_cache_loc + offsets, mask=mask, other=0).to(tl.int64)
+    full_loc = tl.where(full_loc < 0, full_loc + mapping_size, full_loc)
+    swa_loc = tl.load(full_to_swa + full_loc, mask=mask, other=0)
+    tl.store(swa_cache_loc + offsets, swa_loc, mask=mask)
+
+
+def translate_welm_mtp_cache_loc(
+    *,
+    full_cache_loc: torch.Tensor,
+    full_to_swa: torch.Tensor,
+    swa_cache_loc: torch.Tensor,
+) -> None:
+    """Translate fixed proposal-graph cache locations with one graphable launch."""
+    num_tokens = int(full_cache_loc.numel())
+    if num_tokens == 0:
+        return
+    if int(swa_cache_loc.numel()) != num_tokens:
+        raise ValueError("Full and SWA cache-location buffers must have equal size.")
+    if swa_cache_loc.dtype != torch.int32:
+        raise ValueError("The SWA cache-location buffer must use torch.int32.")
+    block_size = 256
+    _translate_cache_loc_kernel[(triton.cdiv(num_tokens, block_size),)](
+        full_cache_loc,
+        full_to_swa,
+        swa_cache_loc,
+        num_tokens,
+        int(full_to_swa.numel()),
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _pack_graph_inputs_kernel(
     input_ids,
     out_cache_loc,

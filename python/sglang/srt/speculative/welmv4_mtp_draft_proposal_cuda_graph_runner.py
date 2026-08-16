@@ -86,10 +86,12 @@ class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     first_input_ids: torch.Tensor
     req_pool_indices: torch.Tensor
     out_cache_loc: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     hidden_states: torch.Tensor
     mirrored_kv_indices: Optional[torch.Tensor]
+    identity_indices: torch.Tensor
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -163,8 +165,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.use_token_owner = model_runner.server_args.enable_token_owner
         self.use_token_owner_deepep = (
-            self.use_token_owner
-            and get_speculative_moe_a2a_backend().is_deepep()
+            self.use_token_owner and get_speculative_moe_a2a_backend().is_deepep()
         )
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
@@ -323,6 +324,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
             first_input_ids = torch.zeros((self.max_bs,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            out_cache_loc_swa = (
+                torch.zeros((self.max_num_token,), dtype=torch.int32)
+                if self.model_runner.is_hybrid_swa
+                else None
+            )
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             hidden_states = torch.zeros(
@@ -330,6 +336,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 dtype=self.model_runner.dtype,
             )
             mirrored_kv_indices = torch.arange(self.max_num_token, dtype=torch.int64)
+            identity_indices = torch.arange(self.max_num_token, dtype=torch.int64)
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -532,9 +539,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
             num_token_non_padded = (
-                torch.zeros((1,), dtype=torch.int32)
-                if self.use_token_owner
-                else None
+                torch.zeros((1,), dtype=torch.int32) if self.use_token_owner else None
             )
 
             self.welm_mtp_mirror_padding_index = self.max_num_token
@@ -550,15 +555,13 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 GPU_MEMORY_TYPE_KV_CACHE
             ):
                 for layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
+                    packed_kv = torch.zeros(
+                        (self.welm_mtp_mirror_kv_len, 2 * kv_size),
+                        dtype=self.model_runner.dtype,
+                    )
                     self.welm_mtp_mirror_kv_states[layer_idx] = (
-                        torch.zeros(
-                            (self.welm_mtp_mirror_kv_len, kv_size),
-                            dtype=self.model_runner.dtype,
-                        ),
-                        torch.zeros(
-                            (self.welm_mtp_mirror_kv_len, kv_size),
-                            dtype=self.model_runner.dtype,
-                        ),
+                        packed_kv[:, :kv_size],
+                        packed_kv[:, kv_size:],
                     )
 
         seq_lens_cpu = torch.full(
@@ -570,10 +573,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
             first_input_ids=first_input_ids,
             req_pool_indices=req_pool_indices,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             hidden_states=hidden_states,
             mirrored_kv_indices=mirrored_kv_indices,
+            identity_indices=identity_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
@@ -619,6 +624,32 @@ class WelmMTPDraftProposalCudaGraphRunner:
             num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
+
+        from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
+            welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
+        )
+
+        welm_qkv_prepared = 0
+        if welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled():
+            from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2 import (
+                prepare_welm_v45_80a3_h2048_hd256_nextn_pre_attn_v2_cuda_graphs,
+            )
+
+            welm_qkv_prepared = (
+                prepare_welm_v45_80a3_h2048_hd256_nextn_pre_attn_v2_cuda_graphs(
+                    self.model_runner,
+                    self.buffers,
+                    self.capture_bs,
+                    self.num_tokens_per_bs,
+                    self.welm_mtp_mirror_kv_states,
+                )
+            )
+        if welm_qkv_prepared:
+            logger.info(
+                "Prepared %d WeLM v4.5 80A3 H2048/HD256 NextN Pre-Attn V2 "
+                "CUDA graph operations.",
+                welm_qkv_prepared,
+            )
 
         try:
             with model_capture_mode():
@@ -1589,6 +1620,11 @@ class WelmMTPDraftProposalCudaGraphRunner:
         first_input_ids = buffers.first_input_ids[:bs]
         req_pool_indices = buffers.req_pool_indices[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = (
+            None
+            if buffers.out_cache_loc_swa is None
+            else buffers.out_cache_loc_swa[:num_tokens]
+        )
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
@@ -1670,6 +1706,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=int(fill_value) * bs,
             return_logprob=False,
             positions=positions,
@@ -1691,6 +1728,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         forward_batch.custom_last_index = custom_last_index
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
+        forward_batch.welm_mtp_identity_indices = buffers.identity_indices
         forward_batch._welm_force_low_latency_deepep = self.use_token_owner_deepep
         if self.distributed_topk:
             forward_batch.welm_mtp_distributed_topk = self.sampling_topk
@@ -1790,6 +1828,18 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
 
         def run_once():
+            if out_cache_loc_swa is not None:
+                from sglang.srt.speculative.welmv4_mtp_staging import (
+                    translate_welm_mtp_cache_loc,
+                )
+
+                translate_welm_mtp_cache_loc(
+                    full_cache_loc=out_cache_loc,
+                    full_to_swa=(
+                        self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                    ),
+                    swa_cache_loc=out_cache_loc_swa,
+                )
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             if global_num_tokens is not None:
                 global_num_tokens.fill_(num_tokens)
@@ -1842,9 +1892,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return out
 
-        self.deepep_adapter.capture(
-            is_extend_in_batch=not self.use_token_owner_deepep
-        )
+        self.deepep_adapter.capture(is_extend_in_batch=not self.use_token_owner_deepep)
+        if out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
         self._capture_init(run_once)
         contracted_rows = getattr(
             forward_batch, "_welm_mtp_contracted_dp_metadata_rows", None

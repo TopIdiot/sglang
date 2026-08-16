@@ -509,9 +509,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if src is None:
                     continue
                 shape = pp_proxy_tensors.tensors.get(f"{key}.shape")
-                if (
-                    shape is not None
-                    and key.startswith(f"{WELM_KV_MIRROR_PP_KEY_PREFIX}.")
+                if shape is not None and key.startswith(
+                    f"{WELM_KV_MIRROR_PP_KEY_PREFIX}."
                 ):
                     dim = _welm_kv_mirror_packed_len(math.prod(shape))
                     src = src.view(-1)[:dim]
@@ -1016,9 +1015,7 @@ class CudaGraphRunner:
                 )
                 or is_scale_seq_pseudo_tv
             )
-            and should_use_welm_oe_hash_kernel(
-                self.model_runner.model_config
-            )
+            and should_use_welm_oe_hash_kernel(self.model_runner.model_config)
         ):
             oe_grams, oe_vocab_sizes = get_welm_oe_hash_config(
                 self.model_runner.model_config
@@ -1038,7 +1035,8 @@ class CudaGraphRunner:
         welm_oe_fused_max_bs = 0
         welm_oe_fused_hidden_size = 0
         _welm_eligibility_gates = {
-            "welm_oe_decode_hash_config_set": self.welm_oe_decode_hash_config is not None,
+            "welm_oe_decode_hash_config_set": self.welm_oe_decode_hash_config
+            is not None,
             "num_tokens_per_bs_eq_1": self.num_tokens_per_bs == 1,
             "no_dp_attention": not self.model_runner.server_args.enable_dp_attention,
             "no_pdmux": not getattr(
@@ -1056,10 +1054,8 @@ class CudaGraphRunner:
 
             if should_use_welm_oe_fused_decode_gemm():
                 try:
-                    self._welm_oe_fused_config = (
-                        discover_welm_oe_fused_decode_modules(
-                            self.model_runner.model
-                        )
+                    self._welm_oe_fused_config = discover_welm_oe_fused_decode_modules(
+                        self.model_runner.model
                     )
                 except Exception as exc:  # defensive: discovery failures fall back
                     logger.warning(
@@ -1095,7 +1091,8 @@ class CudaGraphRunner:
             if (
                 # Only log when the env is set — non-WeLM deployments don't
                 # need to see this.
-                self.welm_oe_decode_hash_config is not None
+                self.welm_oe_decode_hash_config
+                is not None
             ):
                 logger.info(
                     "WeLM OE fused-decode: cuda-graph prepared path skipped "
@@ -1149,32 +1146,33 @@ class CudaGraphRunner:
         )
         self.buffers.share_buffers()
 
-        from sglang.srt.models.welm_v45_80a3_fused_pre_attn_config import (
-            welm_v45_80a3_fused_pre_attn_enabled,
+        from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
+            welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
         )
 
         welm_qkv_prepared = 0
-        if welm_v45_80a3_fused_pre_attn_enabled():
-            from sglang.srt.models.welm_v45_80a3_fused_pre_attn import (
-                prepare_welm_v45_80a3_fused_pre_attn_cuda_graphs,
+        if welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled():
+            from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2 import (
+                prepare_welm_v45_80a3_h2048_hd256_pre_attn_v2_cuda_graphs,
             )
 
-            welm_qkv_prepared = prepare_welm_v45_80a3_fused_pre_attn_cuda_graphs(
-                self.model_runner,
-                self.buffers,
-                self.capture_bs,
-                self.num_tokens_per_bs,
+            welm_qkv_prepared = (
+                prepare_welm_v45_80a3_h2048_hd256_pre_attn_v2_cuda_graphs(
+                    self.model_runner,
+                    self.buffers,
+                    self.capture_bs,
+                    self.num_tokens_per_bs,
+                )
             )
         if welm_qkv_prepared:
             logger.info(
-                "Prepared %d WeLM v4.5 80A3 fused pre-attention CUDA graph "
-                "handles.",
+                "Prepared %d WeLM v4.5 80A3 H2048/HD256 Pre-Attn V2 "
+                "CUDA graph operations.",
                 welm_qkv_prepared,
             )
 
-        # Build per-bucket Prepared mk handles BEFORE capture. mk's prepare
-        # does symm-mem rendezvous + workspace allocation; both must happen
-        # outside ``torch.cuda.graph(...)`` capture.
+        # Build the OE-fusion handles before capture. This path performs a
+        # symmetric-memory rendezvous and creates capture-stable resources.
         if (
             self._welm_oe_fused_eligible
             and self._welm_oe_fused_config is not None
@@ -1240,9 +1238,7 @@ class CudaGraphRunner:
             getattr(self.attn_backend, "is_attn_cp_sharded_kv", False)
         )
         full_context_fallback_bs = self._build_full_context_fallback_batch_sizes()
-        skew_bucket_bs = self._build_skew_bucket_batch_sizes(
-            full_context_fallback_bs
-        )
+        skew_bucket_bs = self._build_skew_bucket_batch_sizes(full_context_fallback_bs)
         values: Dict[int, List[int]] = {}
         prev_bs = 0
         # AttnCP sharded-KV selects a CUDA graph by max(seq_lens), while KV
@@ -1277,11 +1273,7 @@ class CudaGraphRunner:
                 buckets.append(buckets[-1] * 2)
             if buckets[-1] != cap:
                 buckets.append(cap)
-            if (
-                is_attn_cp_sharded_kv
-                and bs_int in skew_bucket_bs
-                and skew_cap > cap
-            ):
+            if is_attn_cp_sharded_kv and bs_int in skew_bucket_bs and skew_cap > cap:
                 buckets.append(skew_cap)
             if is_attn_cp_sharded_kv and bs_int in full_context_fallback_bs:
                 buckets.append(max_seq_cap)
@@ -1346,9 +1338,7 @@ class CudaGraphRunner:
     ) -> int:
         if page_size <= 1:
             return int(seq_len)
-        aligned = max(
-            1, ((int(seq_len) + page_size - 1) // page_size) * page_size
-        )
+        aligned = max(1, ((int(seq_len) + page_size - 1) // page_size) * page_size)
         if max_seq_cap is not None:
             aligned = min(aligned, int(max_seq_cap))
         return aligned
@@ -1499,9 +1489,7 @@ class CudaGraphRunner:
                 max_seq_len = int(seq_lens_cpu.max().item())
             else:
                 max_seq_len = int(max(seq_lens_cpu))
-        graph_bs, seq_len_bucket = self._select_graph_shape(
-            cuda_graph_bs, max_seq_len
-        )
+        graph_bs, seq_len_bucket = self._select_graph_shape(cuda_graph_bs, max_seq_len)
 
         if forward_batch.return_logprob and getattr(
             attn_backend, "is_attn_cp_sharded_kv", False
@@ -1742,9 +1730,7 @@ class CudaGraphRunner:
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        self._prepare_seq_lens_for_capture(
-            seq_lens, seq_lens_cpu, seq_len_fill_value
-        )
+        self._prepare_seq_lens_for_capture(seq_lens, seq_lens_cpu, seq_len_fill_value)
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -1778,9 +1764,7 @@ class CudaGraphRunner:
             )
 
         capture_global_num_tokens_cpu = (
-            [num_tokens] * self.dp_size
-            if self.use_token_owner
-            else None
+            [num_tokens] * self.dp_size if self.use_token_owner else None
         )
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -1818,7 +1802,9 @@ class CudaGraphRunner:
             global_dp_buffer_len = None
         router_replay_num_tokens = num_tokens
         if self.require_gathered_buffer:
-            router_replay_num_tokens = num_tokens * buffers.global_num_tokens_gpu.numel()
+            router_replay_num_tokens = (
+                num_tokens * buffers.global_num_tokens_gpu.numel()
+            )
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -1926,9 +1912,9 @@ class CudaGraphRunner:
             and num_tokens <= 32
         ):
             forward_batch.welm_oe_fused_prepared = prepared_handle
-            forward_batch.welm_oe_fused_output = (
-                buffers.welm_oe_fused_decode_output[:num_tokens]
-            )
+            forward_batch.welm_oe_fused_output = buffers.welm_oe_fused_decode_output[
+                :num_tokens
+            ]
             use_welm_oe_fused_prepared = True
         else:
             forward_batch.welm_oe_fused_prepared = None
@@ -2191,9 +2177,9 @@ class CudaGraphRunner:
                 )
                 raise
             forward_batch.welm_oe_fused_prepared = prepared_handle
-            forward_batch.welm_oe_fused_output = (
-                buffers.welm_oe_fused_decode_output[:bs]
-            )
+            forward_batch.welm_oe_fused_output = buffers.welm_oe_fused_decode_output[
+                :bs
+            ]
         elif (
             self.welm_oe_decode_hash_config is not None
             and buffers.welm_oe_decode_hashed_inputs is not None
