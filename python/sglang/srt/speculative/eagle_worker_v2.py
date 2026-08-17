@@ -3980,6 +3980,12 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.server_args.enable_token_owner
                 or not is_idle_decode
                 or self.cuda_graph_runner_for_draft_proposal is not None
+                # With DP attention, idle ranks must run the same merged
+                # draft loop as decode ranks: the loop contracts the DP token
+                # metadata per MTP step, and an idle rank on the legacy path
+                # keeps the padded scheduler counts, so the two groups size
+                # their logits collectives differently and deadlock.
+                or self.server_args.enable_dp_attention
                 or self.topk > 1
             )
         ):

@@ -47,6 +47,13 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.attention.cp_sharded_kv import (
+    CPPrefillKVGatherPlan,
+    CPPrefillKVSourcePushPlan,
+    CPPrefillSWAKVGatherPlan,
+    build_cp_prefill_kv_gather_plan,
+    build_cp_prefill_kv_source_push_plan,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -55,13 +62,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
-)
-from sglang.srt.layers.attention.cp_sharded_kv import (
-    CPPrefillKVGatherPlan,
-    CPPrefillKVSourcePushPlan,
-    CPPrefillSWAKVGatherPlan,
-    build_cp_prefill_kv_gather_plan,
-    build_cp_prefill_kv_source_push_plan,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -352,14 +352,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
-    attn_cp_prefill_split_specs: Optional[
-        Tuple[Optional[CPPrefillSplitSpec], ...]
-    ] = None
+    attn_cp_prefill_split_specs: Optional[Tuple[Optional[CPPrefillSplitSpec], ...]] = (
+        None
+    )
     attn_cp_prefill_runtime_layout: Optional[CPPrefillRuntimeLayout] = None
     attn_cp_prefill_kv_gather_plan: Optional[CPPrefillKVGatherPlan] = None
-    attn_cp_prefill_kv_source_push_plan: Optional[
-        CPPrefillKVSourcePushPlan
-    ] = None
+    attn_cp_prefill_kv_source_push_plan: Optional[CPPrefillKVSourcePushPlan] = None
     attn_cp_prefill_swa_kv_gather_plans: Optional[
         Dict[tuple, CPPrefillSWAKVGatherPlan]
     ] = None
@@ -1227,18 +1225,50 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
-            hidden_states_num_tokens = num_tokens
+            hidden = spec_info.hidden_states
             if (
                 getattr(self, "welm_mtp_merge_kv_fill_draft", False)
-                and spec_info.hidden_states is not None
-                and spec_info.hidden_states.shape[0] == self.batch_size
+                and hidden is not None
+                and int(getattr(self, "mtp_step_idx", 0)) > 0
             ):
-                # Merged WeLM MTP uses token rows to fill KV, but step>0 main
-                # hidden states are already contracted to one row per request.
-                hidden_states_num_tokens = bs
-            spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, hidden_states_num_tokens
-            )
+                # Merged WeLM MTP fills KV with token rows at step 0, while
+                # step>0 main hidden states carry one row per request that
+                # must land on the query rows (custom_last_index) inside the
+                # padded fill layout. Row count cannot distinguish the two
+                # cases: when every request accepts exactly one token, step-0
+                # token rows equal the batch size, so keying on rows skipped
+                # the step-0 padding and fed the MTP projector mismatched row
+                # domains (sglang issue #4).
+                if hidden.shape[0] < num_tokens:
+                    custom_last_index = getattr(self, "custom_last_index", None)
+                    if (
+                        custom_last_index is None
+                        or int(custom_last_index.numel()) != hidden.shape[0]
+                    ):
+                        raise RuntimeError(
+                            "Merged WeLM MTP step>0 hidden padding requires one "
+                            "custom_last_index entry per request: "
+                            f"rows={hidden.shape[0]}, "
+                            f"custom_last_index={custom_last_index}."
+                        )
+                    padded = hidden.new_zeros((num_tokens, *hidden.shape[1:]))
+                    padded[custom_last_index.to(torch.long)] = hidden
+                    spec_info.hidden_states = padded
+            else:
+                spec_info.hidden_states = self._pad_tensor_to_size(hidden, num_tokens)
+            mirrored_kv_indices = getattr(spec_info, "mirrored_kv_indices", None)
+            if (
+                getattr(self, "welm_mtp_merge_kv_fill_draft", False)
+                and mirrored_kv_indices is not None
+                and mirrored_kv_indices.shape[0] < num_tokens
+            ):
+                # Mirrored-KV row selection must also follow the padded token
+                # rows: pad rows read mirror row 0 and their store lands in
+                # the reserved padding cache slot, mirroring the graph
+                # runner's dedicated mirror padding index.
+                spec_info.mirrored_kv_indices = self._pad_tensor_to_size(
+                    mirrored_kv_indices, num_tokens
+                )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1255,9 +1285,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def post_forward_mlp_sync_batch(
         self,
-        logits_output: Union[
-            LogitsProcessorOutput, WelmDeferredPrefillCompletion
-        ],
+        logits_output: Union[LogitsProcessorOutput, WelmDeferredPrefillCompletion],
     ):
 
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)

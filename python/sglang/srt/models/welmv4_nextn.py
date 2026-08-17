@@ -37,6 +37,7 @@ from sglang.srt.models.welmv4 import (
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
     _get_welm_kv_mirror_states,
+    _welm_idle_has_contracting_peer,
     _welm_init_kv_mirror_last_q_indices,
     _welm_prepare_kv_mirror_logits_states,
     _welm_scatter_kv_mirror_rows,
@@ -56,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 def _welm_mtp_trace(message: str) -> None:
     if os.environ.get("SGLANG_WELM_MTP_TRACE", "0") == "1":
-        logger.warning(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
+        print(f"[WELM_MTP_TRACE pid={os.getpid()}] {message}", flush=True)
 
 
 _is_cuda = is_cuda()
@@ -725,7 +726,13 @@ class WeLMV4ModelNextN(nn.Module):
             forward_batch.forward_mode.is_idle()
             and forward_batch.is_extend_in_batch
             and main_hidden_states is not None
+            and _welm_idle_has_contracting_peer(forward_batch)
         ):
+            # Contract at model entry only when non-idle peers contract at
+            # entry too (KV-mirror prefill rounds). In merged draft-extend
+            # rounds the decode ranks contract after the layer, so an idle
+            # rank contracting here would size the layer collectives with
+            # request counts while its peers still use the padded counts.
             _welm_update_contracted_dp_metadata(
                 forward_batch,
                 hidden_states.shape[0],
@@ -912,6 +919,17 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 else None
             )
             previous_pruned = None
+            _welm_mtp_trace(
+                "wrapper_branch "
+                f"contract={_welm_should_contract_kv_mirror(forward_batch)} "
+                f"flags={getattr(forward_batch, 'welm_kv_mirror_contract_flags', None)} "
+                f"local_flag={getattr(forward_batch, '_welm_local_kv_mirror_contract_enabled', None)} "
+                f"mode={forward_batch.forward_mode} "
+                f"hidden={tuple(hidden_states.shape)} "
+                f"custom_last={None if getattr(forward_batch, 'custom_last_index', None) is None else int(forward_batch.custom_last_index.numel())} "
+                f"merge={getattr(forward_batch, 'welm_mtp_merge_kv_fill_draft', False)} "
+                f"contracted={getattr(forward_batch, 'welm_kv_mirror_contracted', False)}"
+            )
             if _welm_should_contract_kv_mirror(forward_batch):
                 hidden_states, aux_hidden_states = (
                     _welm_prepare_kv_mirror_logits_states(
@@ -936,9 +954,12 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                         ]
             elif getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False):
                 custom_last_index = getattr(forward_batch, "custom_last_index", None)
-                if (
-                    custom_last_index is not None
-                    and hidden_states.shape[0] != custom_last_index.numel()
+                if custom_last_index is not None and (
+                    hidden_states.shape[0] != custom_last_index.numel()
+                    # Idle ranks carry zero rows on both sides but must still
+                    # contract here, in the same phase as their decode peers,
+                    # to keep the logits collectives size-matched.
+                    or forward_batch.forward_mode.is_idle()
                 ):
                     if aux_hidden_states is None:
                         raise RuntimeError(

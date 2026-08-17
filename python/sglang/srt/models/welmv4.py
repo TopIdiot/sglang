@@ -50,6 +50,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attntp_fused_norm import (
     get_or_create_attntp_fused_norm_manager,
+    get_prefill_cp_attntp_fused_norm_manager,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -96,9 +97,6 @@ from sglang.srt.layers.moe.mk_moe_router import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.prefill_cp_logits import route_cp_prefill_hidden_states
-from sglang.srt.layers.attntp_fused_norm import (
-    get_prefill_cp_attntp_fused_norm_manager,
-)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
@@ -143,12 +141,12 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_oe_embedding,
     welm_embeddings,
 )
+from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
+    welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
+)
 from sglang.srt.models.welmv4_token_owner import (
     WeLMTokenOwnerRuntime,
     welm_token_owner_enabled,
-)
-from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
-    welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
 )
 from sglang.srt.server_args import (
     MAX_AUTO_RUNNING_REQUESTS,
@@ -756,6 +754,14 @@ def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
     # MTP draft proposal graph) always run the un-contracted path.
     forward_batch._welm_kv_mirror_pad_contract_safe = safe
     return safe
+
+
+def _welm_idle_has_contracting_peer(forward_batch: ForwardBatch) -> bool:
+    """Whether any DP peer contracts its rows at model entry this round."""
+    contract_flags = getattr(forward_batch, "welm_kv_mirror_contract_flags", None)
+    if contract_flags is None:
+        return True
+    return bool(any(contract_flags))
 
 
 def _welm_should_contract_kv_mirror(forward_batch: ForwardBatch) -> bool:
@@ -2057,6 +2063,16 @@ def _welm_update_contracted_dp_metadata(
         forward_batch.dp_padding_mode.is_max_len(),
         new_global_num_tokens,
     )
+    if os.environ.get("SGLANG_WELM_MTP_TRACE", "0") == "1":
+        print(
+            f"[WELM_MTP_TRACE pid={os.getpid()}] contracted_dp_metadata "
+            f"mode={forward_batch.forward_mode} local={new_local_num_tokens} "
+            f"tokens={forward_batch.global_num_tokens_cpu} "
+            f"logprob={forward_batch.global_num_tokens_for_logprob_cpu} "
+            f"buffer_len={global_dp_buffer_len} "
+            f"padding_mode={forward_batch.dp_padding_mode}",
+            flush=True,
+        )
     set_is_extend_in_batch(
         forward_batch.is_extend_in_batch
         and not getattr(forward_batch, "_welm_force_low_latency_deepep", False)
@@ -2976,10 +2992,18 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         )
         kv_activation = kv_mirror_states.get(pop_key)
         if kv_activation is None:
-            if (
-                getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
-                and _welm_should_contract_kv_mirror(forward_batch)
-                and _welm_kv_mirror_has_no_active_q(forward_batch)
+            merge_kv_fill_draft = getattr(
+                forward_batch, "welm_mtp_merge_kv_fill_draft", False
+            )
+            if merge_kv_fill_draft and (
+                # Idle ranks run the merged draft loop purely for collective
+                # alignment: no target verify ran, so there is no mirrored
+                # activation and no row consumes one.
+                forward_batch.forward_mode.is_idle()
+                or (
+                    _welm_should_contract_kv_mirror(forward_batch)
+                    and _welm_kv_mirror_has_no_active_q(forward_batch)
+                )
             ):
                 kv_activation = (
                     hidden_states.new_empty((0, attn.kv_size)),
