@@ -111,7 +111,7 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 
 if _is_cuda or _is_musa:
-    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+    from sgl_kernel import top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
 _WELM_MTP_DUMP_ENABLED = os.environ.get(
@@ -1269,9 +1269,19 @@ class EagleDraftWorker(BaseDraftWorker):
         sampling_info = forward_batch.sampling_info
         return sampling_info is not None and not sampling_info.is_all_greedy
 
+    def _get_welmv4_mtp_draft_sampling_vocab_size(self) -> int:
+        """Width of the draft logits that draft sampling top-k operates on."""
+        model_config = self.draft_runner.model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        for attr in ("draft_vocab_size", "hot_vocab_size"):
+            value = getattr(hf_config, attr, None)
+            if value is not None:
+                return int(value)
+        return int(model_config.vocab_size)
+
     def _get_welmv4_mtp_draft_sampling_topk(self) -> int:
         raw = os.environ.get(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV)
-        vocab_size = int(self.draft_runner.model_config.vocab_size)
+        vocab_size = self._get_welmv4_mtp_draft_sampling_vocab_size()
         if raw is not None:
             value = int(raw)
             if not (0 < value < vocab_size):
@@ -1454,59 +1464,33 @@ class EagleDraftWorker(BaseDraftWorker):
         scaled_logits = logits.float() / temperature
         use_top_p = self._should_use_welmv4_mtp_draft_top_p(forward_batch)
         sampling_topk = self._get_welmv4_mtp_draft_sampling_topk()
-        vocab_size = int(scaled_logits.shape[-1])
 
-        if 0 < sampling_topk < vocab_size:
-            top_logits, top_indices = torch.topk(
-                scaled_logits,
-                k=sampling_topk,
-                dim=-1,
-                sorted=use_top_p,
-            )
-            probs = F.softmax(top_logits, dim=-1)
-            if use_top_p:
-                top_ps = self._get_welmv4_mtp_draft_top_p(forward_batch, top_logits)
-                probs = top_p_renorm_prob(probs, top_ps)
-
-            topk_p, topk_pos = self._sample_welmv4_mtp_probs_top1(
-                probs,
-                forward_batch,
-                base_positions=base_positions,
-                step=step,
-            )
-            topk_index = torch.gather(top_indices, dim=-1, index=topk_pos)
-            tp_group = (
-                get_attention_tp_group()
-                if is_dp_attention_enabled()
-                else get_tp_group()
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(topk_index, src=0)
-                topk_p = torch.gather(probs, dim=1, index=topk_pos)
-                tp_group.broadcast(topk_p, src=0)
-            return topk_p, topk_index, None, top_indices, probs
-
-        probs = F.softmax(scaled_logits, dim=-1)
-        if (
-            not self._has_welmv4_mtp_fixed_draft_sampling_params()
-            and getattr(sampling_info, "need_top_k_sampling", False)
-            and (_is_cuda or _is_musa)
-        ):
-            top_ks = self._expand_sampling_tensor_for_logits(
-                sampling_info.top_ks, logits
-            )
-            probs = top_k_renorm_prob(probs, top_ks)
+        top_logits, top_indices = torch.topk(
+            scaled_logits,
+            k=sampling_topk,
+            dim=-1,
+            sorted=use_top_p,
+        )
+        probs = F.softmax(top_logits, dim=-1)
         if use_top_p:
-            top_ps = self._get_welmv4_mtp_draft_top_p(forward_batch, logits)
+            top_ps = self._get_welmv4_mtp_draft_top_p(forward_batch, top_logits)
             probs = top_p_renorm_prob(probs, top_ps)
 
-        topk_p, topk_index = self._sample_welmv4_mtp_probs_top1(
+        topk_p, topk_pos = self._sample_welmv4_mtp_probs_top1(
             probs,
             forward_batch,
             base_positions=base_positions,
             step=step,
         )
-        return topk_p, topk_index, probs.contiguous(), None, None
+        topk_index = torch.gather(top_indices, dim=-1, index=topk_pos)
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(topk_index, src=0)
+            topk_p = torch.gather(probs, dim=1, index=topk_pos)
+            tp_group.broadcast(topk_p, src=0)
+        return topk_p, topk_index, None, top_indices, probs
 
     def _select_or_sample_welmv4_mtp_draft_topk(
         self,
@@ -2032,64 +2016,6 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         return counts
 
-    def _get_welmv4_mtp_local_row_dp_counts(
-        self,
-        forward_batch: ForwardBatch,
-        local_rows: int,
-    ) -> Optional[List[int]]:
-        if (
-            not is_dp_attention_enabled()
-            or getattr(forward_batch, "global_num_tokens_gpu", None) is None
-        ):
-            return None
-
-        num_dp_slots = int(forward_batch.global_num_tokens_gpu.numel())
-        if num_dp_slots <= 1:
-            return [int(local_rows)]
-        if get_is_capture_mode():
-            return None
-
-        tp_group = get_tp_group()
-        if tp_group.world_size % num_dp_slots != 0:
-            raise RuntimeError(
-                "WeLM MTP DP row-count gather expected the TP group size to be "
-                f"divisible by DP slots: tp_group={tp_group.world_size}, "
-                f"dp_slots={num_dp_slots}."
-            )
-
-        local_count = torch.tensor(
-            [int(local_rows)],
-            dtype=torch.int64,
-            device=forward_batch.global_num_tokens_gpu.device,
-        )
-        gathered_counts = torch.empty(
-            (tp_group.world_size,),
-            dtype=torch.int64,
-            device=local_count.device,
-        )
-        tp_group.all_gather_into_tensor(gathered_counts, local_count)
-        ranks_per_dp = tp_group.world_size // num_dp_slots
-        counts = (
-            gathered_counts.view(num_dp_slots, ranks_per_dp)
-            .max(dim=1)
-            .values.detach()
-            .cpu()
-            .tolist()
-        )
-
-        dp_rank = int(get_attention_dp_rank())
-        if not 0 <= dp_rank < num_dp_slots:
-            raise RuntimeError(
-                "WeLM MTP DP row-count gather got an invalid attention DP rank: "
-                f"dp_rank={dp_rank}, dp_slots={num_dp_slots}."
-            )
-        if counts[dp_rank] != int(local_rows):
-            raise RuntimeError(
-                "WeLM MTP DP row-count gather mismatch: "
-                f"dp_rank={dp_rank}, local_rows={local_rows}, counts={counts}."
-            )
-        return counts
-
     def _get_welmv4_mtp_step0_dp_token_counts(
         self,
         forward_batch: ForwardBatch,
@@ -2601,20 +2527,10 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             int(input_ids.numel()),
         )
-        variable_decode_token_counts = None
-        if getattr(forward_batch, "welm_mtp_variable_decode_extend", False):
-            variable_decode_token_counts = self._get_welmv4_mtp_local_row_dp_counts(
-                forward_batch,
-                int(forward_batch.extend_num_tokens),
-            )
-        step0_token_counts = (
-            variable_decode_token_counts
-            if variable_decode_token_counts is not None
-            else self._get_welmv4_mtp_step0_dp_token_counts(
-                forward_batch,
-                prefill_token_counts,
-                base_request_counts,
-            )
+        step0_token_counts = self._get_welmv4_mtp_step0_dp_token_counts(
+            forward_batch,
+            prefill_token_counts,
+            base_request_counts,
         )
 
         try:
@@ -4243,36 +4159,6 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.cuda_graph_runner_for_draft_proposal is not None
                     and self.cuda_graph_runner_for_draft_proposal.can_run(forward_batch)
                 )
-                use_variable_decode_extend = (
-                    self._should_sample_welmv4_mtp_draft(forward_batch)
-                    and self._get_welmv4_mtp_draft_sampling_topk() == 0
-                    and not can_cuda_graph
-                )
-                if use_variable_decode_extend and not is_idle_decode:
-                    previous_forward_batch = forward_batch
-                    batch.forward_mode = ForwardMode.EXTEND
-                    draft_input.num_tokens_per_req = 1
-                    draft_input.num_tokens_for_logprob_per_req = 1
-                    forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-                    self._copy_welmv4_mtp_oe_hash_inputs(
-                        previous_forward_batch, forward_batch
-                    )
-                    forward_batch.return_logprob = False
-                    forward_batch.welm_mtp_variable_decode_extend = True
-                    real_last_index = (
-                        torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-                    )
-                    forward_batch.custom_last_index = real_last_index
-                    if forward_batch.out_cache_loc is not None:
-                        forward_batch.custom_last_cache_loc = (
-                            forward_batch.out_cache_loc[real_last_index]
-                        )
-                    attn_backend = (
-                        self.draft_extend_attn_backend or self.draft_runner.attn_backend
-                    )
-                    forward_batch.attn_backend = attn_backend
-                elif use_variable_decode_extend:
-                    forward_batch.welm_mtp_variable_decode_extend = True
                 if is_idle_decode and not can_cuda_graph:
                     forward_batch.forward_mode = ForwardMode.IDLE
                 if not can_cuda_graph and not is_idle_decode:

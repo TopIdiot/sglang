@@ -31,7 +31,6 @@ from sglang.srt.models.welm_perf_opt import (
     compute_welm_local_embedding,
     compute_welm_oe_embedding,
 )
-from sglang.srt.models.welmv4_token_owner import WeLMTokenOwnerRuntime
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     Qwen2MoeSparseMoeBlock,
@@ -48,6 +47,7 @@ from sglang.srt.models.welmv4 import (
     welm_nextn_local_to_hf_name,
     welm_use_previous_precision,
 )
+from sglang.srt.models.welmv4_token_owner import WeLMTokenOwnerRuntime
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -742,6 +742,19 @@ class WeLMV4ModelNextN(nn.Module):
 
         proj = self._get_projector(mtp_step_idx)
         if hidden_states.shape[0] > 0:
+            main_rows = (
+                None if main_hidden_states is None else int(main_hidden_states.shape[0])
+            )
+            if main_rows != int(hidden_states.shape[0]):
+                raise RuntimeError(
+                    "WeLM MTP projector inputs must share the rank-local row "
+                    f"layout: embedding rows={int(hidden_states.shape[0])}, "
+                    f"main hidden rows={main_rows}, "
+                    f"mode={forward_batch.forward_mode}, "
+                    f"mtp_step={mtp_step_idx}, "
+                    "global_num_tokens="
+                    f"{getattr(forward_batch, 'global_num_tokens_cpu', None)}."
+                )
             enorm_output = proj.enorm(hidden_states)
             hnorm_output = proj.hnorm(main_hidden_states)
             _dump_tensor(f"model.mtp.{mtp_step_idx}.enorm", enorm_output)
@@ -862,9 +875,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        enable_token_owner = _welm_token_owner_enabled(
-            pp_size=self.pp_group.world_size
-        )
+        enable_token_owner = _welm_token_owner_enabled(pp_size=self.pp_group.world_size)
         self.token_owner_runtime = (
             WeLMTokenOwnerRuntime() if enable_token_owner else None
         )
@@ -915,8 +926,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 row_pad = getattr(forward_batch, "_welm_kv_mirror_row_pad", 0)
                 if (
                     row_pad > 0
-                    and hidden_states.shape[0]
-                    == forward_batch.kv_mirror_output_size
+                    and hidden_states.shape[0] == forward_batch.kv_mirror_output_size
                 ):
                     num_real_rows = forward_batch.kv_mirror_output_size - row_pad
                     hidden_states = hidden_states[:num_real_rows]

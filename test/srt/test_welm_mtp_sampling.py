@@ -193,3 +193,27 @@ def test_draft_sampling_topk_defaults_when_unset_or_invalid(monkeypatch):
     monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "1000")
     with pytest.raises(ValueError, match="must be in"):
         worker._get_welmv4_mtp_draft_sampling_topk()
+
+
+def test_draft_sampling_topk_bounded_by_draft_logits_width(monkeypatch):
+    from sglang.srt.speculative.eagle_worker_v2 import (
+        _WELM_MTP_DRAFT_SAMPLING_TOPK_ENV,
+        EagleDraftWorker,
+    )
+
+    worker = EagleDraftWorker.__new__(EagleDraftWorker)
+    worker.draft_runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            vocab_size=1000,
+            hf_config=SimpleNamespace(hot_vocab_size=100),
+        )
+    )
+
+    monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "20")
+    assert worker._get_welmv4_mtp_draft_sampling_topk() == 20
+
+    # K within the main vocab but beyond the hot-vocab logits width must be
+    # rejected: torch.topk over the draft logits cannot satisfy it.
+    monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "200")
+    with pytest.raises(ValueError, match="must be in"):
+        worker._get_welmv4_mtp_draft_sampling_topk()
