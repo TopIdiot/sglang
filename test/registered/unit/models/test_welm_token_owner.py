@@ -464,8 +464,7 @@ def test_welm_mtp_owner_graph_fails_fast_on_sampling_mode_mismatch():
     runner.use_dp_sampling_consensus = True
     runner.supports_draft_top_p = True
     runner.topk = 1
-    runner.sample_draft = True
-    runner.use_top_p = False
+    runner.graphs_by_mode = {(True, False): {}}
     runner.eagle_worker = SimpleNamespace(
         _is_welmv4_mtp_draft_sampling_enabled=lambda: True,
         welmv4_mtp_draft_fixed_top_p=None,
@@ -501,11 +500,9 @@ def test_welm_mtp_owner_graph_rejects_unexpected_fast_path_miss(
     runner.require_mlp_tp_gather = False
     runner.require_mlp_sync = True
     runner.disable_padding = False
-    runner.graphs = graphs
+    runner.graphs_by_mode = {(False, False): graphs}
     runner.max_bs = max_bs
     runner.num_tokens_per_bs = 4
-    runner.sample_draft = False
-    runner.use_top_p = False
     runner.use_dp_sampling_consensus = False
     runner.eagle_worker = SimpleNamespace(
         _should_sample_welmv4_mtp_draft=lambda _batch: False,
@@ -521,6 +518,76 @@ def test_welm_mtp_owner_graph_rejects_unexpected_fast_path_miss(
 
     with pytest.raises(RuntimeError, match=reason):
         runner.can_run(forward_batch)
+
+
+@pytest.mark.parametrize(
+    (
+        "enabled",
+        "topk",
+        "has_fixed_params",
+        "fixed_top_p",
+        "supports_top_p",
+        "expected_modes",
+    ),
+    [
+        (False, 1, False, None, True, [(False, False)]),
+        (True, 2, False, None, True, [(False, False)]),
+        (True, 1, True, 0.8, True, [(True, True)]),
+        (True, 1, True, 1.0, True, [(True, False)]),
+        (True, 1, True, 0.8, False, [(True, False)]),
+        (True, 1, True, None, True, [(True, False), (True, True)]),
+        (True, 1, True, None, False, [(True, False)]),
+        (True, 1, False, None, True, [(False, False), (True, False), (True, True)]),
+        (True, 1, False, None, False, [(False, False), (True, False)]),
+    ],
+)
+def test_welm_mtp_capture_sampling_modes_follow_policy(
+    enabled,
+    topk,
+    has_fixed_params,
+    fixed_top_p,
+    supports_top_p,
+    expected_modes,
+):
+    import sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner as mtp_graph
+
+    worker = SimpleNamespace(
+        _is_welmv4_mtp_draft_sampling_enabled=lambda: enabled,
+        _has_welmv4_mtp_fixed_draft_sampling_params=lambda: has_fixed_params,
+        welmv4_mtp_draft_fixed_top_p=fixed_top_p,
+    )
+
+    modes = mtp_graph._compute_capture_sampling_modes(
+        worker, topk=topk, supports_draft_top_p=supports_top_p
+    )
+
+    assert modes == expected_modes
+
+
+def test_welm_mtp_graph_activation_switches_family():
+    runner = WelmMTPDraftProposalCudaGraphRunner.__new__(
+        WelmMTPDraftProposalCudaGraphRunner
+    )
+    greedy_graphs, random_graphs = {1: object()}, {1: object()}
+    greedy_outputs, random_outputs = {1: object()}, {1: object()}
+    runner.graphs_by_mode = {
+        (False, False): greedy_graphs,
+        (True, False): random_graphs,
+    }
+    runner.output_buffers_by_mode = {
+        (False, False): greedy_outputs,
+        (True, False): random_outputs,
+    }
+
+    runner._activate_sampling_mode((True, False))
+    assert runner.sample_draft and not runner.use_top_p
+    assert runner.graphs is random_graphs
+    assert runner.output_buffers is random_outputs
+
+    runner._activate_sampling_mode((False, False))
+    assert not runner.sample_draft and not runner.use_top_p
+    assert runner.graphs is greedy_graphs
+    assert runner.output_buffers is greedy_outputs
 
 
 def test_welm_token_owner_aligns_mirror_residual_to_original_lane():

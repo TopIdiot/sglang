@@ -140,8 +140,7 @@ def test_persistent_handoff_requires_captured_sampling_mode():
     runner.capture_bs = [1]
     runner.num_tokens_per_bs = 5
     runner.use_dp_sampling_consensus = False
-    runner.sample_draft = False
-    runner.use_top_p = False
+    runner.graphs_by_mode = {(False, False): {}}
     runner.eagle_worker = SimpleNamespace(
         _should_sample_welmv4_mtp_draft=lambda batch: True,
         _should_use_welmv4_mtp_draft_top_p=lambda batch: runner.requires_top_p,
@@ -162,11 +161,35 @@ def test_persistent_handoff_requires_captured_sampling_mode():
 
     assert not runner.can_replay_from_verify(batch, batch_result)
 
-    runner.sample_draft = True
+    runner.graphs_by_mode[(True, False)] = {}
     assert runner.can_replay_from_verify(batch, batch_result)
 
     runner.requires_top_p = True
     assert not runner.can_replay_from_verify(batch, batch_result)
 
-    runner.use_top_p = True
+    runner.graphs_by_mode[(True, True)] = {}
     assert runner.can_replay_from_verify(batch, batch_result)
+
+
+def test_draft_sampling_topk_defaults_when_unset_or_invalid(monkeypatch):
+    from sglang.srt.speculative.eagle_worker_v2 import (
+        _WELM_MTP_DRAFT_SAMPLING_TOPK_ENV,
+        EagleDraftWorker,
+    )
+
+    worker = EagleDraftWorker.__new__(EagleDraftWorker)
+    worker.draft_runner = SimpleNamespace(model_config=SimpleNamespace(vocab_size=1000))
+
+    monkeypatch.delenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, raising=False)
+    assert worker._get_welmv4_mtp_draft_sampling_topk() == 8
+
+    monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "20")
+    assert worker._get_welmv4_mtp_draft_sampling_topk() == 20
+
+    monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "0")
+    with pytest.raises(ValueError, match="must be in"):
+        worker._get_welmv4_mtp_draft_sampling_topk()
+
+    monkeypatch.setenv(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "1000")
+    with pytest.raises(ValueError, match="must be in"):
+        worker._get_welmv4_mtp_draft_sampling_topk()

@@ -249,19 +249,16 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             WelmMTPDraftProposalCudaGraphRunner
         )
         runner.linear_verify_prepare = True
-        runner.fused_linear_graph_outputs = True
+        runner._fused_linear_graph_outputs_base = True
+        runner.sample_draft = True
         runner.max_bs = 4
         runner.num_tokens_per_bs = 4
         runner.buffers = SimpleNamespace(
             linear_verify_mask=torch.empty((4 * 4 * 4,), dtype=torch.bool),
             linear_verify_positions=torch.empty((4 * 4,), dtype=torch.int64),
             linear_verify_retrieve_index=torch.empty((4, 4), dtype=torch.int64),
-            linear_verify_retrieve_next_token=torch.empty(
-                (4, 4), dtype=torch.int64
-            ),
-            linear_verify_retrieve_next_sibling=torch.empty(
-                (4, 4), dtype=torch.int64
-            ),
+            linear_verify_retrieve_next_token=torch.empty((4, 4), dtype=torch.int64),
+            linear_verify_retrieve_next_sibling=torch.empty((4, 4), dtype=torch.int64),
             linear_verify_tokens=torch.empty((4 * 4,), dtype=torch.int64),
             linear_verify_hash_seq_lens=torch.empty((4,), dtype=torch.int32),
         )

@@ -130,6 +130,8 @@ _WELM_MTP_SAMPLE_DRAFT_ENV = "SGLANG_WELM_MTP_SAMPLE_DRAFT"
 _WELM_MTP_DRAFT_FIXED_TEMPERATURE_ENV = "SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE"
 _WELM_MTP_DRAFT_FIXED_TOP_P_ENV = "SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P"
 _WELM_MTP_DRAFT_SAMPLING_TOPK_ENV = "SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK"
+_WELM_MTP_DRAFT_SAMPLING_TOPK_DEFAULT = 8
+_warned_welm_mtp_draft_sampling_topk_default = False
 _WELM_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP = (
     os.environ.get("SGLANG_WELMV4_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP", "0")
     .strip()
@@ -1268,13 +1270,27 @@ class EagleDraftWorker(BaseDraftWorker):
         return sampling_info is not None and not sampling_info.is_all_greedy
 
     def _get_welmv4_mtp_draft_sampling_topk(self) -> int:
-        value = int(os.environ.get(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV, "0"))
-        if value <= 0:
-            return 0
+        raw = os.environ.get(_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV)
         vocab_size = int(self.draft_runner.model_config.vocab_size)
-        if value >= vocab_size:
-            return 0
-        return value
+        if raw is not None:
+            value = int(raw)
+            if not (0 < value < vocab_size):
+                raise ValueError(
+                    f"{_WELM_MTP_DRAFT_SAMPLING_TOPK_ENV} must be in "
+                    f"(0, {vocab_size}), got {raw}."
+                )
+            return value
+        global _warned_welm_mtp_draft_sampling_topk_default
+        if not _warned_welm_mtp_draft_sampling_topk_default:
+            _warned_welm_mtp_draft_sampling_topk_default = True
+            logger.warning(
+                "%s is unset; using the default WeLM MTP draft sampling "
+                "top-k %d. Draft sampling truncates candidates to this fixed "
+                "K on both the CUDA graph and eager paths.",
+                _WELM_MTP_DRAFT_SAMPLING_TOPK_ENV,
+                _WELM_MTP_DRAFT_SAMPLING_TOPK_DEFAULT,
+            )
+        return _WELM_MTP_DRAFT_SAMPLING_TOPK_DEFAULT
 
     @staticmethod
     def _expand_sampling_tensor_for_logits(
@@ -2482,9 +2498,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     draft_input.bonus_tokens,
                     entry_history_state,
                 )
-                draft_input.welm_mtp_oe_history_state = (
-                    first_query_verify_history_state
-                )
+                draft_input.welm_mtp_oe_history_state = first_query_verify_history_state
 
             self._run_welmv4_mtp_merged_extend_draft(
                 forward_batch,
@@ -3229,9 +3243,7 @@ class EagleDraftWorker(BaseDraftWorker):
             (_is_cuda or _is_musa)
             and (
                 isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-                or isinstance(
-                    self.draft_extend_attn_backend, TRTLLMHAAttnBackend
-                )
+                or isinstance(self.draft_extend_attn_backend, TRTLLMHAAttnBackend)
                 or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
             )
         )

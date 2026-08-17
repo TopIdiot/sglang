@@ -80,6 +80,32 @@ def _validate_dp_proposal_graph_consensus_config(
         )
 
 
+def _compute_capture_sampling_modes(
+    eagle_worker, *, topk: int, supports_draft_top_p: bool
+) -> list[tuple[bool, bool]]:
+    """Return every (sample_draft, use_top_p) mode the launch policy can require.
+
+    _required_draft_sampling_mode picks one of these per batch at replay time;
+    a mode missing from the captured family degrades every such batch to the
+    eager fallback.
+    """
+    if not eagle_worker._is_welmv4_mtp_draft_sampling_enabled() or topk != 1:
+        return [(False, False)]
+    fixed_top_p = eagle_worker.welmv4_mtp_draft_fixed_top_p
+    if eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params():
+        # Fixed draft params force sampling for every batch, so no greedy
+        # graph is reachable; top-p is static only when fixed top-p sets it.
+        if fixed_top_p is not None:
+            return [(True, fixed_top_p < 1.0 and supports_draft_top_p)]
+        if supports_draft_top_p:
+            return [(True, False), (True, True)]
+        return [(True, False)]
+    modes = [(False, False), (True, False)]
+    if supports_draft_top_p:
+        modes.append((True, True))
+    return modes
+
+
 @dataclass
 class WelmMTPDraftProposalInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -192,22 +218,31 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.welm_mtp_mirror_kv_states = None
         self.welm_mtp_mirror_padding_index = 0
         self.welm_mtp_mirror_kv_len = 0
-        self.sample_draft = (
-            eagle_worker._is_welmv4_mtp_draft_sampling_enabled()
-            and eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params()
-            and eagle_worker._get_welmv4_mtp_draft_sampling_topk() > 0
+        eagle_topk = int(model_runner.server_args.speculative_eagle_topk)
+        self.capture_sampling_modes = _compute_capture_sampling_modes(
+            eagle_worker,
+            topk=eagle_topk,
+            supports_draft_top_p=self.supports_draft_top_p,
+        )
+        self.family_has_sampling = any(
+            sample for sample, _ in self.capture_sampling_modes
         )
         self.sampling_topk = (
             eagle_worker._get_welmv4_mtp_draft_sampling_topk()
-            if self.sample_draft
+            if self.family_has_sampling
             else 0
         )
-        self.use_top_p = (
-            self.sample_draft
-            and eagle_worker.welmv4_mtp_draft_fixed_top_p is not None
-            and eagle_worker.welmv4_mtp_draft_fixed_top_p < 1.0
-            and self.supports_draft_top_p
-        )
+        # Active sampling mode; capture and replay re-point it per graph family.
+        self.sample_draft, self.use_top_p = self.capture_sampling_modes[0]
+        self.graphs_by_mode = {}
+        self.output_buffers_by_mode = {}
+        if len(self.capture_sampling_modes) > 1:
+            logger.info(
+                "WeLM MTP draft proposal graph captures one family per "
+                "(sample_draft, use_top_p) mode %s with sampling top-k %d.",
+                self.capture_sampling_modes,
+                self.sampling_topk,
+            )
         self.fused_topk_sample = get_bool_env_var(
             "SGLANG_WELM_MTP_FUSED_DRAFT_TOPK_SAMPLE"
         )
@@ -246,21 +281,21 @@ class WelmMTPDraftProposalCudaGraphRunner:
             and int(model_runner.server_args.speculative_eagle_topk) == 1
             and get_bool_env_var("SGLANG_WELM_MTP_LINEAR_VERIFY_PREPARE")
         )
-        self.fused_linear_graph_outputs = (
+        self._fused_linear_graph_outputs_base = (
             self.linear_verify_prepare
             and self.speculative_num_steps == 3
             and self.speculative_num_draft_tokens == 4
-            and self.sample_draft
+            and self.family_has_sampling
             and self.sampling_topk > 0
             and get_bool_env_var("SGLANG_WELM_MTP_FUSED_LINEAR_GRAPH_OUTPUTS")
         )
-        if self.fused_linear_graph_outputs:
+        if self._fused_linear_graph_outputs_base:
             logger.info(
                 "SGLANG_WELM_MTP_FUSED_LINEAR_GRAPH_OUTPUTS=1: fuse MTP3 "
                 "proposal output assembly into one proposal-graph kernel."
             )
         self.synced_draft_generator = None
-        if self.fused_prepare and self.sample_draft:
+        if self.fused_prepare and self.family_has_sampling:
             # TP workers receive the same server seed before model-runner init.
             # A dedicated generator therefore produces identical draft samples
             # on every TP rank without a per-replay NCCL broadcast, while being
@@ -445,7 +480,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             linear_proposal_tokens = torch.zeros(
                 (self.max_bs, self.speculative_num_steps), dtype=torch.int64
             )
-            if self.sample_draft:
+            if self.family_has_sampling:
                 linear_proposal_draft_topk_indices = torch.zeros(
                     (self.max_bs, self.num_tokens_per_bs, self.sampling_topk),
                     dtype=torch.int64,
@@ -659,6 +694,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 f"Capture WeLM MTP draft proposal cuda graph failed: {e}\n"
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    @property
+    def fused_linear_graph_outputs(self) -> bool:
+        # Follows the active mode: fused output assembly is captured only into
+        # the sampling graphs of a family.
+        return self._fused_linear_graph_outputs_base and self.sample_draft
 
     def build_linear_verify_inputs(
         self, draft_input: EagleDraftInput, seq_lens: torch.Tensor
@@ -1484,12 +1525,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if not forward_batch.forward_mode.is_draft_extend(include_v2=True):
             return False
         required_sampling_mode = self._required_draft_sampling_mode(forward_batch)
-        captured_sampling_mode = self.sample_draft, self.use_top_p
-        if required_sampling_mode != captured_sampling_mode:
+        mode_graphs = self.graphs_by_mode.get(required_sampling_mode)
+        if mode_graphs is None:
             return self._reject_token_owner_graph_miss(
                 "sampling mode mismatch "
                 f"(required={required_sampling_mode}, "
-                f"captured={captured_sampling_mode})"
+                f"captured={sorted(self.graphs_by_mode)})"
             )
         if forward_batch.input_ids is None or forward_batch.out_cache_loc is None:
             return False
@@ -1506,7 +1547,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         else:
             cuda_graph_bs = raw_bs
         has_capture_bucket = (
-            cuda_graph_bs in self.graphs
+            cuda_graph_bs in mode_graphs
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -1596,7 +1637,17 @@ class WelmMTPDraftProposalCudaGraphRunner:
         CudaGraphRunner._post_process_after_profile(self, prof)
 
     def capture(self):
-        CudaGraphRunner.capture(self)
+        for mode in self.capture_sampling_modes:
+            self.sample_draft, self.use_top_p = mode
+            self.graphs = self.graphs_by_mode.setdefault(mode, {})
+            self.output_buffers = self.output_buffers_by_mode.setdefault(mode, {})
+            CudaGraphRunner.capture(self)
+        self._activate_sampling_mode(self.capture_sampling_modes[0])
+
+    def _activate_sampling_mode(self, mode: tuple[bool, bool]) -> None:
+        self.sample_draft, self.use_top_p = mode
+        self.graphs = self.graphs_by_mode[mode]
+        self.output_buffers = self.output_buffers_by_mode[mode]
 
     def capture_one_batch_size(
         self,
@@ -1730,7 +1781,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         forward_batch.custom_last_cache_loc = custom_last_cache_loc
         forward_batch.welm_mtp_identity_indices = buffers.identity_indices
         forward_batch._welm_force_low_latency_deepep = self.use_token_owner_deepep
-        if self.distributed_topk:
+        if self.distributed_topk and self.sample_draft:
             forward_batch.welm_mtp_distributed_topk = self.sampling_topk
             forward_batch.welm_mtp_candidate_indices_buffer = (
                 buffers.welm_mtp_candidate_indices[:, :bs]
@@ -1915,8 +1966,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if not self.persistent_handoff or self.topk != 1 or self.dp_size != 1:
             return False
         required_sampling_mode = self._required_draft_sampling_mode(batch)
-        captured_sampling_mode = self.sample_draft, self.use_top_p
-        if required_sampling_mode != captured_sampling_mode:
+        if required_sampling_mode not in self.graphs_by_mode:
             return False
         if batch.forward_mode.is_idle() or batch.seq_lens_cpu is None:
             return False
@@ -1957,6 +2007,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         if not self.can_replay_from_verify(batch, batch_result):
             raise RuntimeError("Persistent WeLM MTP handoff preconditions are not met.")
 
+        self._activate_sampling_mode(self._required_draft_sampling_mode(batch))
         self.deepep_adapter.replay()
         buffers = self.buffers
         raw_bs = int(batch.seq_lens.shape[0])
@@ -2178,6 +2229,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         first_query_hashed_inputs: Optional[torch.Tensor],
         first_query_history_state: Optional[torch.Tensor],
     ) -> None:
+        self._activate_sampling_mode(self._required_draft_sampling_mode(forward_batch))
         self.deepep_adapter.replay()
         buffers = self.buffers
         raw_bs = int(forward_batch.batch_size)
