@@ -41,6 +41,7 @@ ARG VENV_PATH=/envs/venv
 ARG TCCL_VERSION=2.28
 ARG PYTORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG SGLANG_KERNEL_INDEX_URL=https://docs.sglang.ai/whl/cu129/
+ARG WELM_PYPI_INDEX_URL=https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
 ARG SGLANG_VERSION=0.0.0.dev0
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -344,6 +345,7 @@ PY
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python "${VENV_PATH}/bin/python" \
+        --extra-index-url "${WELM_PYPI_INDEX_URL}" \
         -r /tmp/sglang-runtime-requirements.txt \
         decord2
 

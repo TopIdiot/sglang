@@ -85,9 +85,17 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
+name = "tencent-pypi"
+url = "https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple/"
+explicit = true
+
+[[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
+
+[tool.uv.sources]
+welm-flash-attn-4 = { index = "tencent-pypi" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]

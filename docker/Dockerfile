@@ -16,6 +16,7 @@ ARG SGL_DEEP_GEMM_VERSION=0.1.0
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
+ARG WELM_PYPI_INDEX_URL=https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
@@ -178,6 +179,7 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG WELM_PYPI_INDEX_URL
 
 WORKDIR /sgl-workspace
 
@@ -238,7 +240,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && python3 -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+        --extra-index-url "${WELM_PYPI_INDEX_URL}" \
+        ".[${BUILD_TYPE}]" \
     && python3 -m pip install decord \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \

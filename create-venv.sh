@@ -23,6 +23,7 @@ fi
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYTORCH_CUDA_INDEX_URL="${PYTORCH_CUDA_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 SGLANG_KERNEL_INDEX_URL="${SGLANG_KERNEL_INDEX_URL:-https://docs.sglang.ai/whl/cu129/}"
+WELM_PYPI_INDEX_URL="${WELM_PYPI_INDEX_URL:-https://mirrors.tencent.com/repository/pypi/tencent_pypi/simple/}"
 
 if [ ! -x "${UV}" ]; then
     echo "uv not found or not executable: ${UV}" >&2
@@ -223,7 +224,10 @@ run_logged install-sglang-kernel-cu129 "${UV}" pip install \
     --python "${VENV_PYTHON}" \
     --index-url "${SGLANG_KERNEL_INDEX_URL}" \
     "sglang-kernel==0.4.2.post2+cu129"
-run_logged install-runtime-deps "${UV}" pip install --python "${VENV_PYTHON}" -r "${REQ_FILE}"
+run_logged install-runtime-deps "${UV}" pip install \
+    --python "${VENV_PYTHON}" \
+    --extra-index-url "${WELM_PYPI_INDEX_URL}" \
+    -r "${REQ_FILE}"
 SGL_DEEP_GEMM_VERSION="$(cat "${SGL_DEEP_GEMM_VERSION_FILE}")"
 run_logged install-sgl-deep-gemm-cu129 "${UV}" pip install \
     --python "${VENV_PYTHON}" \
