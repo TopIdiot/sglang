@@ -1231,7 +1231,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
     def _is_welmv4_mtp_draft_sampling_enabled(self) -> bool:
-        return self.welmv4_mtp_draft_sampling_mode is True
+        return self.welmv4_mtp_draft_sampling_mode is not False
 
     @staticmethod
     def _copy_welmv4_mtp_oe_hash_inputs(
@@ -1242,7 +1242,7 @@ class EagleDraftWorker(BaseDraftWorker):
             target.welm_oe_decode_hashed_inputs = cached_welm_oe_hash
 
     def _should_use_welmv4_mtp_greedy_draft(self, forward_batch: ForwardBatch) -> bool:
-        if not self._is_welmv4_mtp_draft_sampling_enabled():
+        if self.welmv4_mtp_draft_sampling_mode is False:
             return self.topk == 1 and not forward_batch.forward_mode.is_idle()
         if self._has_welmv4_mtp_fixed_draft_sampling_params():
             return False

@@ -11,7 +11,6 @@ from sglang.srt.models import welmv4
 from sglang.srt.models import welmv4_nextn
 from sglang.srt.models import welmv4_token_owner as token_owner
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
     WelmMTPDraftProposalCudaGraphRunner,
     _use_pretranslated_swa_cache_loc,
@@ -1599,29 +1598,6 @@ def test_welm_mtp_proposal_graph_uses_global_sampling_mode(
     )
 
     assert runner._required_draft_sampling_mode(forward_batch) == expected_mode
-
-
-@pytest.mark.parametrize(
-    ("sampling_mode", "sampling_enabled"),
-    [(None, False), (False, False), (True, True)],
-)
-def test_welm_mtp_draft_sampling_requires_explicit_enable(
-    sampling_mode: bool | None, sampling_enabled: bool
-):
-    worker = EagleDraftWorker.__new__(EagleDraftWorker)
-    worker.welmv4_mtp_draft_sampling_mode = sampling_mode
-    worker.topk = 1
-    worker.welmv4_mtp_draft_fixed_temperature = None
-    worker.welmv4_mtp_draft_fixed_top_p = None
-    forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_idle=lambda: False),
-        sampling_info=SimpleNamespace(is_all_greedy=False),
-    )
-
-    assert worker._is_welmv4_mtp_draft_sampling_enabled() is sampling_enabled
-    assert worker._should_use_welmv4_mtp_greedy_draft(forward_batch) is (
-        not sampling_enabled
-    )
 
 
 def test_welm_mtp_proposal_graph_keeps_local_mode_without_dp_consensus():
