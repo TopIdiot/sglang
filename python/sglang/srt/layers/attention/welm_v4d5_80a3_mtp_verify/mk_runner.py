@@ -175,8 +175,13 @@ class MkVerifyAttention:
             return self._api is not None
         self._import_attempted = True
         try:
-            from mk.errors import MKCompileError, MKConfigError
-            from mk.kernels.verify_attention_welmv45 import (
+            from sglang.srt.layers.attention.welm_v45_80a3.kernel_runtime import (
+                ConfigError as MKConfigError,
+            )
+            from sglang.srt.layers.attention.welm_v45_80a3.kernel_runtime import (
+                LaunchError as MKCompileError,
+            )
+            from sglang.srt.layers.attention.welm_v45_80a3.verify_attention import (
                 verify_attention_welmv45_plan,
                 verify_attention_welmv45_prepare,
                 verify_attention_welmv45_replan,
@@ -185,8 +190,8 @@ class MkVerifyAttention:
         except Exception as exc:  # noqa: BLE001  # pragma: no cover
             self.last_fallback_detail = f"{type(exc).__name__}: {exc}"
             logger.warning_once(
-                "MK WeLM verify attention is unavailable; using the configured "
-                "attention backend instead: %s",
+                "WeLM verify attention (k-dash welm/v45_80a3_attention) is "
+                "unavailable; using the configured attention backend instead: %s",
                 exc,
             )
             return False
@@ -196,7 +201,7 @@ class MkVerifyAttention:
             verify_attention_welmv45_prepare,
             verify_attention_welmv45_run,
         )
-        self._fallback_errors = (MKConfigError, MKCompileError)
+        self._fallback_errors = (MKConfigError, MKCompileError, RuntimeError)
         return True
 
     def ensure_self_check(self, device: torch.device) -> bool:

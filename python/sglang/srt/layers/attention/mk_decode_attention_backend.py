@@ -138,14 +138,15 @@ class MkDecodeAttentionBackend(AttentionBackend):
         self._sm_scale_by_window_left = self._collect_window_sm_scales()
 
         try:
-            from mk.kernels.decode_attention_welmv45 import (  # noqa: F401
+            from sglang.srt.layers.attention.welm_v45_80a3.decode_attention import (  # noqa: F401
                 decode_attention_welmv45_init_workspace,
                 decode_attention_welmv45_run,
             )
         except Exception as exc:  # pragma: no cover - import path/env specific
             raise RuntimeError(
-                "mk_decode_attention backend requires the mk package with "
-                "mk.kernels.decode_attention_welmv45 available."
+                "mk_decode_attention backend requires k-dash to resolve the "
+                "kernel 'welm/v45_80a3_attention'; install k-dash and provide "
+                "~/.config/k-dash.yaml."
             ) from exc
 
     def _record_timing(self, record: dict) -> None:
@@ -532,7 +533,7 @@ class MkDecodeAttentionBackend(AttentionBackend):
         if token_counts_cpu is None or max_pages is None:
             return {}
         try:
-            from mk.kernels.decode_attention_welmv45 import _make_split_plan
+            from sglang.srt.layers.attention.welm_v45_80a3.decode_attention import _make_split_plan
 
             if forced_num_splits is None and workspace_token_counts_cpu is not None:
                 workspace_plan = _make_split_plan(
@@ -581,7 +582,7 @@ class MkDecodeAttentionBackend(AttentionBackend):
         max_splits: int,
         batch: int,
     ) -> dict:
-        from mk.kernels.decode_attention_welmv45 import (
+        from sglang.srt.layers.attention.welm_v45_80a3.decode_attention import (
             _MAX_MERGE_WORKERS,
             _PLAN_ACTIVE_SPLITS_FIELD,
             _PLAN_MERGE_WORKER_FIELD,
@@ -694,7 +695,7 @@ class MkDecodeAttentionBackend(AttentionBackend):
         dump_page_ids: bool = False,
         use_cuda_graph_workspace: bool = False,
     ) -> tuple[torch.Tensor, object]:
-        from mk.kernels.decode_attention_welmv45 import (
+        from sglang.srt.layers.attention.welm_v45_80a3.decode_attention import (
             decode_attention_welmv45_init_workspace,
         )
 
@@ -1174,7 +1175,7 @@ class MkDecodeAttentionBackend(AttentionBackend):
         save_kv_cache=True,
         sinks: Optional[torch.Tensor] = None,
     ):
-        from mk.kernels.decode_attention_welmv45 import decode_attention_welmv45_run
+        from sglang.srt.layers.attention.welm_v45_80a3.decode_attention import decode_attention_welmv45_run
 
         if self.forward_metadata is None:
             raise RuntimeError("mk_decode_attention metadata is not initialized.")

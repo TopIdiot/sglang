@@ -45,13 +45,19 @@ MK 路径是 target-verify 专用 fast path。Prefill、普通 decode 和 draft 
 attention 始终使用原 FA3 backend，不属于 fallback。启用方式：
 
 ```bash
-git submodule update --init 3rdparty/mk
-git -C 3rdparty/mk submodule update --init ref/flashinfer
+pip install k-dash                       # 唯一的 kernel 依赖
+export K_DASH_KERNEL_VERSION=dev-local   # 或某个已发布 release
+# ~/.config/k-dash.yaml 必须存在（上传进容器即可）。
 export SGLANG_WELM_V4D5_80A3_MTP_VERIFY_ATTENTION_BACKEND=mk
+# 可选的 decode backend（full + SWA）：
+# --decode-attention-backend mk_decode_attention
 ```
 
-MK 必须包含已初始化的 `3rdparty/mk/ref/flashinfer` 子模块；缺失时
-verify kernel 无法编译，启动日志会给出明确 fallback 原因。
+Host planner 位于 `sglang/srt/layers/attention/welm_v45_80a3/`，从上游 k-dash
+kernel source package `welm/v45_80a3_attention` vendored 而来——那个仓库只产出
+CUDA kernel，不是 Python 包。CUDA `.so` 由
+`k_dash.get("welm/v45_80a3_attention", version=..., jit_args={...})`
+解析下载/缓存路径，不需要把 `.so` 拷进镜像。
 
 MK 路径固定要求 H20/SM90、每个 DP replica 使用 TP4、BF16 KV cache、page size 16、
 `steps=3`、`topk=1`、每请求 4 个 verify tokens，以及本地
