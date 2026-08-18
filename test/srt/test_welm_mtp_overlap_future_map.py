@@ -74,16 +74,26 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
         overlap_utils.spec_need_hidden_states = self._spec_need_hidden_states
 
     def test_resolve_preserves_welm_mtp_sampling_state(self):
+        # Model a decode-disaggregation pool with 4 running slots, 2
+        # pre-allocation slots, and CUDA-graph padding slot 0.
         future_map = FutureMap(
             max_running_requests=4,
-            chunked_prefill_size=0,
+            chunked_prefill_size=16,
             context_len=128,
             device=torch.device("cpu"),
             spec_algo=SpeculativeAlgorithm.EAGLE,
+            request_buffer_len=7,
         )
         stored = _make_draft_input()
-        future_indices = future_map.alloc_future_indices(2)
+        future_indices = future_map.alloc_future_indices(
+            2, torch.tensor([6, 5], dtype=torch.int64)
+        )
         future_map.store_to_map_for_new_batch(future_indices, stored)
+
+        self.assertEqual(future_map.future_buffer_len, 52)
+        self.assertEqual(future_map.welm_mtp_draft_probs_buf.shape[0], 7)
+        self.assertEqual(future_map.welm_mtp_draft_topk_indices_buf.shape[0], 7)
+        self.assertEqual(future_map.welm_mtp_draft_topk_values_buf.shape[0], 7)
 
         resolved = _make_draft_input(has_sampling_state=False)
         resolved.future_indices = future_indices
@@ -102,6 +112,31 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             stored.welm_mtp_draft_topk_values,
         )
 
+    def test_deferred_prefill_does_not_allocate_sampling_state(self):
+        future_map = FutureMap(
+            max_running_requests=4,
+            chunked_prefill_size=16,
+            context_len=128,
+            device=torch.device("cpu"),
+            spec_algo=SpeculativeAlgorithm.EAGLE,
+        )
+        stored = _make_draft_input(has_sampling_state=False)
+        stored.welm_mtp_deferred_prefill_draft = True
+        stored.welm_mtp_deferred_prefill_draft_mask = torch.ones(
+            (2,), dtype=torch.bool
+        )
+        future_indices = future_map.alloc_future_indices(
+            2, torch.tensor([1, 2], dtype=torch.int64)
+        )
+
+        future_map.store_to_map_for_new_batch(future_indices, stored)
+
+        self.assertFalse(future_map.has_welm_mtp_draft_probs_buf)
+        self.assertFalse(future_map.has_welm_mtp_draft_topk_buf)
+        self.assertFalse(hasattr(future_map, "welm_mtp_draft_probs_buf"))
+        self.assertFalse(hasattr(future_map, "welm_mtp_draft_topk_indices_buf"))
+        self.assertFalse(hasattr(future_map, "welm_mtp_draft_topk_values_buf"))
+
     def test_resolve_drops_sampling_state_when_mixed_with_deferred_prefill(self):
         future_map = FutureMap(
             max_running_requests=4,
@@ -111,15 +146,18 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             spec_algo=SpeculativeAlgorithm.EAGLE,
         )
         stored = _make_draft_input()
-        future_indices = future_map.alloc_future_indices(2)
+        future_indices = future_map.alloc_future_indices(
+            2, torch.tensor([1, 3], dtype=torch.int64)
+        )
         future_map.store_to_map_for_new_batch(future_indices, stored)
         missing_index = future_indices.indices[1]
+        missing_req_index = future_map.req_pool_indices_buf[missing_index]
         future_map.welm_mtp_has_draft_probs_buf[missing_index] = False
         future_map.welm_mtp_has_draft_topk_buf[missing_index] = False
         future_map.welm_mtp_deferred_prefill_draft_buf[missing_index] = True
-        future_map.welm_mtp_draft_probs_buf[missing_index].zero_()
-        future_map.welm_mtp_draft_topk_indices_buf[missing_index].zero_()
-        future_map.welm_mtp_draft_topk_values_buf[missing_index].zero_()
+        future_map.welm_mtp_draft_probs_buf[missing_req_index].zero_()
+        future_map.welm_mtp_draft_topk_indices_buf[missing_req_index].zero_()
+        future_map.welm_mtp_draft_topk_values_buf[missing_req_index].zero_()
 
         resolved = _make_draft_input(has_sampling_state=False)
         resolved.future_indices = future_indices
@@ -143,7 +181,9 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             spec_algo=SpeculativeAlgorithm.EAGLE,
         )
         stored = _attach_oe_history(_make_draft_input())
-        future_indices = future_map.alloc_future_indices(2)
+        future_indices = future_map.alloc_future_indices(
+            2, torch.tensor([1, 2], dtype=torch.int64)
+        )
         future_map.store_to_map_for_new_batch(future_indices, stored)
 
         resolved = _make_draft_input(has_sampling_state=False)
@@ -164,7 +204,9 @@ class TestWelmMTPOverlapFutureMap(unittest.TestCase):
             spec_algo=SpeculativeAlgorithm.EAGLE,
         )
         stored = _attach_oe_history(_make_draft_input())
-        future_indices = future_map.alloc_future_indices(2)
+        future_indices = future_map.alloc_future_indices(
+            2, torch.tensor([1, 2], dtype=torch.int64)
+        )
         future_map.store_to_map_for_new_batch(future_indices, stored)
         missing_index = future_indices.indices[1]
         future_map.welm_mtp_has_oe_history_buf[missing_index] = False

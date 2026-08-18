@@ -1521,6 +1521,7 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
             self.spec_algorithm,
+            request_buffer_len=self.req_to_token_pool.req_to_token.shape[0],
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -4309,7 +4310,9 @@ class Scheduler(
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
                 bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
+                future_indices = self.future_map.alloc_future_indices(
+                    bs, model_worker_batch.req_pool_indices
+                )
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)

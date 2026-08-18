@@ -50,6 +50,7 @@ class FutureMap:
         context_len: int,
         device: torch.device,
         spec_algo: Optional[SpeculativeAlgorithm] = None,
+        request_buffer_len: Optional[int] = None,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
         self.future_ct = 0
@@ -66,6 +67,22 @@ class FutureMap:
         self.future_limit = max_running_requests * (3 + max_num_chunks)
         # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
+        # The large stochastic-draft tensors are request state, so keep one
+        # copy per actual request-pool row instead of reserving a copy for every
+        # chunked-prefill slot in the future ring.  A regular request pool has
+        # max_running_requests + 1 rows (including CUDA-graph padding slot 0),
+        # while a disaggregated decode pool also has pre-allocation rows.
+        self.request_buffer_len = (
+            max_running_requests + 1
+            if request_buffer_len is None
+            else request_buffer_len
+        )
+        if self.request_buffer_len < max_running_requests + 1:
+            raise ValueError(
+                "request_buffer_len must cover all running request slots and "
+                f"CUDA-graph padding: got {self.request_buffer_len}, expected "
+                f"at least {max_running_requests + 1}."
+            )
         self.device = device
         self.spec_algo = spec_algo
 
@@ -79,6 +96,9 @@ class FutureMap:
             # For speculative decoding, we lazily initialize the buffers
             # This is to make the shape derivation easier.
             self.buf_initialized = False
+            self.req_pool_indices_buf = torch.empty(
+                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+            )
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -162,7 +182,7 @@ class FutureMap:
 
         draft_probs0 = draft_probs[0]
         self.welm_mtp_draft_probs_buf = torch.empty(
-            (self.future_buffer_len, *draft_probs0.shape),
+            (self.request_buffer_len, *draft_probs0.shape),
             dtype=draft_probs0.dtype,
             device=self.device,
         )
@@ -180,12 +200,12 @@ class FutureMap:
         draft_topk_indices0 = draft_topk_indices[0]
         draft_topk_values0 = draft_topk_values[0]
         self.welm_mtp_draft_topk_indices_buf = torch.empty(
-            (self.future_buffer_len, *draft_topk_indices0.shape),
+            (self.request_buffer_len, *draft_topk_indices0.shape),
             dtype=draft_topk_indices0.dtype,
             device=self.device,
         )
         self.welm_mtp_draft_topk_values_buf = torch.empty(
-            (self.future_buffer_len, *draft_topk_values0.shape),
+            (self.request_buffer_len, *draft_topk_values0.shape),
             dtype=draft_topk_values0.dtype,
             device=self.device,
         )
@@ -239,13 +259,26 @@ class FutureMap:
         )
         self.has_welm_mtp_oe_history_buf = True
 
-    def alloc_future_indices(self, bs: int) -> FutureIndices:
+    def alloc_future_indices(
+        self, bs: int, req_pool_indices: Optional[torch.Tensor] = None
+    ) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        if not self.spec_algo.is_none():
+            if req_pool_indices is None or req_pool_indices.numel() != bs:
+                num_req_pool_indices = (
+                    None if req_pool_indices is None else req_pool_indices.numel()
+                )
+                raise ValueError(
+                    "Speculative overlap requires one request pool index per "
+                    f"future row, got bs={bs} and "
+                    f"req_pool_indices={num_req_pool_indices}."
+                )
+            self.req_pool_indices_buf[start:end] = req_pool_indices
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
@@ -258,6 +291,7 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            req_pool_indices = self.req_pool_indices_buf[indices]
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at
@@ -292,7 +326,7 @@ class FutureMap:
                     else False
                 )
             draft_input.draft_probs = (
-                self.welm_mtp_draft_probs_buf[indices]
+                self.welm_mtp_draft_probs_buf[req_pool_indices]
                 if has_draft_probs
                 else None
             )
@@ -309,10 +343,10 @@ class FutureMap:
                 )
             if has_draft_topk:
                 draft_input.welm_mtp_draft_topk_indices = (
-                    self.welm_mtp_draft_topk_indices_buf[indices]
+                    self.welm_mtp_draft_topk_indices_buf[req_pool_indices]
                 )
                 draft_input.welm_mtp_draft_topk_values = (
-                    self.welm_mtp_draft_topk_values_buf[indices]
+                    self.welm_mtp_draft_topk_values_buf[req_pool_indices]
                 )
             else:
                 draft_input.welm_mtp_draft_topk_indices = None
@@ -390,6 +424,8 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
+        req_pool_indices = self.req_pool_indices_buf[intv]
+
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
         self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
@@ -439,24 +475,21 @@ class FutureMap:
             self.hidden_states_buf[intv] = draft_input.hidden_states
         self._ensure_welm_mtp_draft_probs_buf(draft_input)
         if getattr(self, "has_welm_mtp_draft_probs_buf", False):
-            if getattr(draft_input, "draft_probs", None) is None:
-                self.welm_mtp_draft_probs_buf[intv].zero_()
-            else:
-                self.welm_mtp_draft_probs_buf[intv] = draft_input.draft_probs
+            if getattr(draft_input, "draft_probs", None) is not None:
+                self.welm_mtp_draft_probs_buf[req_pool_indices] = (
+                    draft_input.draft_probs
+                )
         self._ensure_welm_mtp_draft_topk_buf(draft_input)
         if getattr(self, "has_welm_mtp_draft_topk_buf", False):
             has_draft_topk = (
                 draft_input.welm_mtp_draft_topk_indices is not None
                 and draft_input.welm_mtp_draft_topk_values is not None
             )
-            if not has_draft_topk:
-                self.welm_mtp_draft_topk_indices_buf[intv].zero_()
-                self.welm_mtp_draft_topk_values_buf[intv].zero_()
-            else:
-                self.welm_mtp_draft_topk_indices_buf[intv] = (
+            if has_draft_topk:
+                self.welm_mtp_draft_topk_indices_buf[req_pool_indices] = (
                     draft_input.welm_mtp_draft_topk_indices
                 )
-                self.welm_mtp_draft_topk_values_buf[intv] = (
+                self.welm_mtp_draft_topk_values_buf[req_pool_indices] = (
                     draft_input.welm_mtp_draft_topk_values
                 )
         self._ensure_welm_mtp_draft_proposal_buf(draft_input)
