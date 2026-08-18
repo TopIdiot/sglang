@@ -51,7 +51,7 @@ from sglang.srt.models.welm_perf_opt import (
     get_welm_oe_hash_config,
     should_use_welm_oe_hash_kernel,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_welm_decode_token_owner_enabled
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -269,6 +269,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.welm_decode_token_owner_enabled = (
+            get_welm_decode_token_owner_enabled(server_args)
         )
         self.welmv4_mtp_draft_sampling_mode = _parse_optional_bool_env(
             _WELM_MTP_SAMPLE_DRAFT_ENV
@@ -1228,7 +1231,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
     def _is_welmv4_mtp_draft_sampling_enabled(self) -> bool:
-        return self.welmv4_mtp_draft_sampling_mode is not False
+        return self.welmv4_mtp_draft_sampling_mode is True
 
     @staticmethod
     def _copy_welmv4_mtp_oe_hash_inputs(
@@ -1239,7 +1242,7 @@ class EagleDraftWorker(BaseDraftWorker):
             target.welm_oe_decode_hashed_inputs = cached_welm_oe_hash
 
     def _should_use_welmv4_mtp_greedy_draft(self, forward_batch: ForwardBatch) -> bool:
-        if self.welmv4_mtp_draft_sampling_mode is False:
+        if not self._is_welmv4_mtp_draft_sampling_enabled():
             return self.topk == 1 and not forward_batch.forward_mode.is_idle()
         if self._has_welmv4_mtp_fixed_draft_sampling_params():
             return False
@@ -3977,7 +3980,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self._is_welmv4_mtp_draft_model()
             and self.speculative_num_steps > 1
             and (
-                self.server_args.enable_token_owner
+                self.welm_decode_token_owner_enabled
                 or not is_idle_decode
                 or self.cuda_graph_runner_for_draft_proposal is not None
                 # With DP attention, idle ranks must run the same merged

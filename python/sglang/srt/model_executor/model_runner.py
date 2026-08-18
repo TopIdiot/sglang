@@ -175,11 +175,15 @@ from sglang.srt.models.welm_perf_opt import (
     get_welm_oe_hash_config,
     should_use_welm_oe_hash_kernel,
 )
+from sglang.srt.models.welmv4_token_owner import (
+    welm_token_owner_enabled_for_forward,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
+    get_welm_decode_token_owner_enabled,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -311,6 +315,24 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     if hasattr(model, "language_model"):
         return model.language_model
     return model.model
+
+
+def _uses_mlp_sync_batch(server_args, forward_batch: ForwardBatch) -> bool:
+    if forward_batch.global_num_tokens_cpu is None:
+        return False
+    is_single_group_pure_tp_owner = (
+        getattr(server_args, "_welm_token_owner_args_validated", False)
+        and server_args.enable_token_owner
+        and not server_args.enable_dp_attention
+        and server_args.attn_cp_size == 1
+        and welm_token_owner_enabled_for_forward(
+            forward_batch,
+            decode_token_owner_enabled=get_welm_decode_token_owner_enabled(
+                server_args
+            ),
+        )
+    )
+    return not is_single_group_pure_tp_owner
 
 
 class RankZeroFilter(logging.Filter):
@@ -3881,9 +3903,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
+        uses_mlp_sync_batch = _uses_mlp_sync_batch(self.server_args, forward_batch)
+        if uses_mlp_sync_batch:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
+            if getattr(
+                self.server_args, "_welm_token_owner_args_validated", False
+            ) and self.server_args.enable_token_owner:
+                set_is_extend_in_batch(forward_batch.is_extend_in_batch)
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
@@ -3930,10 +3957,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        if (
-            forward_batch.global_num_tokens_cpu is not None
-            and self.pp_group.is_last_rank
-        ):
+        if uses_mlp_sync_batch and self.pp_group.is_last_rank:
             forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)

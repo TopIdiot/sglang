@@ -257,6 +257,50 @@ def test_partial_o_is_reduced_before_o_norm_and_residual_norm(monkeypatch):
     assert residual.tolist() == [[38.0]]
 
 
+def test_replicated_scatter_reduces_partial_o_before_norms(monkeypatch):
+    partial_o = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+    local_residual = torch.tensor([[30.0], [40.0]])
+    calls = []
+
+    def reduce_scatter(output, input_):
+        calls.append(("reduce_scatter", input_.clone()))
+        output.copy_(torch.tensor([[7.0], [8.0]]))
+
+    class ONorm:
+        def __call__(self, hidden_states):
+            calls.append(("o_norm", hidden_states.clone()))
+            return hidden_states + 1
+
+    class PostAttentionNorm:
+        def __call__(self, hidden_states, residual):
+            calls.append(("post_attention_norm", hidden_states.clone()))
+            return hidden_states + residual, hidden_states + residual
+
+    monkeypatch.setattr(
+        communicator, "attn_tp_reduce_scatter_tensor", reduce_scatter
+    )
+
+    hidden_states, residual = (
+        CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual(
+            partial_o,
+            local_residual,
+            forward_batch=SimpleNamespace(),
+            layernorm=PostAttentionNorm(),
+            context=SimpleNamespace(attn_tp_size=2, attn_tp_rank=1),
+            residual_input_mode=ScatterMode.SCATTERED,
+            pre_layernorm=ONorm(),
+        )
+    )
+
+    assert [call[0] for call in calls] == [
+        "reduce_scatter",
+        "o_norm",
+        "post_attention_norm",
+    ]
+    assert hidden_states.tolist() == [[38.0], [49.0]]
+    assert residual.tolist() == [[38.0], [49.0]]
+
+
 def test_global_tp_expert_partial_reduces_directly_to_owner(monkeypatch):
     layout = TokenOwnerLayout.from_owner_sizes((2, 1, 1, 0), local_owner_rank=1)
     partial = torch.arange(8, dtype=torch.float32).view(4, 2)
@@ -394,22 +438,14 @@ def test_deepep_final_owner_rows_use_variable_local_gather(monkeypatch):
     assert output_residual is None
 
 
-def test_layer_communicator_routes_local_and_global_owner_layouts():
+def test_layer_communicator_routes_explicit_local_and_global_owner_layouts():
     local_layout = TokenOwnerLayout.from_owner_sizes((2, 1), local_owner_rank=1)
     global_layout = TokenOwnerLayout.from_owner_sizes(
         (2, 1, 1, 0),
         local_owner_rank=1,
     )
 
-    class Provider:
-        def local_layout(self, forward_batch):
-            return local_layout
-
-        def global_layout(self, forward_batch):
-            return global_layout
-
     communicator_instance = LayerCommunicator.__new__(LayerCommunicator)
-    communicator_instance.token_owner_layout_provider = Provider()
     communicator_instance.input_layernorm = lambda hidden_states: hidden_states
     communicator_instance.post_attention_layernorm = object()
     communicator_instance.pre_mlp_norm = object()
@@ -426,8 +462,9 @@ def test_layer_communicator_routes_local_and_global_owner_layouts():
         assert pre_layernorm is communicator_instance.pre_mlp_norm
         return kwargs["hidden_states"], kwargs["residual"]
 
-    def postprocess(token_owner_layout, **kwargs):
+    def postprocess(token_owner_layout, local_token_owner_layout, **kwargs):
         assert token_owner_layout is global_layout
+        assert local_token_owner_layout is local_layout
         return kwargs["hidden_states"], kwargs["residual"]
 
     communicator_instance._communicate_simple_fn = prepare_attention
@@ -442,16 +479,116 @@ def test_layer_communicator_routes_local_and_global_owner_layouts():
         hidden_states,
         None,
         forward_batch,
+        token_owner_layout=local_layout,
     )
     hidden_states, residual = communicator_instance.prepare_mlp(
         hidden_states,
         residual,
         forward_batch,
+        token_owner_layout=local_layout,
     )
     output, output_residual = communicator_instance.postprocess_layer(
         hidden_states,
         residual,
         forward_batch,
+        token_owner_global_layout=global_layout,
+        token_owner_local_layout=local_layout,
+    )
+
+    assert output is hidden_states
+    assert output_residual is residual
+
+
+def test_layer_communicator_transition_gathers_hidden_and_residual_together():
+    local_layout = TokenOwnerLayout.from_owner_sizes((2, 1), local_owner_rank=1)
+
+    communicator_instance = LayerCommunicator.__new__(LayerCommunicator)
+    communicator_instance.input_layernorm = (
+        lambda hidden_states, residual, post_residual_addition=None: (
+            hidden_states + 1,
+            residual + 2,
+        )
+    )
+    communicator_instance.qkv_latent_func = None
+    communicator_instance._context = SimpleNamespace()
+    calls = 0
+
+    def gather(hidden_states, token_owner_layout, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert token_owner_layout is local_layout
+        assert isinstance(hidden_states, tuple)
+        hidden_states, residual = hidden_states
+        assert hidden_states.tolist() == [[2.0]]
+        assert residual.tolist() == [[4.0]]
+        return (
+            torch.tensor([[10.0], [11.0], [2.0]]),
+            torch.tensor([[20.0], [21.0], [4.0]]),
+        )
+
+    communicator_instance._communicate_simple_fn = gather
+
+    hidden_states, residual = communicator_instance.prepare_attn(
+        torch.tensor([[1.0]]),
+        torch.tensor([[2.0]]),
+        SimpleNamespace(),
+        gather_token_owner_residual=True,
+        token_owner_layout=local_layout,
+    )
+
+    assert calls == 1
+    assert hidden_states.tolist() == [[10.0], [11.0], [2.0]]
+    assert residual.tolist() == [[20.0], [21.0], [4.0]]
+
+
+def test_layer_communicator_routes_non_owner_transport_layout():
+    communicator_instance = LayerCommunicator.__new__(LayerCommunicator)
+    communicator_instance.allow_reduce_scatter = True
+    communicator_instance._context = SimpleNamespace()
+    layout = TokenOwnerLayout.from_owner_sizes((2, 1), local_owner_rank=1)
+
+    def gather(local_token_owner_layout, **kwargs):
+        assert local_token_owner_layout is layout
+        return kwargs["hidden_states"], kwargs["residual"]
+
+    communicator_instance._communicate_summable_tensor_pair_fn = gather
+    hidden_states = torch.tensor([[1.0]])
+    residual = torch.tensor([[2.0]])
+
+    output, output_residual = communicator_instance.postprocess_layer(
+        hidden_states,
+        residual,
+        SimpleNamespace(),
+        transport_local_layout=layout,
+    )
+
+    assert output is hidden_states
+    assert output_residual is residual
+
+
+def test_layer_communicator_preserves_legacy_postprocess_signature_without_layout():
+    communicator_instance = LayerCommunicator.__new__(LayerCommunicator)
+    communicator_instance.allow_reduce_scatter = True
+    communicator_instance._context = SimpleNamespace()
+
+    def legacy_postprocess(
+        hidden_states,
+        residual,
+        forward_batch,
+        context,
+        allow_reduce_scatter,
+    ):
+        assert allow_reduce_scatter
+        return hidden_states, residual
+
+    communicator_instance._communicate_summable_tensor_pair_fn = legacy_postprocess
+    hidden_states = torch.tensor([[1.0]])
+    residual = torch.tensor([[2.0]])
+
+    output, output_residual = communicator_instance.postprocess_layer(
+        hidden_states,
+        residual,
+        SimpleNamespace(),
     )
 
     assert output is hidden_states

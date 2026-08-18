@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.models.welm_perf_opt import get_welm_oe_hash_config
+from sglang.srt.server_args import get_welm_decode_token_owner_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.welmv4_mtp_sampling import (
     welm_mtp_deterministic_uniforms,
@@ -62,6 +63,14 @@ if _is_cuda or _is_musa:
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+
+def _use_pretranslated_swa_cache_loc(
+    *, is_hybrid_swa: bool, use_token_owner: bool
+) -> bool:
+    # Token Owner selects a layer-local row domain that cannot reuse a flat
+    # proposal-level SWA location buffer.
+    return is_hybrid_swa and not use_token_owner
 
 
 def _validate_dp_proposal_graph_consensus_config(
@@ -189,7 +198,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.use_token_owner = model_runner.server_args.enable_token_owner
+        self.use_token_owner = get_welm_decode_token_owner_enabled(
+            model_runner.server_args
+        )
         self.use_token_owner_deepep = (
             self.use_token_owner and get_speculative_moe_a2a_backend().is_deepep()
         )
@@ -313,7 +324,9 @@ class WelmMTPDraftProposalCudaGraphRunner:
             else self.speculative_num_draft_tokens
         )
         capture_bs, compile_bs = get_batch_sizes_to_capture(
-            model_runner, num_tokens_per_bs=self.num_tokens_per_bs
+            model_runner,
+            num_tokens_per_bs=self.num_tokens_per_bs,
+            use_token_owner=self.use_token_owner,
         )
         self.capture_bs = self._filter_contracted_dp_capture_bs(capture_bs)
         self.compile_bs = [bs for bs in compile_bs if bs in self.capture_bs]
@@ -361,7 +374,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
             out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             out_cache_loc_swa = (
                 torch.zeros((self.max_num_token,), dtype=torch.int32)
-                if self.model_runner.is_hybrid_swa
+                if _use_pretranslated_swa_cache_loc(
+                    is_hybrid_swa=self.model_runner.is_hybrid_swa,
+                    use_token_owner=self.use_token_owner,
+                )
                 else None
             )
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -1446,9 +1462,12 @@ class WelmMTPDraftProposalCudaGraphRunner:
         global_num_reqs = getattr(forward_batch, "global_num_reqs_cpu", None)
         if global_num_reqs:
             return max(int(count) for count in global_num_reqs)
+        if self.use_token_owner and self.dp_size == 1:
+            return int(forward_batch.batch_size)
         if self.use_token_owner:
             raise RuntimeError(
-                "Token-owner MTP draft graph requires non-empty global request counts"
+                "Token-owner MTP draft graph requires non-empty global request "
+                "counts for a multi-group topology"
             )
 
         # Topk tree proposals can have a different row width from scheduler
@@ -1533,17 +1552,25 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 f"captured={sorted(self.graphs_by_mode)})"
             )
         if forward_batch.input_ids is None or forward_batch.out_cache_loc is None:
-            return False
+            return self._reject_token_owner_graph_miss(
+                "requires input IDs and output cache locations"
+            )
         raw_bs = int(forward_batch.batch_size)
         raw_num_tokens = int(forward_batch.input_ids.numel())
         if not (0 <= raw_num_tokens <= raw_bs * self.num_tokens_per_bs):
-            return False
+            return self._reject_token_owner_graph_miss(
+                "received an invalid token count"
+            )
         if raw_bs == 0 and not self.require_mlp_sync:
-            return False
+            return self._reject_token_owner_graph_miss(
+                "received an empty unsupported batch"
+            )
         if self.require_mlp_tp_gather or self.use_token_owner:
             cuda_graph_bs = self._get_dp_cuda_graph_request_bs(forward_batch)
             if cuda_graph_bs is None or cuda_graph_bs <= 0:
-                return False
+                return self._reject_token_owner_graph_miss(
+                    "received an invalid request batch size"
+                )
         else:
             cuda_graph_bs = raw_bs
         has_capture_bucket = (
@@ -1555,22 +1582,32 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return self._reject_token_owner_graph_miss(
                 f"has no capture bucket for request batch size {cuda_graph_bs}"
             )
-        if self.require_mlp_sync and not forward_batch.can_run_dp_cuda_graph:
+        if (
+            self.require_mlp_sync
+            and not (self.use_token_owner and self.dp_size == 1)
+            and not forward_batch.can_run_dp_cuda_graph
+        ):
             return self._reject_token_owner_graph_miss(
                 "was scheduler disabled for this DP batch"
             )
         spec_info = forward_batch.spec_info
         if not isinstance(spec_info, EagleDraftInput):
-            return False
+            return self._reject_token_owner_graph_miss(
+                "requires a valid EagleDraftInput"
+            )
         if (
             spec_info.num_accept_tokens_cpu is None
             or spec_info.num_accept_tokens is None
             or spec_info.num_correct_drafts is None
         ):
-            return False
+            return self._reject_token_owner_graph_miss(
+                "requires complete accepted-token metadata"
+            )
         accepted_lens_cpu = [int(x) for x in spec_info.num_accept_tokens_cpu]
         if len(accepted_lens_cpu) != raw_bs:
-            return False
+            return self._reject_token_owner_graph_miss(
+                "accepted-token metadata does not match the request batch"
+            )
         index = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
         if index >= len(self.capture_bs):
             return self._reject_token_owner_graph_miss(
@@ -1578,8 +1615,14 @@ class WelmMTPDraftProposalCudaGraphRunner:
             )
         graph_bs = self.capture_bs[index]
         if sum(accepted_lens_cpu) != raw_num_tokens:
-            return False
-        return self._make_padded_accept_lens(accepted_lens_cpu, graph_bs) is not None
+            return self._reject_token_owner_graph_miss(
+                "accepted-token metadata does not match the token count"
+            )
+        if self._make_padded_accept_lens(accepted_lens_cpu, graph_bs) is None:
+            return self._reject_token_owner_graph_miss(
+                "cannot pad accepted-token metadata to the capture bucket"
+            )
+        return True
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()

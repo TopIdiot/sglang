@@ -91,6 +91,60 @@ class TestWelmOeArgs(unittest.TestCase):
             server_args._handle_welm_oe_hash_kernel_args()
 
 
+class TestWelmTokenOwnerArgs(unittest.TestCase):
+    def test_instance_connector_rejects_token_owner(self):
+        server_args = ServerArgs(model_path="dummy", enable_token_owner=True)
+        server_args.model_path = "instance://127.0.0.1:1234"
+
+        with self.assertRaisesRegex(ValueError, "instance.*token-owner"):
+            server_args._handle_model_specific_adjustments()
+
+    def test_rejects_pdmux(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_token_owner=True,
+            enable_pdmux=True,
+        )
+        model_config = MagicMock()
+        model_config.hf_config.scale_seq_times = 0
+        model_config.hf_text_config.scale_seq_times = 0
+
+        with self.assertRaisesRegex(ValueError, "token-owner.*PDMux"):
+            server_args._validate_welm_token_owner_args(model_config)
+
+    def test_non_welm_model_rejects_token_owner(self):
+        server_args = ServerArgs(model_path="dummy", enable_token_owner=True)
+        model_config = MagicMock()
+        model_config.hf_config.architectures = ["Qwen2ForCausalLM"]
+
+        with patch.object(
+            server_args, "get_model_config", return_value=model_config
+        ), self.assertRaisesRegex(ValueError, "WeLM.*token-owner"):
+            server_args._handle_model_specific_adjustments()
+
+    def test_pure_tp_rejects_scale_seq(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_token_owner=True,
+            enable_dp_attention=False,
+        )
+        model_configs = [
+            MagicMock(
+                hf_config=MagicMock(scale_seq_times=1),
+                hf_text_config=MagicMock(scale_seq_times=0),
+            ),
+            MagicMock(
+                hf_config=MagicMock(scale_seq_times=0),
+                hf_text_config=MagicMock(scale_seq_times=1),
+            ),
+        ]
+
+        for model_config in model_configs:
+            with self.subTest(model_config=model_config):
+                with self.assertRaisesRegex(ValueError, "token-owner.*Scale-Seq"):
+                    server_args._validate_welm_token_owner_args(model_config)
+
+
 class TestRouterReplayServerArgs(unittest.TestCase):
     def test_return_routed_experts_rejects_welm_kv_mirror_opt(self):
         with self.assertRaisesRegex(

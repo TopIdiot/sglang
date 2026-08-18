@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import welmv4 as welmv4_model
+from sglang.srt.models import welmv4_token_owner as token_owner
 from sglang.srt.models.welm_deferred_mirror import (
     WelmDeferredExecutionRole,
     WelmDeferredMirrorPair,
@@ -234,32 +235,19 @@ def test_deferred_dp_cutoff_builds_one_synchronized_suffix_layout(
     )
 
 
-@pytest.mark.parametrize(
-    (
-        "flags",
-        "peer_rows",
-        "expected_calls",
-        "expected_rows",
-        "expected_invalidations",
-    ),
-    [
-        ([True, False], 3, [(0, 2), (1, 2), (2, 0), (3, 0)], 0, 1),
-        ([True, False], 0, [(0, 2), (1, 2)], 0, 0),
-        ([True, True], 2, [(0, 2), (1, 2)], 0, 0),
-    ],
-)
-def test_deferred_dp_runtime_continues_only_when_a_peer_needs_suffix(
-    monkeypatch,
-    flags,
-    peer_rows,
-    expected_calls,
-    expected_rows,
-    expected_invalidations,
-):
+def test_deferred_dp_cutoff_rebuilds_token_owner_plan(monkeypatch):
+    flags = [True, False]
+    peer_rows = 3
     calls = []
     model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
     nn.Module.__init__(model)
-    model.token_owner_runtime = MagicMock()
+    model.token_owner_runtime = token_owner.WeLMTokenOwnerRuntime(
+        attn_tp_group=SimpleNamespace(world_size=2, rank_in_group=0),
+        global_tp_group=SimpleNamespace(world_size=4, rank_in_group=0),
+    )
+    model.token_owner_boundary_layer = 2
+    model.disable_prefill_mirror_token_owner = False
+    model.decode_token_owner_enabled = True
     model.config = SimpleNamespace(num_hidden_layers=4)
     model.deferred_execution = SimpleNamespace(
         role=WelmDeferredExecutionRole.MONOLITHIC,
@@ -288,6 +276,11 @@ def test_deferred_dp_runtime_continues_only_when_a_peer_needs_suffix(
     monkeypatch.setattr(welmv4_model, "welm_use_previous_precision", lambda: False)
     monkeypatch.setattr(welmv4_model, "is_dp_attention_enabled", lambda: True)
     monkeypatch.setattr(
+        token_owner,
+        "get_moe_a2a_backend",
+        lambda: SimpleNamespace(is_deepep=lambda: False),
+    )
+    monkeypatch.setattr(
         welmv4_model, "_welm_should_contract_kv_mirror", lambda _batch: False
     )
     monkeypatch.setattr(welmv4_model, "_set_welm_kv_mirror_states", lambda *_: None)
@@ -299,13 +292,18 @@ def test_deferred_dp_runtime_continues_only_when_a_peer_needs_suffix(
     monkeypatch.setattr(
         "sglang.srt.layers.dp_attention.get_attention_dp_rank", lambda: 0
     )
-    monkeypatch.setattr(
-        welmv4_model, "_welm_update_contracted_dp_metadata", MagicMock()
-    )
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
+        global_forward_modes=[ForwardMode.EXTEND, ForwardMode.EXTEND],
+        enable_welm_kv_mirror_opt=True,
         welm_deferred_prefill=True,
         welm_deferred_prefill_flags=flags,
+        welm_kv_mirror_contract_flags=[False, not flags[1] and peer_rows > 0],
+        original_global_num_tokens_cpu=[2, peer_rows],
+        global_num_reqs_cpu=[1, min(peer_rows, 1)],
+        welm_kv_mirror_last_q_indices_cpu=[],
+        welm_kv_mirror_active_batch_indices_cpu=[],
+        welm_kv_mirror_output_size=1,
         global_num_tokens_cpu=[2, peer_rows],
         global_num_tokens_gpu=torch.tensor(
             [2, peer_rows], dtype=torch.int64
@@ -314,6 +312,13 @@ def test_deferred_dp_runtime_continues_only_when_a_peer_needs_suffix(
         global_num_tokens_for_logprob_gpu=torch.tensor(
             [1, peer_rows], dtype=torch.int64
         ),
+        global_dp_buffer_len=2 + peer_rows,
+        dp_padding_mode=welmv4_model.DpPaddingMode.SUM_LEN,
+        dp_local_start_pos=torch.tensor(0),
+        dp_local_num_tokens=torch.tensor(2),
+        num_token_non_padded=None,
+        scale_seq_factor=1,
+        is_extend_in_batch=True,
         can_run_tbo=False,
         spec_info=None,
         spec_algorithm=None,
@@ -328,9 +333,17 @@ def test_deferred_dp_runtime_continues_only_when_a_peer_needs_suffix(
         forward_batch,
     )
 
-    assert calls == expected_calls
-    assert output.shape == (expected_rows, 4)
-    assert model.token_owner_runtime.invalidate.call_count == expected_invalidations
+    assert calls == [(0, 2), (1, 2), (2, 0), (3, 0)]
+    assert output.shape == (0, 4)
+    plan_state = model.token_owner_runtime.state_for(
+        forward_batch, token_owner.TokenOwnerLayerIdentity.PRE_MIRROR
+    )
+    assert plan_state.input_local_layout.valid_token_count == 0
+    boundary_state = model.token_owner_runtime.state_for(
+        forward_batch, token_owner.TokenOwnerLayerIdentity.MIRROR_BOUNDARY
+    )
+    assert boundary_state.transitions_rows
+    assert boundary_state.owner_output
 
 
 def test_mirror_q_allows_missing_kv_only_for_deferred_zero_row_suffix(monkeypatch):

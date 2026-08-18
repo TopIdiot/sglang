@@ -145,12 +145,20 @@ from sglang.srt.models.welm_v45_80a3_h2048_hd256_pre_attn_v2_config import (
     welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled,
 )
 from sglang.srt.models.welmv4_token_owner import (
+    TokenOwnerLayerIdentity,
+    TokenOwnerTransition,
     WeLMTokenOwnerRuntime,
+    classify_token_owner_layers,
+    needs_input_logprobs as _welm_needs_input_logprobs,
+    resolve_token_owner_transition,
     welm_token_owner_enabled,
+    welm_token_owner_enabled_for_forward as _welm_token_owner_enabled_for_forward,
+    welm_token_owner_forward_phase as _welm_attntp_fused_norm_phase,
 )
 from sglang.srt.server_args import (
     MAX_AUTO_RUNNING_REQUESTS,
     get_global_server_args,
+    get_welm_decode_token_owner_enabled,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -159,6 +167,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_cuda,
+    log_info_on_rank0,
     make_layers,
     set_weight_attrs,
 )
@@ -166,6 +175,9 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _WELM_CP_FUSED_NORM_FALLBACK_WARNED = False
 _WELM_TP_FUSED_NORM_LONG_PREFILL_FALLBACK_WARNED = False
+_WELM_DISABLE_PREFILL_MIRROR_TOKEN_OWNER = (
+    Envs.SGLANG_WELM_DISABLE_PREFILL_MIRROR_TOKEN_OWNER.get()
+)
 
 
 def _welm_token_owner_enabled(*, pp_size: int) -> bool:
@@ -173,6 +185,57 @@ def _welm_token_owner_enabled(*, pp_size: int) -> bool:
         pp_size=pp_size,
         activation_dump_enabled=_WELM_DUMP_ENABLED,
     )
+
+
+def _welm_token_owner_physical_rows(
+    forward_batch: ForwardBatch,
+    *,
+    post_pruning: bool = False,
+    row_alignment: int = 1,
+) -> int:
+    if row_alignment <= 0:
+        raise ValueError("token-owner row alignment must be positive")
+    if post_pruning:
+        physical_output_size = getattr(forward_batch, "kv_mirror_output_size", None)
+        if physical_output_size is not None:
+            return int(physical_output_size)
+        output_size = getattr(forward_batch, "welm_kv_mirror_output_size", None)
+        if output_size is None:
+            raise RuntimeError(
+                "WeLM token-owner requires welm_kv_mirror_output_size after pruning"
+            )
+        return _welm_ceil_align(int(output_size), row_alignment)
+
+    global_counts = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_counts is not None:
+        if len(global_counts) != 1:
+            raise RuntimeError(
+                "single-group token-owner rows require one global token count"
+            )
+        rows = int(global_counts[0])
+    elif forward_batch.forward_mode.is_extend_without_speculative():
+        rows = getattr(forward_batch, "extend_num_tokens", None)
+        if rows is None:
+            raise RuntimeError(
+                "WeLM token-owner ordinary Prefill requires extend_num_tokens"
+            )
+        rows = int(rows)
+    elif forward_batch.forward_mode.is_target_verify():
+        spec_info = getattr(forward_batch, "spec_info", None)
+        per_request = getattr(spec_info, "num_tokens_per_req", None)
+        if per_request is None:
+            raise RuntimeError(
+                "WeLM token-owner target verify requires num_tokens_per_req"
+            )
+        rows = int(forward_batch.batch_size) * int(per_request)
+    else:
+        batch_size = getattr(forward_batch, "batch_size", None)
+        if batch_size is None:
+            raise RuntimeError("WeLM token-owner requires an explicit batch_size")
+        rows = int(batch_size)
+    if rows < 0:
+        raise RuntimeError("WeLM token-owner physical rows must be non-negative")
+    return rows
 
 
 if welm_v45_80a3_h2048_hd256_pre_attn_v2_enabled():
@@ -667,20 +730,9 @@ def _unpack_welm_kv_mirror_states(
     }
 
 
-def _welm_needs_input_logprobs(forward_batch: ForwardBatch) -> bool:
-    if not getattr(forward_batch, "return_logprob", False):
-        return False
-    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    start_lens = getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
-    if extend_lens is None or start_lens is None:
-        return False
-    return any(
-        int(extend_len) - int(start_len) > 0
-        for extend_len, start_len in zip(extend_lens, start_lens)
-    )
-
-
-def _welm_kv_mirror_row_alignment() -> int:
+def _welm_kv_mirror_row_alignment(
+    forward_batch: Optional[ForwardBatch] = None,
+) -> int:
     """Row alignment required for the contracted hidden-state domain.
 
     With DeepEP + DP-attention the MLP layout is SCATTERED, so every layer's
@@ -692,10 +744,19 @@ def _welm_kv_mirror_row_alignment() -> int:
     and stripped again before the logits processor. Every other backend keeps
     alignment 1, i.e. bitwise-identical behavior.
     """
+    token_owner_enabled = bool(
+        getattr(
+            forward_batch,
+            "welm_token_owner_enabled",
+            getattr(get_global_server_args(), "enable_token_owner", False),
+        )
+    )
+    # Token Owner computes contraction alignment once in its forward plan and
+    # passes it explicitly to _welm_init_kv_mirror_last_q_indices.
     if (
         is_deepep_class_backend()
         and is_dp_attention_enabled()
-        and not bool(getattr(get_global_server_args(), "enable_token_owner", False))
+        and not token_owner_enabled
     ):
         return get_attention_tp_size()
     return 1
@@ -726,7 +787,7 @@ def _welm_kv_mirror_pad_contract_safe(forward_batch: ForwardBatch) -> bool:
     cached = getattr(forward_batch, "_welm_kv_mirror_pad_contract_safe", None)
     if cached is not None:
         return cached
-    align = _welm_kv_mirror_row_alignment()
+    align = _welm_kv_mirror_row_alignment(forward_batch)
     if align <= 1:
         safe = True
     else:
@@ -912,6 +973,12 @@ def _welm_should_dispatch_attention(
 def _welm_select_layer_communicator(layer, forward_batch: ForwardBatch):
     if getattr(forward_batch, "attn_cp_prefill_runtime_layout", None) is not None:
         return layer.prefill_cp_communicator, True
+    if layer.enable_token_owner and not getattr(
+        forward_batch, "welm_token_owner_enabled", True
+    ):
+        if layer.decode_non_owner_communicator is None:
+            raise RuntimeError("WeLM Decode Token Owner was disabled without setup")
+        return layer.decode_non_owner_communicator, False
     return layer.layer_communicator, False
 
 
@@ -1126,6 +1193,23 @@ def _welm_compute_logits_output(
             chunk_states_loader=prepared_logits.chunk_states_loader,
             hidden_states_to_store=prepared_logits.hidden_states_to_store,
         )
+    global_output_rows = getattr(
+        logits_metadata, "global_num_tokens_for_logprob_cpu", None
+    )
+    deferred_flags = getattr(logits_metadata, "welm_deferred_prefill_flags", None)
+    if (
+        hidden_states.shape[0] == 0
+        and deferred_flags
+        and any(deferred_flags)
+        and global_output_rows is not None
+        and not any(map(int, global_output_rows))
+    ):
+        return LogitsProcessorOutput(
+            next_token_logits=hidden_states.new_empty(
+                (0, vocab_size), dtype=torch.float32
+            ),
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
     if (
         getattr(logits_metadata, "prefill_cp_pruned", False)
         and hidden_states.shape[0] == 0
@@ -1285,6 +1369,7 @@ def _welm_create_tp_dp_attntp_fused_norm_managers(
     hidden_size: int,
     residual_after_layernorm: bool,
     model_dtype: torch.dtype = torch.bfloat16,
+    phases: Optional[tuple[str, ...]] = None,
 ) -> dict[str, object]:
     server_args = get_global_server_args()
     if (
@@ -1320,15 +1405,20 @@ def _welm_create_tp_dp_attntp_fused_norm_managers(
             "WeLM AttnTP fused norm attention/group size mismatch: "
             f"{attention.attn_tp_size} != {group.world_size}"
         )
-    role = server_args.disaggregation_mode
-    if role == "prefill":
-        phases = ("prefill",)
-    elif role == "decode":
-        phases = ("decode",)
-    elif role == "null":
-        phases = ("prefill", "decode")
-    else:
-        raise RuntimeError(f"Unsupported disaggregation mode for fused norm: {role}")
+    if phases is None:
+        role = server_args.disaggregation_mode
+        if role == "prefill":
+            phases = ("prefill",)
+        elif role == "decode":
+            phases = ("decode",)
+        elif role == "null":
+            phases = ("prefill", "decode")
+        else:
+            raise RuntimeError(
+                f"Unsupported disaggregation mode for fused norm: {role}"
+            )
+    elif not phases or set(phases) - {"prefill", "decode"}:
+        raise RuntimeError(f"Invalid fused norm phases: {phases}")
 
     configured_max_requests = server_args.max_running_requests
     if configured_max_requests is None:
@@ -1379,35 +1469,6 @@ def _welm_create_tp_dp_attntp_fused_norm_managers(
         )
         for phase in phases
     }
-
-
-def _welm_attntp_fused_norm_phase(forward_batch: ForwardBatch) -> str:
-    forward_mode = forward_batch.forward_mode
-    if getattr(forward_batch, "welm_mtp_variable_decode_extend", False):
-        if forward_mode not in (ForwardMode.EXTEND, ForwardMode.IDLE):
-            raise RuntimeError(
-                "WeLM MTP variable decode extend has incompatible forward mode "
-                f"{forward_mode!r}"
-            )
-        return "decode"
-    if forward_mode in (
-        ForwardMode.DECODE,
-        ForwardMode.IDLE,
-        ForwardMode.TARGET_VERIFY,
-        ForwardMode.DRAFT_EXTEND,
-        ForwardMode.DRAFT_EXTEND_V2,
-    ):
-        return "decode"
-    if forward_mode in (
-        ForwardMode.EXTEND,
-        ForwardMode.MIXED,
-        ForwardMode.SPLIT_PREFILL,
-        ForwardMode.DLLM_EXTEND,
-    ):
-        return "prefill"
-    raise RuntimeError(
-        f"WeLM AttnTP fused norm does not support forward mode {forward_mode!r}"
-    )
 
 
 def _welm_select_tp_dp_attntp_fused_norm_manager(
@@ -1488,7 +1549,11 @@ def _welm_select_tp_dp_attntp_fused_norm_manager(
     return manager
 
 
-def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
+def _welm_init_kv_mirror_last_q_indices(
+    forward_batch: ForwardBatch,
+    *,
+    row_alignment: Optional[int] = None,
+) -> bool:
     forward_batch.welm_kv_mirror_contracted = True
     if getattr(forward_batch, "kv_mirror_output_size", None) is not None:
         return False
@@ -1555,7 +1620,12 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
         # real rows, so pad rows behave exactly like an unfinished chunked
         # request's row) and stripped before the logits processor.
         padded_output_size = _welm_ceil_align(
-            output_size, _welm_kv_mirror_row_alignment()
+            output_size,
+            (
+                _welm_kv_mirror_row_alignment(forward_batch)
+                if row_alignment is None
+                else row_alignment
+            ),
         )
         forward_batch._welm_kv_mirror_row_pad = padded_output_size - output_size
         output_size = padded_output_size
@@ -1593,8 +1663,16 @@ def _welm_init_kv_mirror_last_q_indices(forward_batch: ForwardBatch) -> bool:
                 "KV mirror CPU last-Q and active-request metadata must align"
             )
         forward_batch.welm_kv_mirror_last_q_indices_cpu = cpu_last_q_indices
-        forward_batch.welm_kv_mirror_active_batch_indices_cpu = cpu_active_batch_indices
-    elif bool(getattr(get_global_server_args(), "enable_token_owner", False)):
+        forward_batch.welm_kv_mirror_active_batch_indices_cpu = (
+            cpu_active_batch_indices
+        )
+    elif bool(
+        getattr(
+            forward_batch,
+            "welm_token_owner_enabled",
+            getattr(get_global_server_args(), "enable_token_owner", False),
+        )
+    ):
         raise RuntimeError(
             "WeLM token-owner KV mirror requires CPU row metadata; refusing "
             "to synchronize CUDA indices"
@@ -1760,14 +1838,24 @@ def _welm_update_contracted_dp_metadata(
     synchronized_global_num_tokens_for_logprob: Optional[List[int]] = None,
     force_sum_len: bool = False,
 ) -> None:
+    new_local_num_tokens = int(new_local_num_tokens)
+    if not is_dp_attention_enabled():
+        if (
+            getattr(
+                forward_batch,
+                "welm_token_owner_enabled",
+                get_global_server_args().enable_token_owner,
+            )
+            and marker_attr is not None
+        ):
+            setattr(forward_batch, marker_attr, new_local_num_tokens)
+        return
     if (
-        not is_dp_attention_enabled()
-        or welm_use_previous_precision()
+        welm_use_previous_precision()
         or getattr(forward_batch, "global_num_tokens_gpu", None) is None
     ):
         return
 
-    new_local_num_tokens = int(new_local_num_tokens)
     if marker_attr is not None and (
         getattr(forward_batch, marker_attr, None) == new_local_num_tokens
     ):
@@ -1870,7 +1958,7 @@ def _welm_update_contracted_dp_metadata(
         # un-padded per-request counts: exactly one logits row per request
         # reaches the logits processor because the pad rows are stripped
         # before it runs.
-        row_align = _welm_kv_mirror_row_alignment()
+        row_align = _welm_kv_mirror_row_alignment(forward_batch)
 
         # In a normal mixed extend/decode batch, only extend ranks contract at
         # the first KV-mirror layer.  Decode ranks keep the row padding that was
@@ -2895,8 +2983,12 @@ class MirrorQProjection(BaseWelmQkvProjection):
                 )
                 forward_batch.welm_kv_mirror_full_q_attention = False
             else:
-                first_contract = (
-                    hidden_states.shape[0] != forward_batch.kv_mirror_output_size
+                first_contract = bool(
+                    getattr(
+                        forward_batch,
+                        "welm_kv_mirror_full_q_attention",
+                        hidden_states.shape[0] != forward_batch.kv_mirror_output_size,
+                    )
                 )
                 forward_batch.welm_kv_mirror_full_q_attention = first_contract
                 if not first_contract:
@@ -4982,28 +5074,47 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.config_layer_id = config_layer_id
         self.is_nextn = is_nextn
         self.token_owner_runtime = token_owner_runtime
+        self.token_owner_layer_identity = TokenOwnerLayerIdentity.PRE_MIRROR
         self.enable_token_owner = token_owner_runtime is not None
+        self.disable_prefill_mirror_token_owner = bool(
+            token_owner_runtime is not None
+            and token_owner_runtime.disable_prefill_mirror_token_owner
+        )
         self.token_owner_uses_global_tp_moe = (
             self.enable_token_owner and get_moe_a2a_backend().is_none()
+        )
+        server_args = get_global_server_args()
+        needs_decode_non_owner = (
+            self.enable_token_owner
+            and server_args.disaggregation_mode != "prefill"
+            and not get_welm_decode_token_owner_enabled(server_args)
         )
         self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
 
         # Qwen2MoE all layers are sparse (include nextn layers)
         self.is_layer_sparse = True
-        standalone_nextn = is_nextn and self.enable_token_owner
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=0 if standalone_nextn else config_layer_id,
-            num_layers=(
-                1
-                if standalone_nextn
-                else total_layer_num + (num_nextn_predict_layers if is_nextn else 0)
-            ),
+        non_owner_scatter_mode_kwargs = dict(
+            layer_id=config_layer_id,
+            num_layers=total_layer_num
+            + (num_nextn_predict_layers if is_nextn else 0),
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=True,
             is_next_layer_sparse=True,
+        )
+        standalone_nextn = is_nextn and self.enable_token_owner
+        layer_scatter_mode_kwargs = (
+            {
+                **non_owner_scatter_mode_kwargs,
+                "layer_id": 0,
+                "num_layers": 1,
+            }
+            if standalone_nextn
+            else non_owner_scatter_mode_kwargs
+        )
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            **layer_scatter_mode_kwargs,
             enable_token_owner=self.enable_token_owner,
         )
-
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -5035,14 +5146,49 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.decode_non_owner_communicator = None
+        if needs_decode_non_owner:
+            self.decode_non_owner_communicator = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    **layer_scatter_mode_kwargs,
+                    enable_token_owner=False,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+            )
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            token_owner_layout_provider=token_owner_runtime,
             pre_mlp_norm=self.self_attn.o_norm if self.enable_token_owner else None,
         )
+        self.prefill_mirror_communicator = None
+        is_kv_mirror_tail = bool(self.kv_mirror_layers) and (
+            self.self_attn.kv_mirror_layer_idx >= min(self.kv_mirror_layers)
+        )
+        if (
+            self.disable_prefill_mirror_token_owner
+            and self.enable_token_owner
+            and is_kv_mirror_tail
+            and not self.is_nextn
+        ):
+            self.prefill_mirror_communicator = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes.init_new(
+                    **layer_scatter_mode_kwargs,
+                    enable_token_owner=False,
+                ),
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                pre_mlp_norm=(
+                    self.self_attn.o_norm
+                    if not is_dp_attention_enabled() and self.self_attn.use_o_norm
+                    else None
+                ),
+            )
         residual_after_layernorm = (
             self.ppln and self.config_layer_id not in self.prenorm_layer_idx
         )
@@ -5059,14 +5205,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
             ),
         )
         self.tp_dp_attntp_fused_norm_managers = (
-            {}
-            if self.enable_token_owner
-            else _welm_create_tp_dp_attntp_fused_norm_managers(
+            _welm_create_tp_dp_attntp_fused_norm_managers(
                 attention=self.self_attn,
                 hidden_size=self.hidden_size,
                 residual_after_layernorm=residual_after_layernorm,
                 model_dtype=self.input_layernorm.weight.dtype,
+                phases=("decode",) if needs_decode_non_owner else None,
             )
+            if not self.enable_token_owner or needs_decode_non_owner
+            else {}
         )
         if self.enable_token_owner and layer_id == 0:
             logger.warning(
@@ -5086,19 +5233,92 @@ class Qwen2MoeDecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]
     ]:
         use_previous_precision = welm_use_previous_precision()
-        enable_token_owner = self.enable_token_owner
-        token_owner_uses_global_tp_moe = (
-            enable_token_owner and self.token_owner_uses_global_tp_moe
+        dp_attention_enabled = is_dp_attention_enabled()
+        enable_token_owner = self.enable_token_owner and bool(
+            getattr(forward_batch, "welm_token_owner_enabled", True)
         )
+        owner_state = (
+            self.token_owner_runtime.state_for(
+                forward_batch, self.token_owner_layer_identity
+            )
+            if enable_token_owner
+            else None
+        )
+        at_owner_boundary = bool(
+            owner_state is not None
+            and owner_state.transitions_rows
+        )
+        if at_owner_boundary:
+            forward_batch.welm_kv_mirror_full_q_attention = (
+                owner_state.local_contracts_rows
+            )
         layer_communicator, use_prefill_cp_communicator = (
             _welm_select_layer_communicator(self, forward_batch)
         )
-        tp_dp_attntp_fused_norm_manager = _welm_select_tp_dp_attntp_fused_norm_manager(
-            self,
-            forward_batch,
-            use_prefill_cp_communicator=use_prefill_cp_communicator,
+        is_kv_mirror_layer = (
+            self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         )
-        use_tp_dp_attntp_fused_norm = tp_dp_attntp_fused_norm_manager is not None
+        input_layer_communicator = output_layer_communicator = layer_communicator
+        output_layer_scatter_modes = None
+        owner_input = owner_state.owner_input if owner_state is not None else False
+        owner_output = owner_state.owner_output if owner_state is not None else False
+        input_owner_layout = (
+            owner_state.input_local_layout if owner_input else None
+        )
+        output_owner_layout = (
+            owner_state.output_local_layout if owner_output else None
+        )
+        input_transport_layout = (
+            owner_state.transport_local_layout
+            if owner_state is not None and not owner_input
+            else None
+        )
+        output_transport_layout = (
+            owner_state.transport_local_layout
+            if owner_state is not None and not owner_output
+            else None
+        )
+        if enable_token_owner and (not owner_input or not owner_output):
+            if use_prefill_cp_communicator:
+                raise RuntimeError(
+                    "WeLM Prefill mirror Token Owner exit cannot use Prefill CP"
+                )
+            replicated = self.prefill_mirror_communicator
+            if replicated is None:
+                raise RuntimeError(
+                    "WeLM Prefill mirror Token Owner exit has no replicated "
+                    "communicator"
+                )
+            input_layer_communicator = (
+                self.layer_communicator if owner_input else replicated
+            )
+            output_layer_communicator = (
+                self.layer_communicator if owner_output else replicated
+            )
+            output_layer_scatter_modes = (
+                output_layer_communicator.layer_scatter_modes
+            )
+        active_layer_scatter_modes = output_layer_scatter_modes or getattr(
+            layer_communicator,
+            "layer_scatter_modes",
+            getattr(self, "layer_scatter_modes", None),
+        )
+        token_owner_uses_global_tp_moe = (
+            owner_output and self.token_owner_uses_global_tp_moe
+        )
+        exits_token_owner = owner_input and not owner_output
+        tp_dp_attntp_fused_norm_manager = (
+            None
+            if enable_token_owner
+            else _welm_select_tp_dp_attntp_fused_norm_manager(
+                self,
+                forward_batch,
+                use_prefill_cp_communicator=use_prefill_cp_communicator,
+            )
+        )
+        use_tp_dp_attntp_fused_norm = (
+            tp_dp_attntp_fused_norm_manager is not None
+        )
         if use_prefill_cp_communicator and not self._prefill_cp_mlp_validated:
             layer_communicator.validate_mlp(self.mlp)
             self._prefill_cp_mlp_validated = True
@@ -5114,9 +5334,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual_after_layernorm = (
             self.ppln and self.config_layer_id not in self.prenorm_layer_idx
         )
-        use_dp_layer_communicator = is_dp_attention_enabled()
+        use_standard_layer_communicator = (
+            dp_attention_enabled or enable_token_owner
+        )
         use_layer_communicator = (
-            use_dp_layer_communicator or use_prefill_cp_communicator
+            use_standard_layer_communicator or use_prefill_cp_communicator
         )
         use_fp32_ppln_residual = residual_after_layernorm and not use_layer_communicator
         if use_previous_precision:
@@ -5136,12 +5358,40 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch,
                 residual_after_layernorm=residual_after_layernorm,
             )
-        elif use_dp_layer_communicator:
-            hidden_states, residual = layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch
-            )
+        elif use_standard_layer_communicator:
+            if exits_token_owner and not residual_after_layernorm:
+                hidden_states, residual = input_layer_communicator.prepare_attn(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    gather_token_owner_residual=True,
+                    token_owner_layout=input_owner_layout,
+                )
+            else:
+                hidden_states, residual = input_layer_communicator.prepare_attn(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    token_owner_layout=input_owner_layout,
+                    transport_local_layout=input_transport_layout,
+                )
             if residual_after_layernorm:
-                residual = hidden_states.to(torch.float32)
+                layer_input_mode = (
+                    output_layer_scatter_modes.layer_input_mode
+                    if output_layer_scatter_modes is not None
+                    else active_layer_scatter_modes.layer_input_mode
+                )
+                token_owner_scattered = (
+                    owner_output
+                    and layer_input_mode == ScatterMode.SCATTERED
+                    and self.self_attn.attn_tp_size > 1
+                )
+                if token_owner_scattered:
+                    residual = input_owner_layout.local_rows(hidden_states).to(
+                        torch.float32, copy=True
+                    )
+                else:
+                    residual = hidden_states.to(torch.float32)
                 # DeepEP fix: with an a2a MoE backend the MLP mode is SCATTERED,
                 # so every layer whose layer_input_mode is SCATTERED (all layers
                 # after the prenorm layer) declares its residual already
@@ -5154,37 +5404,31 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 # sparse layers. Layer 0 (input mode TP_ATTN_FULL) is untouched
                 # and is sliced in prepare_mlp.
                 if (
-                    self.layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                    not token_owner_scattered
+                    and layer_input_mode == ScatterMode.SCATTERED
                     and self.self_attn.attn_tp_size > 1
                 ):
-                    # First contracting mirror layer with row alignment active
-                    # (DeepEP + DP-attention): residual here is the full
-                    # T-domain post-LN hidden, attn-TP replicated -- the only
-                    # point where the contracted residual can be built from
-                    # local data. Contract + pad it BEFORE the per-rank slice,
-                    # so between-layer residuals are the scattered slice of
-                    # the padded contracted domain (matching hidden). Without
-                    # this, the post-attn align would gather T-domain
-                    # custom_last indices out of a 1/attn_tp slice -> CUDA
-                    # index-out-of-bounds.
+                    # Preserve the legacy non-owner contract-before-split order.
                     if (
-                        _welm_kv_mirror_row_alignment() > 1
-                        and self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
+                        owner_state is None
+                        and _welm_kv_mirror_row_alignment(forward_batch) > 1
+                        and is_kv_mirror_layer
                         and _welm_should_contract_kv_mirror(forward_batch)
                     ):
                         _welm_init_kv_mirror_last_q_indices(forward_batch)
-                        if residual.shape[0] != forward_batch.kv_mirror_output_size:
+                        if (
+                            residual.shape[0]
+                            != forward_batch.kv_mirror_output_size
+                        ):
                             residual = _welm_scatter_kv_mirror_rows(
                                 _welm_select_kv_mirror_rows(
-                                    residual, forward_batch, first_contract=True
+                                    residual,
+                                    forward_batch,
+                                    first_contract=True,
                                 ),
                                 forward_batch,
                             )
-                    if enable_token_owner:
-                        residual = self.token_owner_runtime.local_layout(
-                            forward_batch
-                        ).local_rows(residual)
-                    else:
+                    if not exits_token_owner:
                         residual = residual.tensor_split(self.self_attn.attn_tp_size)[
                             self.self_attn.attn_tp_rank
                         ]
@@ -5211,6 +5455,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     else hidden_states.dtype
                 ),
             )
+        layer_communicator = output_layer_communicator
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.input_layernorm.0", hidden_states
@@ -5229,18 +5474,39 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states.clone().to(
                 dtype=hidden_states.dtype, device=hidden_states.device
             )
-        use_mmq_norm_after_attn = (
-            _welm_should_use_mmq_norm_after_attn(
-                use_previous_precision=use_previous_precision,
-                residual_after_layernorm=residual_after_layernorm,
-                use_o_norm=self.self_attn.use_o_norm,
-                o_norm_needs_attn_tp_reduce=(
-                    self.self_attn.o_norm_needs_attn_tp_reduce
-                ),
-                use_prefill_cp_communicator=use_prefill_cp_communicator,
+        pure_tp_mirror_output = (
+            output_layer_scatter_modes is not None
+            and not owner_output
+            and not dp_attention_enabled
+        )
+        if pure_tp_mirror_output and (
+            not self.self_attn.o_proj.reduce_results
+            or self.self_attn.o_proj_suffix_parallel_reduce
+            or self.self_attn.o_norm_needs_attn_tp_reduce
+        ):
+            raise RuntimeError(
+                "WeLM pure-TP Prefill mirror Token Owner exit requires the "
+                "native pure-TP o_proj reduction topology"
             )
-            and not use_tp_dp_attntp_fused_norm
-            and not enable_token_owner
+        mirror_output_scattered = (
+            pure_tp_mirror_output
+            and output_layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED
+        )
+        use_mmq_norm_after_attn = _welm_should_use_mmq_norm_after_attn(
+            use_previous_precision=use_previous_precision,
+            residual_after_layernorm=residual_after_layernorm,
+            use_o_norm=self.self_attn.use_o_norm,
+            o_norm_needs_attn_tp_reduce=(
+                self.self_attn.o_norm_needs_attn_tp_reduce
+            ),
+            use_prefill_cp_communicator=use_prefill_cp_communicator,
+        ) and not (
+            use_tp_dp_attntp_fused_norm
+            or owner_output
+            or mirror_output_scattered
+        )
+        reduce_mirror_output_in_communicator = (
+            pure_tp_mirror_output and not use_mmq_norm_after_attn
         )
         use_prefill_cp_attntp2_fused_norm = (
             _welm_should_use_prefill_cp_attntp2_fused_norm(
@@ -5255,11 +5521,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
             )
         )
+        skip_o_proj_reduce = (
+            use_prefill_cp_attntp2_fused_norm
+            or use_tp_dp_attntp_fused_norm
+            or reduce_mirror_output_in_communicator
+            or owner_output
+        )
         needs_empty_dp_collectives = _welm_needs_empty_dp_collectives(
             forward_batch,
             is_nextn=self.is_nextn,
         )
-        is_kv_mirror_layer = self.self_attn.kv_mirror_layer_idx in self.kv_mirror_layers
         if (
             use_prefill_cp_communicator
             and is_kv_mirror_layer
@@ -5274,60 +5545,54 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 kv_mirror_states=kv_mirror_states,
-                skip_o_norm=(
-                    use_mmq_norm_after_attn
-                    or use_prefill_cp_attntp2_fused_norm
-                    or use_tp_dp_attntp_fused_norm
-                    or enable_token_owner
-                ),
-                skip_o_proj_reduce=(
-                    use_prefill_cp_attntp2_fused_norm
-                    or use_tp_dp_attntp_fused_norm
-                    or enable_token_owner
-                ),
+                skip_o_norm=use_mmq_norm_after_attn or skip_o_proj_reduce,
+                skip_o_proj_reduce=skip_o_proj_reduce,
             )
-        mirror_owner_layout_just_contracted = False
-        if (
-            _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
+        if at_owner_boundary:
+            self.token_owner_runtime.publish_boundary_transport(
+                forward_batch, owner_state
+            )
+        elif (
+            owner_state is None
+            and _welm_should_sync_kv_mirror_dp_metadata(forward_batch)
             and is_kv_mirror_layer
             and not self.is_nextn
             and not use_previous_precision
         ):
-            marker_attr = "_welm_kv_mirror_contracted_dp_metadata_rows"
-            previous_contracted_rows = getattr(forward_batch, marker_attr, None)
             _welm_update_contracted_dp_metadata(
                 forward_batch,
                 hidden_states.shape[0],
-                marker_attr=marker_attr,
+                marker_attr="_welm_kv_mirror_contracted_dp_metadata_rows",
                 contract_to_request_counts=True,
             )
-            contracted_rows = getattr(forward_batch, marker_attr, None)
-            if enable_token_owner and contracted_rows != previous_contracted_rows:
-                self.token_owner_runtime.invalidate()
-            mirror_owner_layout_just_contracted = (
-                enable_token_owner
-                and previous_contracted_rows is None
-                and contracted_rows is not None
-                and self.token_owner_runtime.local_contraction_active(forward_batch)
-            )
         if (
-            _welm_should_contract_kv_mirror(forward_batch)
-            and is_kv_mirror_layer
+            at_owner_boundary
             and residual is not None
+            and (owner_state.local_contracts_rows or exits_token_owner)
         ):
-            if enable_token_owner:
-                if mirror_owner_layout_just_contracted:
-                    residual = self.token_owner_runtime.align_kv_mirror_residual(
-                        residual,
-                        forward_batch,
-                    )
-            elif residual.shape[0] != hidden_states.shape[0]:
+            residual = self.token_owner_runtime.contract_boundary_residual(
+                residual,
+                owner_state,
+                output_scattered=(
+                    exits_token_owner
+                    and output_layer_scatter_modes is not None
+                    and output_layer_scatter_modes.layer_input_mode
+                    == ScatterMode.SCATTERED
+                ),
+            )
+        elif is_kv_mirror_layer and residual is not None:
+            contracts_local_rows = _welm_should_contract_kv_mirror(forward_batch)
+            if (
+                owner_state is None
+                and contracts_local_rows
+                and residual.shape[0] != hidden_states.shape[0]
+            ):
                 # With row alignment active (DeepEP + DP-attention) the residual
                 # between layers is this attn-TP rank's SCATTERED slice of the
                 # padded contracted domain (rows == output_size / attn_tp). It is
                 # already what prepare_mlp expects for SCATTERED residuals; re-
                 # aligning would gather T-domain indices out of the small slice.
-                row_align = _welm_kv_mirror_row_alignment()
+                row_align = _welm_kv_mirror_row_alignment(forward_batch)
                 output_size = getattr(forward_batch, "kv_mirror_output_size", None)
                 residual_is_padded_slice = (
                     row_align > 1
@@ -5386,7 +5651,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.post_attention_layernorm.eps,
                 execution=execution,
             )
-            if use_dp_layer_communicator:
+            if use_standard_layer_communicator:
                 hidden_states, residual = (
                     layer_communicator.prepare_mlp_from_fused_attntp(
                         hidden_states,
@@ -5421,9 +5686,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.post_attention_layernorm.eps,
             )
             if (
-                is_dp_attention_enabled()
+                dp_attention_enabled
                 and self.self_attn.attn_tp_size == 1
-                and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+                and (
+                    output_layer_scatter_modes.mlp_mode
+                    if output_layer_scatter_modes is not None
+                    else active_layer_scatter_modes.mlp_mode
+                )
+                == ScatterMode.FULL
             ):
                 from sglang.srt.layers.dp_attention import (
                     dp_gather_partial,
@@ -5437,14 +5707,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     hidden_states_fp32 = hidden_states.to(torch.float32)
         else:
             if use_layer_communicator and not use_previous_precision:
-                hidden_states, residual = layer_communicator.prepare_mlp(
-                    hidden_states, residual, forward_batch
-                )
+                if use_prefill_cp_communicator:
+                    hidden_states, residual = layer_communicator.prepare_mlp(
+                        hidden_states, residual, forward_batch
+                    )
+                else:
+                    hidden_states, residual = layer_communicator.prepare_mlp(
+                        hidden_states,
+                        residual,
+                        forward_batch,
+                        token_owner_layout=output_owner_layout,
+                    )
                 hidden_states_fp32 = (
-                    hidden_states.to(torch.float32)
-                    if dump_this_layer
-                    or (not use_prefill_cp_communicator and not enable_token_owner)
-                    else None
+                    hidden_states.to(torch.float32) if dump_this_layer else None
                 )
             else:
                 (
@@ -5471,7 +5746,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             use_prefill_cp_communicator
             or token_owner_uses_global_tp_moe
             or (
-                use_dp_layer_communicator
+                use_standard_layer_communicator
                 and forward_batch.dp_padding_mode is not None
                 and not is_suffix_parallel_enabled()
                 and layer_communicator.should_use_reduce_scatter(forward_batch)
@@ -5482,8 +5757,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and self.is_final_layer
             and residual is not None
             and getattr(self.mlp, "tp_size", 1) == 1
-            and not is_dp_attention_enabled()
+            and not dp_attention_enabled
             and not use_prefill_cp_communicator
+            and not enable_token_owner
         )
         return_mlp_components = (
             dump_this_layer
@@ -5500,19 +5776,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and not layer_communicator.use_ep_dispatch
             and not skip_empty_cp_mlp
         ):
-            router_context = layer_communicator.build_router_context(forward_batch)
-        elif token_owner_uses_global_tp_moe:
-            router_context = self.token_owner_runtime.build_router_context(
-                forward_batch,
-                device=hidden_states.device,
-                use_deepep=False,
+            router_context = layer_communicator.build_router_context(
+                forward_batch
             )
-        elif enable_token_owner and is_deepep_class_backend():
-            router_context = self.token_owner_runtime.build_router_context(
-                forward_batch,
-                device=hidden_states.device,
-                use_deepep=True,
-            )
+        elif token_owner_uses_global_tp_moe or (
+            owner_output and is_deepep_class_backend()
+        ):
+            router_context = owner_state.router_context
         if skip_empty_cp_mlp:
             mlp_output = hidden_states
         else:
@@ -5535,9 +5805,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states = mlp_output
 
         if use_layer_communicator and not use_previous_precision:
-            hidden_states, residual = layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+            if use_prefill_cp_communicator:
+                hidden_states, residual = layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
+            else:
+                hidden_states, residual = layer_communicator.postprocess_layer(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    token_owner_global_layout=(
+                        owner_state.output_global_layout if owner_output else None
+                    ),
+                    token_owner_local_layout=output_owner_layout,
+                    transport_local_layout=output_transport_layout,
+                )
 
         if self.is_final_layer and not use_previous_precision:
             self.final_mlp_experts_output = experts_output
@@ -5604,9 +5886,44 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        enable_token_owner = _welm_token_owner_enabled(pp_size=self.pp_group.world_size)
+        server_args = get_global_server_args()
+        enable_token_owner = _welm_token_owner_enabled(
+            pp_size=self.pp_group.world_size
+        )
+        self.decode_token_owner_enabled = (
+            enable_token_owner
+            and get_welm_decode_token_owner_enabled(server_args)
+        )
+        self.disable_prefill_mirror_token_owner = False
+        kv_mirror_layers, kv_mirror_imitated_layers = (
+            _welm_effective_kv_mirror_pairs(config)
+        )
+        if enable_token_owner and _WELM_DISABLE_PREFILL_MIRROR_TOKEN_OWNER:
+            target_layer_count = getattr(
+                config, "num_target_hidden_layers", config.num_hidden_layers
+            )
+            has_effective_kv_mirror_pair = any(
+                0 <= mirror < target_layer_count and 0 <= imitated < target_layer_count
+                for mirror, imitated in zip(
+                    kv_mirror_layers, kv_mirror_imitated_layers
+                )
+            )
+            self.disable_prefill_mirror_token_owner = bool(
+                server_args.enable_welm_kv_mirror_opt
+                and has_effective_kv_mirror_pair
+            )
+        if self.disable_prefill_mirror_token_owner:
+            log_info_on_rank0(
+                logger, "WeLM ordinary Prefill exits Token Owner at KV-mirror layers"
+            )
         self.token_owner_runtime = (
-            WeLMTokenOwnerRuntime() if enable_token_owner else None
+            WeLMTokenOwnerRuntime(
+                disable_prefill_mirror_token_owner=(
+                    self.disable_prefill_mirror_token_owner
+                )
+            )
+            if enable_token_owner
+            else None
         )
 
         self.oe_dim = config.oe_dim
@@ -5614,7 +5931,7 @@ class Qwen2MoeModel(nn.Module):
         self.oe_vocab_sizes = config.oe_vocab_sizes
         self.scale_seq_times = getattr(config, "scale_seq_times", 0)
         shared_embeddings_enabled = (
-            get_global_server_args().welm_shared_embedding_policy != "disabled"
+            server_args.welm_shared_embedding_policy != "disabled"
         )
         if shared_embeddings_enabled and self.scale_seq_times > 0:
             raise ValueError(
@@ -5645,7 +5962,7 @@ class Qwen2MoeModel(nn.Module):
                                 self.oe_vocab_sizes[i],
                                 self.oe_dim,
                                 use_attn_tp_group=is_dp_attention_enabled(),
-                                padding_size=get_global_server_args().welm_vocab_padding_size,
+                                padding_size=server_args.welm_vocab_padding_size,
                             )
                             for i in range(len(self.oe_vocab_sizes))
                         ]
@@ -5667,7 +5984,7 @@ class Qwen2MoeModel(nn.Module):
                         config.vocab_size,
                         config.hidden_size,
                         use_attn_tp_group=is_dp_attention_enabled(),
-                        padding_size=get_global_server_args().welm_vocab_padding_size,
+                        padding_size=server_args.welm_vocab_padding_size,
                     )
                     for _ in range(self.scale_seq_times)
                 ]
@@ -5681,7 +5998,7 @@ class Qwen2MoeModel(nn.Module):
                                     self.oe_vocab_sizes[j],
                                     self.oe_dim,
                                     use_attn_tp_group=is_dp_attention_enabled(),
-                                    padding_size=get_global_server_args().welm_vocab_padding_size,
+                                    padding_size=server_args.welm_vocab_padding_size,
                                 )
                                 for j in range(len(self.oe_vocab_sizes))
                             ]
@@ -5717,7 +6034,7 @@ class Qwen2MoeModel(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     use_attn_tp_group=is_dp_attention_enabled(),
-                    padding_size=get_global_server_args().welm_vocab_padding_size,
+                    padding_size=server_args.welm_vocab_padding_size,
                     prefix=add_prefix("embed_tokens", prefix),
                 )
         else:
@@ -5746,10 +6063,28 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         self._bind_monolithic_deferred_target_kv_finalizers()
+        self.token_owner_boundary_layer = None
+        if self.token_owner_runtime is not None:
+            local_end_layer = min(self.end_layer, self.execution_end_layer)
+            (
+                self.token_owner_boundary_layer,
+                token_owner_identities,
+            ) = classify_token_owner_layers(
+                local_start_layer=self.start_layer,
+                local_end_layer=local_end_layer,
+                execution_start_layer=0,
+                execution_end_layer=self.execution_end_layer,
+                mirror_targets=kv_mirror_layers,
+            )
+            for layer_id, identity in zip(
+                range(self.start_layer, local_end_layer),
+                token_owner_identities,
+                strict=True,
+            ):
+                self.layers[layer_id].token_owner_layer_identity = identity
         self.mk_moe_router = None
         mk_moe_router_mode = get_mk_moe_router_mode()
         if mk_moe_router_mode is not MkMoeRouterMode.OFF:
-            server_args = get_global_server_args()
             local_moe_blocks = [
                 self.layers[layer_id].mlp
                 for layer_id in range(self.start_layer, self.end_layer)
@@ -5887,10 +6222,9 @@ class Qwen2MoeModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         skip_oe_fusion: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self.token_owner_runtime is not None:
-            self.token_owner_runtime.begin_forward(forward_batch)
-
-        deferred_prefill = bool(getattr(forward_batch, "welm_deferred_prefill", False))
+        deferred_prefill = bool(
+            getattr(forward_batch, "welm_deferred_prefill", False)
+        )
         deferred_prefill_flags = getattr(
             forward_batch, "welm_deferred_prefill_flags", None
         )
@@ -5936,6 +6270,13 @@ class Qwen2MoeModel(nn.Module):
         else:
             runtime_end_layer = self.execution_end_layer
 
+        forward_batch.welm_token_owner_enabled = bool(
+            self.token_owner_runtime is not None
+            and _welm_token_owner_enabled_for_forward(
+                forward_batch,
+                decode_token_owner_enabled=self.decode_token_owner_enabled,
+            )
+        )
         if _WELM_DUMP_ENABLED:
             _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
@@ -5970,6 +6311,33 @@ class Qwen2MoeModel(nn.Module):
             hidden_states, positions = _welm_localize_cp_prefill_rows(
                 hidden_states, positions, forward_batch
             )
+        token_owner_plan = None
+        if forward_batch.welm_token_owner_enabled:
+            transition = resolve_token_owner_transition(
+                forward_batch,
+                has_mirror_boundary=self.token_owner_boundary_layer is not None,
+                exit_owner=self.disable_prefill_mirror_token_owner,
+            )
+            token_owner_plan = self.token_owner_runtime.begin_forward(
+                forward_batch,
+                single_group_physical_rows=(
+                    _welm_token_owner_physical_rows(forward_batch)
+                    if not is_dp_attention_enabled()
+                    else None
+                ),
+                transition=transition,
+                device=hidden_states.device,
+            )
+            initial_layout = token_owner_plan.state_for(
+                TokenOwnerLayerIdentity.PRE_MIRROR
+            ).input_local_layout
+            if (
+                initial_layout is None
+                or hidden_states.shape[0] != initial_layout.valid_token_count
+            ):
+                raise RuntimeError(
+                    "WeLM token-owner model input rows do not match the forward plan"
+                )
         if self.mk_moe_router is not None:
             self.mk_moe_router.begin_forward(
                 forward_batch=forward_batch,
@@ -6018,7 +6386,16 @@ class Qwen2MoeModel(nn.Module):
                         if not kv_mirror_indices_initialized:
                             # PP can split mirror layers across ranks; initialize
                             # before the first local mirror-layer skip check.
-                            _welm_init_kv_mirror_last_q_indices(forward_batch)
+                            _welm_init_kv_mirror_last_q_indices(
+                                forward_batch,
+                                row_alignment=(
+                                    token_owner_plan.row_alignment
+                                    if token_owner_plan is not None
+                                    and layer.token_owner_layer_identity
+                                    is TokenOwnerLayerIdentity.MIRROR_BOUNDARY
+                                    else None
+                                ),
+                            )
                             kv_mirror_indices_initialized = True
                     hidden_states, residual, kv_mirror_states = layer(
                         positions,
@@ -6051,8 +6428,13 @@ class Qwen2MoeModel(nn.Module):
                             forward_batch,
                         )
                     )
-                    if self.token_owner_runtime is not None and not suffix_is_empty:
-                        self.token_owner_runtime.invalidate()
+                    if token_owner_plan is not None and not suffix_is_empty:
+                        token_owner_plan = self.token_owner_runtime.begin_forward(
+                            forward_batch,
+                            single_group_physical_rows=None,
+                            transition=token_owner_plan.transition,
+                            device=hidden_states.device,
+                        )
                     if suffix_is_empty:
                         break
         omit_final_output = deferred_prefill or (
@@ -6300,6 +6682,23 @@ class WeLMV4MoeForCausalLM(nn.Module):
             if isinstance(model_output, tuple):
                 raise RuntimeError(
                     "WeLM deferred Prefill does not support hidden-state output payloads"
+                )
+            global_output_rows = getattr(
+                forward_batch, "global_num_tokens_for_logprob_cpu", None
+            )
+            if (
+                self.deferred_execution.role
+                is WelmDeferredExecutionRole.MONOLITHIC
+                and getattr(forward_batch, "welm_deferred_prefill_flags", None)
+                and global_output_rows is not None
+                and any(map(int, global_output_rows))
+            ):
+                # The local deferred slot has no logits, but its Global-TP ranks
+                # must join the active peer's hidden/vocab gathers.
+                self.logits_processor._get_logits(
+                    model_output,
+                    self.lm_head,
+                    LogitsMetadata.from_forward_batch(forward_batch),
                 )
             capture_hidden_mode = getattr(forward_batch, "capture_hidden_mode", None)
             if getattr(forward_batch, "return_logprob", False) or (

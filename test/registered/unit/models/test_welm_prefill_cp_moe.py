@@ -896,6 +896,7 @@ def test_prefill_cp_ppln_keeps_communicator_fp32_residual(
             return hidden_states
 
     layer = SimpleNamespace(
+        enable_token_owner=False,
         layer_communicator=object(),
         prefill_cp_communicator=PrefillCommunicator(),
         _prefill_cp_mlp_validated=False,
@@ -1042,6 +1043,7 @@ def test_prefill_cp_ppln_routes_attntp2_partial_through_fused_norm(monkeypatch):
 
     communicator = PrefillCommunicator()
     layer = SimpleNamespace(
+        enable_token_owner=False,
         layer_communicator=object(),
         prefill_cp_communicator=communicator,
         _prefill_cp_mlp_validated=False,
@@ -1182,6 +1184,7 @@ def test_tp_ppln_routes_partial_through_autotuned_fused_norm(monkeypatch):
             return hidden_states
 
     layer = SimpleNamespace(
+        enable_token_owner=False,
         layer_communicator=object(),
         prefill_cp_communicator=object(),
         tp_dp_attntp_fused_norm_managers={"prefill": Manager()},
@@ -1262,7 +1265,7 @@ def test_dp_ppln_routes_partial_through_autotuned_fused_norm(monkeypatch):
     mlp_hidden = torch.full((4, 2048), 6.0, dtype=torch.bfloat16)
 
     class LayerCommunicator:
-        def prepare_attn(self, hidden_states, residual, forward_batch):
+        def prepare_attn(self, hidden_states, residual, forward_batch, **_kwargs):
             return torch.cat((hidden_states, hidden_states)), residual
 
         def prepare_mlp(self, *_args, **_kwargs):
@@ -1277,7 +1280,9 @@ def test_dp_ppln_routes_partial_through_autotuned_fused_norm(monkeypatch):
         def should_use_reduce_scatter(self, forward_batch):
             return False
 
-        def postprocess_layer(self, hidden_states, residual, forward_batch):
+        def postprocess_layer(
+            self, hidden_states, residual, forward_batch, **_kwargs
+        ):
             captured["postprocess_args"] = (hidden_states, residual, forward_batch)
             return hidden_states, residual
 
@@ -1330,6 +1335,7 @@ def test_dp_ppln_routes_partial_through_autotuned_fused_norm(monkeypatch):
 
     communicator = LayerCommunicator()
     layer = SimpleNamespace(
+        enable_token_owner=False,
         layer_communicator=communicator,
         prefill_cp_communicator=object(),
         tp_dp_attntp_fused_norm_managers={"decode": Manager()},
@@ -1695,6 +1701,7 @@ def test_non_dp_decode_does_not_select_layer_communicator_reduce_scatter(monkeyp
             return hidden_states
 
     layer = SimpleNamespace(
+        enable_token_owner=False,
         layer_communicator=communicator,
         prefill_cp_communicator=object(),
         _prefill_cp_mlp_validated=False,

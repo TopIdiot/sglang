@@ -86,6 +86,39 @@ _WELM_V4_ARCHITECTURES = {
 }
 
 
+def resolve_welm_decode_token_owner_enabled(
+    *,
+    token_owner_enabled: bool,
+    disable_override: Optional[bool],
+    dp_attention_enabled: bool,
+    dp_size: int,
+    disaggregation_mode: str,
+) -> bool:
+    if not token_owner_enabled:
+        return False
+    if disable_override is not None:
+        return not disable_override
+    return not (
+        not dp_attention_enabled
+        and dp_size == 1
+        and disaggregation_mode == "null"
+    )
+
+
+def get_welm_decode_token_owner_enabled(server_args) -> bool:
+    if getattr(server_args, "enable_mixed_chunk", False):
+        return server_args.enable_token_owner
+    return resolve_welm_decode_token_owner_enabled(
+        token_owner_enabled=server_args.enable_token_owner,
+        disable_override=(
+            envs.SGLANG_WELM_DISABLE_PURE_TP_DECODE_TOKEN_OWNER.get()
+        ),
+        dp_attention_enabled=server_args.enable_dp_attention,
+        dp_size=server_args.dp_size,
+        disaggregation_mode=server_args.disaggregation_mode,
+    )
+
+
 def _is_local_welm_v4_model_path(model_path: str) -> bool:
     if not model_path or not os.path.isdir(model_path):
         return False
@@ -1873,6 +1906,25 @@ class ServerArgs:
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
         )
 
+    def _validate_welm_token_owner_args(self, model_config) -> None:
+        if self.enable_token_owner and self.enable_pdmux:
+            raise ValueError("WeLM token-owner does not support PDMux")
+        hf_config = model_config.hf_config
+        text_config = model_config.hf_text_config
+        scale_seq_times = max(
+            getattr(hf_config, "scale_seq_times", 0) or 0,
+            getattr(text_config, "scale_seq_times", 0) or 0,
+        )
+        if (
+            self.enable_token_owner
+            and not self.enable_dp_attention
+            and scale_seq_times > 0
+        ):
+            raise ValueError(
+                "--enable-token-owner pure TP does not support WeLM Scale-Seq"
+            )
+        self._welm_token_owner_args_validated = True
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -1880,16 +1932,28 @@ class ServerArgs:
         )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            if self.enable_token_owner:
+                raise ValueError(
+                    "instance connector does not support WeLM token-owner"
+                )
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        if self.enable_token_owner and model_arch not in _WELM_V4_ARCHITECTURES:
+            raise ValueError(
+                "WeLM token-owner is not supported for model architecture "
+                f"{model_arch!r}"
+            )
 
         if model_arch in [
             "WeLMV4MoeForCausalLM",
             "WeLMV4MoeForCausalLMNextN",
             "WeLMV4VLMForConditionalGeneration",
         ]:
+            self._validate_welm_token_owner_args(model_config)
             self.prepare_n_gram_inputs = True
             self.disable_piecewise_cuda_graph = True
 
@@ -4899,6 +4963,20 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        if (
+            getattr(self, "_welm_token_owner_args_validated", False)
+            and self.enable_token_owner
+        ):
+            if self.enable_mixed_chunk:
+                logger.info(
+                    "SGLANG_WELM_DISABLE_PURE_TP_DECODE_TOKEN_OWNER has no effect "
+                    "with --enable-mixed-chunk; Decode Token Owner remains enabled"
+                )
+            elif not get_welm_decode_token_owner_enabled(self):
+                logger.info(
+                    "WeLM Decode Token Owner is disabled; Prefill Token Owner remains enabled"
+                )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(

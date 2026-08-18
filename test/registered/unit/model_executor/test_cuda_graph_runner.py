@@ -77,10 +77,25 @@ class TestCudaGraphBatchSizes(unittest.TestCase):
 
         self.assertEqual(capture_bs, [4, 8, 12, 16])
 
+    def test_decode_override_uses_non_owner_bucket_alignment(self):
+        import sglang.srt.model_executor.cuda_graph_runner as cgr
+
+        with (
+            patch.object(cgr, "require_gathered_buffer", return_value=True),
+            patch.object(cgr, "get_attention_tp_size", return_value=4),
+            patch.object(cgr, "get_attention_cp_size", return_value=1),
+        ):
+            capture_bs, _ = cgr.get_batch_sizes_to_capture(
+                _make_model_runner(enable_token_owner=True),
+                use_token_owner=False,
+            )
+
+        self.assertEqual(capture_bs, [4, 8, 12, 16])
+
 
 class TestTokenOwnerCudaGraph(unittest.TestCase):
     @staticmethod
-    def _make_runner(*, capture_bs, graphs, use_token_owner=True):
+    def _make_runner(*, capture_bs, graphs, use_token_owner=True, dp_size=2):
         from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
@@ -93,6 +108,7 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
         )
         runner.require_mlp_tp_gather = False
         runner.require_mlp_sync = True
+        runner.dp_size = dp_size
         runner.disable_padding = False
         runner.capture_bs = list(capture_bs)
         runner.enable_seq_len_graph_buckets = False
@@ -107,10 +123,19 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
         return runner
 
     @staticmethod
-    def _make_batch(*, can_run_dp_cuda_graph=True, is_extend_in_batch=False):
+    def _make_batch(
+        *,
+        can_run_dp_cuda_graph=True,
+        is_extend_in_batch=False,
+        global_num_reqs_cpu=(2, 1),
+    ):
         return SimpleNamespace(
             replace_embeds=None,
-            global_num_reqs_cpu=[2, 1],
+            global_num_reqs_cpu=(
+                None
+                if global_num_reqs_cpu is None
+                else list(global_num_reqs_cpu)
+            ),
             batch_size=2,
             return_logprob=False,
             lora_ids=None,
@@ -196,6 +221,54 @@ class TestTokenOwnerCudaGraph(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "scheduler disabled"):
             runner.can_run(self._make_batch(can_run_dp_cuda_graph=False))
+
+    def test_pure_tp_owner_uses_local_request_count_for_graph_bucket(self):
+        runner = self._make_runner(
+            capture_bs=(2,), graphs={2: object()}, dp_size=1
+        )
+
+        self.assertTrue(
+            runner.can_run(self._make_batch(global_num_reqs_cpu=None))
+        )
+
+    def test_multi_group_owner_still_requires_global_request_counts(self):
+        runner = self._make_runner(
+            capture_bs=(2,), graphs={2: object()}, dp_size=2
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "global request counts"):
+            runner.can_run(self._make_batch(global_num_reqs_cpu=None))
+
+    def test_pure_tp_owner_does_not_require_dp_scheduler_graph_permission(self):
+        runner = self._make_runner(
+            capture_bs=(2,), graphs={2: object()}, dp_size=1
+        )
+
+        self.assertTrue(
+            runner.can_run(
+                self._make_batch(
+                    can_run_dp_cuda_graph=False,
+                    global_num_reqs_cpu=None,
+                )
+            )
+        )
+
+    def test_non_owner_pure_tp_keeps_scheduler_graph_permission(self):
+        runner = self._make_runner(
+            capture_bs=(2,),
+            graphs={2: object()},
+            use_token_owner=False,
+            dp_size=1,
+        )
+
+        self.assertFalse(
+            runner.can_run(
+                self._make_batch(
+                    can_run_dp_cuda_graph=False,
+                    global_num_reqs_cpu=None,
+                )
+            )
+        )
 
     def test_owner_prefill_uses_eager_when_scheduler_disables_graph(self):
         runner = self._make_runner(capture_bs=(2,), graphs={2: object()})

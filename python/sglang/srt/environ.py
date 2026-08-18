@@ -690,6 +690,9 @@ class Envs:
 
     # WeLM related environment variables
     SGLANG_WELM_V45_80A3_MK_MOE_ROUTER_MODE = EnvStr("off")
+    # Only applies when Token Owner and WeLM KV mirror are both enabled.
+    SGLANG_WELM_DISABLE_PREFILL_MIRROR_TOKEN_OWNER = EnvBool(True)
+    SGLANG_WELM_DISABLE_PURE_TP_DECODE_TOKEN_OWNER = EnvBool(None)
     WELM_ALLOW_PARTIAL_MTP_LOAD = EnvBool(
         False
     )  # Skip mtp layer integration check. Useful for RL.

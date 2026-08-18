@@ -15,10 +15,13 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe.mk_moe_router import (
     MkMoeRouterMode,
     WelmV45_80A3MkMoeRouterAdapter,
@@ -34,6 +37,8 @@ from sglang.srt.models.welm_perf_opt import (
 from sglang.srt.models.welmv4 import (
     Qwen2MoeDecoderLayer,
     Qwen2MoeSparseMoeBlock,
+    _welm_token_owner_enabled_for_forward,
+    _welm_token_owner_physical_rows,
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
     _get_welm_kv_mirror_states,
@@ -48,8 +53,14 @@ from sglang.srt.models.welmv4 import (
     welm_nextn_local_to_hf_name,
     welm_use_previous_precision,
 )
-from sglang.srt.models.welmv4_token_owner import WeLMTokenOwnerRuntime
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.models.welmv4_token_owner import (
+    TokenOwnerTransition,
+    WeLMTokenOwnerRuntime,
+)
+from sglang.srt.server_args import (
+    get_global_server_args,
+    get_welm_decode_token_owner_enabled,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -76,6 +87,54 @@ _MTP_DUMP_ENABLED = (
     os.environ.get("SGLANG_DUMP_MTP_ACTIVATIONS", "0").strip().lower()
     in _MTP_TRUE_ENV_VALUES
 )
+
+
+def _welm_prepare_mtp_pruned_logits_metadata(
+    forward_batch: ForwardBatch,
+    local_num_tokens: int,
+) -> LogitsMetadata:
+    """Build request-row logits metadata without changing the layer layout."""
+    metadata = LogitsMetadata.from_forward_batch(forward_batch)
+    metadata.welm_kv_mirror_contracted = True
+    if not is_dp_attention_enabled():
+        if getattr(
+            forward_batch,
+            "welm_token_owner_enabled",
+            get_global_server_args().enable_token_owner,
+        ):
+            forward_batch._welm_mtp_contracted_dp_metadata_rows = int(
+                local_num_tokens
+            )
+        return metadata
+
+    counts = getattr(
+        forward_batch, "_welm_mtp_contract_global_num_tokens_cpu", None
+    )
+    gpu_counts = metadata.global_num_tokens_for_logprob_gpu
+    if counts is None or gpu_counts is None or len(counts) != gpu_counts.numel():
+        raise RuntimeError("Missing DP row counts for pruned WeLM MTP logits.")
+    if gpu_counts is metadata.global_num_tokens_gpu:
+        raise RuntimeError("WeLM MTP layer and logits DP counts must not alias.")
+    counts = [int(count) for count in counts]
+    dp_rank = get_attention_dp_rank()
+    if counts[dp_rank] != int(local_num_tokens):
+        raise RuntimeError(
+            "WeLM MTP logits row-count mismatch: "
+            f"local_rows={local_num_tokens}, dp_rank={dp_rank}, counts={counts}."
+        )
+
+    if all(count == counts[0] for count in counts):
+        gpu_counts.fill_(counts[0])
+    else:
+        for index, count in enumerate(counts):
+            gpu_counts[index] = count
+    metadata.global_num_tokens_gpu = gpu_counts
+    metadata.global_num_tokens_for_logprob_cpu = counts
+    metadata.global_dp_buffer_len = sum(counts)
+    metadata.dp_local_start_pos = None
+    metadata.dp_local_num_tokens = None
+    forward_batch._welm_mtp_contracted_dp_metadata_rows = int(local_num_tokens)
+    return metadata
 
 
 def _reset_mtp_graph_dump_call_index() -> None:
@@ -295,6 +354,10 @@ class WeLMV4ModelNextN(nn.Module):
         self.num_physical_mtp_layers = int(config.num_nextn_predict_layers)
         self.num_nextn_predict_layers = self.num_physical_mtp_layers
         self.token_owner_runtime = token_owner_runtime
+        self.decode_token_owner_enabled = bool(
+            token_owner_runtime is not None
+            and get_welm_decode_token_owner_enabled(get_global_server_args())
+        )
 
         self.embed_tokens = None
         self.oe_embed = None
@@ -645,8 +708,13 @@ class WeLMV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.token_owner_runtime is not None:
-            self.token_owner_runtime.begin_forward(forward_batch)
+        forward_batch.welm_token_owner_enabled = bool(
+            self.token_owner_runtime is not None
+            and _welm_token_owner_enabled_for_forward(
+                forward_batch,
+                decode_token_owner_enabled=self.decode_token_owner_enabled,
+            )
+        )
         mtp_step_idx = int(getattr(forward_batch, "mtp_step_idx", 0))
         if not getattr(forward_batch, "kv_fill_only", False) and mtp_step_idx == 0:
             _start_mtp_dump_pass()
@@ -738,6 +806,21 @@ class WeLMV4ModelNextN(nn.Module):
                 hidden_states.shape[0],
                 marker_attr="_welm_mtp_contracted_dp_metadata_rows",
                 contract_to_request_counts=True,
+            )
+
+        if forward_batch.welm_token_owner_enabled:
+            self.token_owner_runtime.begin_forward(
+                forward_batch,
+                single_group_physical_rows=(
+                    _welm_token_owner_physical_rows(
+                        forward_batch,
+                        post_pruning=True,
+                    )
+                    if not is_dp_attention_enabled()
+                    else None
+                ),
+                transition=TokenOwnerTransition.NONE,
+                device=hidden_states.device,
             )
 
         needs_empty_dp_collectives = (
@@ -918,7 +1001,7 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                 if hidden_states_for_next_mtp is not None
                 else None
             )
-            previous_pruned = None
+            logits_metadata = forward_batch
             _welm_mtp_trace(
                 "wrapper_branch "
                 f"contract={_welm_should_contract_kv_mirror(forward_batch)} "
@@ -967,27 +1050,17 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
                             "the full hidden state for the next MTP step."
                         )
                     hidden_states = hidden_states[custom_last_index]
-                    previous_pruned = getattr(
-                        forward_batch, "welm_kv_mirror_contracted", False
-                    )
-                    forward_batch.welm_kv_mirror_contracted = True
-                    _welm_update_contracted_dp_metadata(
+                    logits_metadata = _welm_prepare_mtp_pruned_logits_metadata(
                         forward_batch,
                         hidden_states.shape[0],
-                        marker_attr="_welm_mtp_contracted_dp_metadata_rows",
-                        contract_to_request_counts=True,
                     )
-            try:
-                logits_output = self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                    aux_hidden_states,
-                )
-            finally:
-                if previous_pruned is not None:
-                    forward_batch.welm_kv_mirror_contracted = previous_pruned
+            logits_output = self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                logits_metadata,
+                aux_hidden_states,
+            )
             if _MTP_DUMP_ENABLED:
                 _dump_tensor(
                     f"model.mtp.{mtp_step_idx}.logits",

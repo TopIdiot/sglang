@@ -82,6 +82,7 @@ from sglang.srt.models.welm_perf_opt import (
     should_use_welm_oe_hash_kernel,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.server_args import get_welm_decode_token_owner_enabled
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -748,7 +749,12 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner,
+    num_tokens_per_bs=1,
+    *,
+    use_token_owner: Optional[bool] = None,
+):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
     num_max_requests = model_runner.req_to_token_pool.size
@@ -758,7 +764,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
         mul_base *= 2
         num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
 
-    if require_gathered_buffer(server_args) and not server_args.enable_token_owner:
+    if use_token_owner is None:
+        use_token_owner = server_args.enable_token_owner
+    if require_gathered_buffer(server_args) and not use_token_owner:
         mul_base *= get_attention_tp_size()
 
     # Sharded-KV CP keeps each decode request as a full-Q request and only shards
@@ -865,7 +873,13 @@ class CudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.use_token_owner = model_runner.server_args.enable_token_owner
+        self.use_token_owner = bool(
+            model_runner.server_args.enable_token_owner
+            and (
+                not _is_welm_v4_model_config(model_runner.model_config)
+                or get_welm_decode_token_owner_enabled(model_runner.server_args)
+            )
+        )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         self.record_nolora_graph = should_record_nolora_graph()
@@ -907,7 +921,9 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_bs
+            model_runner,
+            self.num_tokens_per_bs,
+            use_token_owner=self.use_token_owner,
         )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
@@ -1435,16 +1451,19 @@ class CudaGraphRunner:
             return "lora"
         return "nolora"
 
-    @staticmethod
     def _requested_token_owner_graph_batch_size(
+        self,
         forward_batch: ForwardBatch,
     ) -> int:
         counts = forward_batch.global_num_reqs_cpu
-        if not counts:
-            raise RuntimeError(
-                "Token-owner CUDA graph requires non-empty global request counts"
-            )
-        return max(counts)
+        if counts:
+            return max(counts)
+        if self.dp_size == 1:
+            return forward_batch.batch_size
+        raise RuntimeError(
+            "Token-owner CUDA graph requires non-empty global request counts "
+            "for a multi-group topology"
+        )
 
     def _reject_token_owner_graph_miss(self, reason: str) -> bool:
         if self.use_token_owner:
@@ -1463,7 +1482,11 @@ class CudaGraphRunner:
             if stream_idx is not None
             else self.attn_backend
         )
-        if self.require_mlp_sync and not forward_batch.can_run_dp_cuda_graph:
+        if (
+            self.require_mlp_sync
+            and not (self.use_token_owner and self.dp_size == 1)
+            and not forward_batch.can_run_dp_cuda_graph
+        ):
             if forward_batch.is_extend_in_batch:
                 return False
             return self._reject_token_owner_graph_miss(

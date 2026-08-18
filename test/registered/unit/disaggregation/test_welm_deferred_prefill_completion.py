@@ -82,6 +82,83 @@ def test_deferred_prefill_model_returns_typed_completion_without_logits(
     model.lm_head.assert_not_called()
 
 
+def test_monolithic_deferred_prefill_participates_in_remote_dp_logits(monkeypatch):
+    class FakeBaseModel(nn.Module):
+        scale_seq_times = 0
+
+        def forward(self, *_args, **_kwargs):
+            return torch.empty((0, 4), dtype=torch.bfloat16)
+
+    model = welmv4_model.WeLMV4MoeForCausalLM.__new__(
+        welmv4_model.WeLMV4MoeForCausalLM
+    )
+    nn.Module.__init__(model)
+    model.model = FakeBaseModel()
+    model.deferred_execution = SimpleNamespace(
+        omit_final_output=False,
+        role=welmv4_model.WelmDeferredExecutionRole.MONOLITHIC,
+    )
+    model.pp_group = SimpleNamespace(is_last_rank=True)
+    model.logits_processor = MagicMock()
+    model.lm_head = object()
+    logits_metadata = object()
+    monkeypatch.setattr(
+        welmv4_model.LogitsMetadata,
+        "from_forward_batch",
+        lambda _batch: logits_metadata,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda **_kwargs: True),
+        welm_deferred_prefill=True,
+        welm_deferred_prefill_flags=[True, False],
+        global_num_tokens_for_logprob_cpu=[0, 1],
+        spec_info=None,
+        enable_welm_kv_mirror_opt=False,
+    )
+
+    output = model(
+        torch.tensor([1, 2], dtype=torch.int64),
+        torch.tensor([0, 1], dtype=torch.int64),
+        forward_batch,
+    )
+
+    assert isinstance(output, forward_batch_info.WelmDeferredPrefillCompletion)
+    model.logits_processor._get_logits.assert_called_once()
+    hidden_states, lm_head, metadata = model.logits_processor._get_logits.call_args.args
+    assert hidden_states.shape == (0, 4)
+    assert lm_head is model.lm_head
+    assert metadata is logits_metadata
+
+
+def test_zero_row_idle_peer_skips_logits_when_no_dp_rank_has_output():
+    logits_processor = MagicMock(
+        side_effect=AssertionError("an all-empty DP batch must not compute logits")
+    )
+    hidden_states = torch.empty((0, 4), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        prefill_cp_pruned=False,
+        welm_deferred_prefill_flags=[True, True],
+        global_num_tokens_for_logprob_cpu=[0, 0],
+        capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
+        mm_input_embeds=None,
+    )
+
+    output = welmv4_model._welm_compute_logits_output(
+        logits_processor,
+        torch.empty((0,), dtype=torch.int64),
+        object(),
+        welmv4_model._WelmPreparedLogits(
+            hidden_states=hidden_states,
+            aux_hidden_states=None,
+            logits_metadata=metadata,
+        ),
+        vocab_size=32,
+    )
+
+    logits_processor.assert_not_called()
+    assert output.next_token_logits.shape == (0, 32)
+
+
 def test_post_forward_sync_restores_batch_without_slicing_completion():
     original_forward_mode = SimpleNamespace(is_extend=lambda **_kwargs: True)
     forward_batch = SimpleNamespace(

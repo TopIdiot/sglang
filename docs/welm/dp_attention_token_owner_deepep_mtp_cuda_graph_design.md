@@ -1,7 +1,7 @@
 # WeLM Token-Owner DeepEP MTP CUDA Graph Design
 
 This document extends
-[`dp_attention_token_owner_design.md`](dp_attention_token_owner_design.md).
+[`token_owner_design.md`](token_owner_design.md).
 All owner-layout and KV-mirror invariants from the main design remain in force;
 this document only specifies the DeepEP/MTP CUDA Graph delta.
 
