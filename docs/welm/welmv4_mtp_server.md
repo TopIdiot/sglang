@@ -36,6 +36,7 @@ MTP serving 需要使用真正带 MTP/NextN 权重的 WeLMV4 checkpoint。模型
 | `SGLANG_WELM_MTP_DRAFT_FIXED_TEMPERATURE` | 未设置 | 显式覆盖 draft temperature；未设置时继承 verify。值必须大于 `0`。 |
 | `SGLANG_WELM_MTP_DRAFT_FIXED_TOP_P` | 未设置 | 显式覆盖 draft top-p；未设置时继承 verify。值必须在 `(0, 1]`。 |
 | `SGLANG_WELM_MTP_DRAFT_SAMPLING_TOPK` | `8` | draft sampling 的固定候选 top-k，graph 与 eager 路径共用。显式设置必须在 `(0, vocab size)` 内，越界直接报错；未设置时使用默认值 `8` 并打印 warning。draft 截断只影响 proposal 分布与 acceptance rate，最终输出分布仍由 target verify 保证。 |
+| `SGLANG_WELM_MTP_LEGACY_MIRROR_STATE` | `0` | 待移除的 P/D legacy 兼容开关。设为 `1` 时恢复 completion 携带 NextN mirror tensor 的旧路径；仅支持 P/D legacy 模式，不支持单体或 Deferred。默认 direct-pool 不需要设置该变量。 |
 | `SGLANG_WELM_V4D5_80A3_MTP_VERIFY_ATTENTION_BACKEND` | `fa3` | 只控制 WeLM V4D5 80A3 的 MTP target-verify attention。`fa3` 保持当前实现；`mk` 在满足下述固定契约时使用 MK verify kernel，不支持或启动自检失败时打印明确原因并回退 FA3。 |
 
 ### WeLM V4D5 80A3 MK verify attention
@@ -81,6 +82,35 @@ AttnCP、tree/custom mask 或 FP8 KV cache。
 - `topk > 1` 时不支持draft sampling，即不能设置 `SGLANG_WELM_MTP_SAMPLE_DRAFT=1`。
 - 基础 Attention Backend 请固定使用 `fa3`。MK 环境变量只替换满足契约的
   target-verify attention，其余模式继续使用 FA3。
+
+## KV 存储与 P/D 角色
+
+WeLM MTP 默认使用 direct-pool 存储，不区分普通 MTP、P/D legacy 调度或
+Deferred Mirror 调度：Prefill 产生的 NextN K/V 直接写入 Draft KV pool，后续
+completion 不携带 mirror tensor。Target/Draft 共用 request 映射，P/D transfer
+同时传输两套 KV pool 的物理页。当前支持配置固定为 `--page-size 16`，Target 与
+Draft 的 page size 必须一致。
+
+P/D 分离时，Prefill worker 使用 lightweight MTP 角色：不加载完整 Draft 执行
+权重，但保留 storage-only Draft KV pool，以产生和传输完整 prefix 的 Draft KV。
+Decode worker 加载完整 Target/Draft 权重并执行 verify、draft proposal 和后续
+continuation。这个角色划分是 WeLM MTP 的默认 P/D 实现，与是否开启 Deferred
+Mirror 调度无关。
+
+## Deferred Mirror 与 MTP
+
+同时传入 `--enable-welm-kv-mirror-opt --enable-kv-mirror-deferred` 后，初始请求
+会把最后一个 prompt token 作为 seed 延后到 Decode。Prefill 提交 seed 之前的
+完整 Target/Draft prefix KV，但不产生 bootstrap hidden state；seed 与普通 MTP
+verify rows 叠 batch，首轮只接受 canonical root token（`accept_len=1`），随后
+恢复普通 MTP continuation。因此 seed 的 MTP verify/draft 计算仍参与有效执行，
+不会被单独回放成一条串行请求。
+
+Deferred MTP 目前要求 Spec V2、`topk=1`、FA3 和至少两个 prompt token；不支持
+mixed chunk、tree verify、pipeline parallelism、HiCache、suffix parallel 或
+Scale-Seq。当前 MTP runtime 尚未支持 AttnCP，因此未纳入 Deferred 验证矩阵；
+Deferred 生命周期设计不依赖具体并行策略。条件不满足时启动或请求会显式失败，
+不会静默回退到完整 Prefill。
 
 ## 示例：
 

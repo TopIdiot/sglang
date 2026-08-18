@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     WelmDeferredPrefillCompletion,
+    is_welm_deferred_dp_idle_peer,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
@@ -225,10 +226,35 @@ class SchedulerOutputProcessorMixin:
             WelmDeferredPrefillCompletion,
         ):
             raise RuntimeError("invalid WeLM deferred Prefill completion marker")
+        if (
+            result.welm_deferred_prefill_completion.model_specific_states
+            is not None
+        ):
+            raise RuntimeError(
+                "WeLM deferred Prefill completion has an unconsumed mirror payload"
+            )
         if self.disaggregation_mode is not DisaggregationMode.NULL:
             raise RuntimeError(
                 "local WeLM deferred Prefill completion requires monolithic P+D"
             )
+        if is_welm_deferred_dp_idle_peer(batch):
+            if batch.reqs:
+                raise RuntimeError(
+                    "WeLM deferred Prefill idle completion must not contain requests"
+                )
+            if (
+                result.logits_output is not None
+                or result.delay_sample_func is not None
+                or result.draft_continuation_state is not None
+                or batch.spec_info is not None
+                or not torch.is_tensor(result.next_token_ids)
+                or result.next_token_ids.ndim != 1
+                or result.next_token_ids.numel() != 0
+            ):
+                raise RuntimeError(
+                    "WeLM deferred Prefill idle completion has an output payload"
+                )
+            return []
         if not batch.forward_mode.is_extend():
             raise RuntimeError("WeLM deferred Prefill completion requires EXTEND mode")
         if not batch.welm_deferred_prefill:
@@ -311,9 +337,14 @@ class SchedulerOutputProcessorMixin:
                 expected_kv_len = span.committed_kv_len + int(
                     state.phase is WelmDeferredDecodePhase.INFLIGHT
                 )
+                allocated_len_matches = (
+                    req.kv_allocated_len >= expected_kv_len
+                    if state.phase is WelmDeferredDecodePhase.INFLIGHT
+                    else req.kv_allocated_len == expected_kv_len
+                )
                 if (
                     req.kv_committed_len != expected_kv_len
-                    or req.kv_allocated_len != expected_kv_len
+                    or not allocated_len_matches
                 ):
                     raise RuntimeError(
                         "WeLM deferred Prefill final row KV length does not match "
@@ -601,20 +632,47 @@ class SchedulerOutputProcessorMixin:
 
     def _resolve_spec_overlap_tokens(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
-    ) -> List[List[int]]:
+    ) -> Tuple[List[List[int]], int]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
+        root_only_mask = result.welm_mtp_root_only_verify_mask
+        if root_only_mask is None:
+            root_only_rows = None
+        else:
+            if not root_only_mask.is_cpu:
+                raise RuntimeError("WeLM MTP root-only result mask must be on CPU.")
+            if root_only_mask.dtype != torch.bool or root_only_mask.ndim != 1:
+                raise RuntimeError("WeLM MTP root-only result mask is invalid.")
+            root_only_rows = root_only_mask.tolist()
+            if len(root_only_rows) != len(batch.reqs):
+                raise RuntimeError(
+                    "WeLM MTP root-only result mask is not request-aligned."
+                )
+            if any(
+                is_root_only and accept_len != 1
+                for is_root_only, accept_len in zip(
+                    root_only_rows, accept_lens, strict=True
+                )
+            ):
+                raise RuntimeError("WeLM MTP root-only verify requires accept_len=1.")
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        ordinary_correct_drafts = [
+            correct_drafts
+            for i, correct_drafts in enumerate(
+                result.num_correct_drafts_per_req_cpu
+            )
+            if root_only_rows is None or not root_only_rows[i]
+        ]
+        result.num_correct_drafts = sum(ordinary_correct_drafts)
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(ordinary_correct_drafts)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -636,15 +694,29 @@ class SchedulerOutputProcessorMixin:
                 req.kv_committed_len -= 1
                 continue
 
+            state = getattr(req, "welm_deferred_decode_state", None)
+            is_inflight_seed = (
+                isinstance(state, WelmDeferredDecodeState)
+                and state.phase is WelmDeferredDecodePhase.INFLIGHT
+            )
+            is_root_only = bool(root_only_rows and root_only_rows[i])
+            if is_root_only != is_inflight_seed:
+                raise RuntimeError(
+                    "WeLM MTP root-only result mask does not match the INFLIGHT "
+                    "seed lifecycle."
+                )
+
             # -1 because prepare_for_decode pre-claimed the bonus slot.
             req.kv_committed_len += accept_lens[i] - 1
+            if is_root_only:
+                continue
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.spec_num_correct_drafts += num_correct_drafts
             req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
-        return predict_tokens
+        return predict_tokens, len(ordinary_correct_drafts)
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -691,9 +763,12 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        spec_metrics_bs = batch.batch_size()
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
+                next_token_ids, spec_metrics_bs = self._resolve_spec_overlap_tokens(
+                    result, batch
+                )
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:
@@ -724,8 +799,8 @@ class SchedulerOutputProcessorMixin:
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_correct_drafts)
+        if not batch.spec_algorithm.is_none() and spec_metrics_bs > 0:
+            self.update_spec_metrics(spec_metrics_bs, result.num_correct_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph

@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import os
 import time
@@ -46,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    WelmDeferredPrefillCompletion,
 )
 from sglang.srt.models.welm_perf_opt import (
     get_welm_oe_hash_config,
@@ -74,14 +76,21 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
-    build_welmv4_mtp_model_specific_states,
-    copy_welmv4_mtp_kv_mirror_states_to_buffers,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
+    uses_welmv4_nextn_draft,
+)
+from sglang.srt.speculative.welmv4_mtp_kv import (
+    build_welmv4_mtp_model_specific_states,
+    copy_welmv4_mtp_kv_mirror_states_to_buffers,
+    should_use_welm_mtp_direct_kv,
+    should_use_welm_mtp_lightweight_prefill,
+    should_use_welm_mtp_storage_draft_kv,
+    slice_welmv4_mtp_kv_mirror_states,
 )
 from sglang.srt.speculative.welmv4_mtp_draft_proposal_cuda_graph_runner import (
     WelmMTPDraftProposalCudaGraphRunner,
@@ -139,6 +148,20 @@ _WELM_DISABLE_TARGET_VERIFY_GRAPH_FOR_DUMP = (
     in _WELM_TRUE_VALUES
 )
 _WELM_VERIFY_AFTER_EVENT_COUNTERS = {}
+_WELM_MTP_PARTITIONED_CONTINUATION_FIELDS = (
+    "topk_p",
+    "topk_index",
+    "hidden_states",
+    "draft_probs",
+    "welm_mtp_draft_topk_indices",
+    "welm_mtp_draft_topk_values",
+    "draft_proposal_parent_list",
+    "draft_proposal_top_scores_index",
+    "draft_proposal_tokens",
+    "welm_mtp_base_positions",
+    "welm_mtp_oe_history_state",
+    "welm_mtp_oe_prefix_rows",
+)
 
 
 def _welm_mtp_trace(message: str) -> None:
@@ -250,6 +273,8 @@ class EagleDraftWorker(BaseDraftWorker):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        *,
+        defer_cuda_graph_capture: bool = False,
     ):
         # copy args
         self.server_args = server_args
@@ -284,6 +309,7 @@ class EagleDraftWorker(BaseDraftWorker):
             _WELM_MTP_DRAFT_FIXED_TOP_P_ENV
         )
         self.welm_mtp_kv_mirror_state_buffers = None
+        self.welm_mtp_direct_kv_enabled = False
         if (
             self.welmv4_mtp_draft_fixed_temperature is not None
             and self.welmv4_mtp_draft_fixed_temperature <= 0
@@ -362,7 +388,8 @@ class EagleDraftWorker(BaseDraftWorker):
             speculative_moe_a2a_backend_context(),
         ):
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            if not defer_cuda_graph_capture:
+                self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
@@ -582,12 +609,16 @@ class EagleDraftWorker(BaseDraftWorker):
         out: Optional[torch.Tensor] = None,
         prefix_rows: Optional[list[list[int]]] = None,
     ) -> Optional[torch.Tensor]:
-        if not self._should_use_welmv4_mtp_oe_hash_kernel() or oe_context is None:
+        if not self._should_use_welmv4_mtp_oe_hash_kernel():
             return None
         _, _, history_width = self._welmv4_mtp_oe_hash_config()
         if history_width <= 0:
             return None
         if prefix_rows is None:
+            if oe_context is None:
+                raise RuntimeError(
+                    "WeLMV4 MTP fused OE hash path requires CPU prefix rows."
+                )
             prefix_rows = self._welmv4_mtp_hash_prefix_rows_from_context(
                 oe_context,
                 history_width,
@@ -627,6 +658,85 @@ class EagleDraftWorker(BaseDraftWorker):
             first_token_ids=first_token_ids,
         )
         return history_out
+
+    @staticmethod
+    def _validate_welmv4_mtp_root_only_verify_mask(
+        draft_input: EagleDraftInput,
+        batch_size: int,
+    ) -> Optional[torch.Tensor]:
+        mask = getattr(draft_input, "welm_mtp_root_only_verify_mask", None)
+        if mask is None:
+            return None
+        if mask.dtype != torch.bool or mask.ndim != 1 or mask.numel() != batch_size:
+            raise RuntimeError(
+                "WeLM MTP root-only verify mask must be a batch-aligned bool tensor."
+            )
+        bonus_tokens = getattr(draft_input, "bonus_tokens", None)
+        if bonus_tokens is None or mask.device != bonus_tokens.device:
+            raise RuntimeError(
+                "WeLM MTP root-only verify mask must share the bonus-token device."
+            )
+        return mask
+
+    def _prepare_welmv4_mtp_root_only_oe_history(
+        self,
+        draft_input: EagleDraftInput,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> Optional[torch.Tensor]:
+        if not self._should_use_welmv4_mtp_oe_hash_kernel():
+            return None
+        bonus_tokens = draft_input.bonus_tokens
+        batch_size = int(bonus_tokens.numel())
+        root_only_mask = self._validate_welmv4_mtp_root_only_verify_mask(
+            draft_input, batch_size
+        )
+        if root_only_mask is None:
+            return None
+        root_rows = torch.nonzero(root_only_mask, as_tuple=False).flatten()
+        if root_rows.numel() == 0:
+            return None
+        if len(model_worker_batch.reqs) != batch_size:
+            raise RuntimeError(
+                "WeLM MTP root-only OE history request rows are misaligned."
+            )
+
+        root_row_ids = root_rows.tolist()
+        prefix_rows = self._welmv4_mtp_prefix_rows_from_reqs(
+            [model_worker_batch.reqs[i] for i in root_row_ids],
+            self._welmv4_mtp_oe_prefix_width(),
+            skip_latest_output=True,
+        )
+        seed_history = self._init_welmv4_mtp_oe_history_from_context(
+            None,
+            device=bonus_tokens.device,
+            first_token_ids=bonus_tokens.index_select(0, root_rows),
+            prefix_rows=prefix_rows,
+        )
+        if seed_history is None:
+            raise RuntimeError("WeLM MTP root-only OE history initialization failed.")
+
+        current_history = getattr(draft_input, "welm_mtp_oe_history_state", None)
+        if current_history is None:
+            if root_rows.numel() != batch_size:
+                raise RuntimeError(
+                    "Mixed WeLM MTP verify is missing ordinary-row OE history."
+                )
+            history = seed_history.new_zeros((batch_size, seed_history.shape[1]))
+        else:
+            if (
+                current_history.ndim != 2
+                or current_history.shape[0] != batch_size
+                or current_history.shape[1] != seed_history.shape[1]
+                or current_history.dtype != seed_history.dtype
+                or current_history.device != seed_history.device
+            ):
+                raise RuntimeError(
+                    "WeLM MTP root-only OE history state has incompatible layout."
+                )
+            history = current_history.clone()
+        history.index_copy_(0, root_rows, seed_history)
+        draft_input.welm_mtp_oe_history_state = history
+        return history
 
     def _init_welmv4_mtp_oe_history_from_extend(
         self,
@@ -2352,11 +2462,16 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         draft_input: EagleDraftInput,
     ) -> None:
+        is_idle_bootstrap = (
+            model_worker_batch.forward_mode.is_idle()
+            and int(model_worker_batch.seq_lens.numel()) == 0
+        )
         deferred_mask = getattr(
             draft_input, "welm_mtp_deferred_prefill_draft_mask", None
         )
         if deferred_mask is not None and (
-            deferred_mask.numel() == 0 or not bool(deferred_mask.all().item())
+            (deferred_mask.numel() == 0 and not is_idle_bootstrap)
+            or not bool(deferred_mask.all().item())
         ):
             raise RuntimeError(
                 "Mixed WeLM MTP deferred prefill rows reached draft(); PD decode "
@@ -2372,13 +2487,19 @@ class EagleDraftWorker(BaseDraftWorker):
                 "WeLM MTP PD decode bootstrap requires prebuilt extend_prefix_lens."
             )
 
-        model_specific_states = self._build_welmv4_mtp_pd_prefill_mirror_states(
-            model_worker_batch
-        )
-        if self.server_args.enable_welm_kv_mirror_opt and model_specific_states is None:
-            raise RuntimeError(
-                "WeLM MTP PD decode bootstrap is missing mirrored KV states."
+        model_specific_states = None
+        if not self.welm_mtp_direct_kv_enabled:
+            model_specific_states = self._build_welmv4_mtp_pd_prefill_mirror_states(
+                model_worker_batch
             )
+            if (
+                self.server_args.enable_welm_kv_mirror_opt
+                and model_specific_states is None
+                and not is_idle_bootstrap
+            ):
+                raise RuntimeError(
+                    "WeLM MTP PD decode bootstrap is missing mirrored KV states."
+                )
 
         original_attrs = {
             name: getattr(model_worker_batch, name, None)
@@ -2394,7 +2515,9 @@ class EagleDraftWorker(BaseDraftWorker):
         first_query_history_state = None
         use_oe_hash_kernel = self._should_use_welmv4_mtp_oe_hash_kernel()
         try:
-            model_worker_batch.forward_mode = ForwardMode.EXTEND
+            model_worker_batch.forward_mode = (
+                ForwardMode.IDLE if is_idle_bootstrap else ForwardMode.EXTEND
+            )
             model_worker_batch.is_extend_in_batch = False
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             model_worker_batch.input_ids = model_worker_batch.input_ids.to(
@@ -2404,11 +2527,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
             forward_batch.return_logprob = False
-            if use_oe_hash_kernel and model_worker_batch.oe_context is not None:
+            if (
+                use_oe_hash_kernel
+                and not is_idle_bootstrap
+                and model_worker_batch.oe_context is not None
+            ):
                 self._prepare_welmv4_mtp_segment_hash_inputs_from_prefixes(
                     forward_batch
                 )
-            if use_oe_hash_kernel:
+            if use_oe_hash_kernel and not is_idle_bootstrap:
                 entry_history_state = self._init_welmv4_mtp_oe_history_from_extend(
                     forward_batch,
                     first_token_ids=None,
@@ -2974,6 +3101,7 @@ class EagleDraftWorker(BaseDraftWorker):
         dst.welm_mtp_deferred_prefill_draft_mask = getattr(
             src, "welm_mtp_deferred_prefill_draft_mask", None
         )
+        dst.welm_mtp_root_only_verify_mask = src.welm_mtp_root_only_verify_mask
 
     def _build_welmv4_mtp_linear_draft_proposal(
         self,
@@ -3264,6 +3392,14 @@ class EagleDraftWorker(BaseDraftWorker):
         use_welmv4_mtp_draft_proposal = (
             is_welmv4_mtp and self._has_welmv4_mtp_draft_proposal(draft_input)
         )
+        root_only_verify_mask = None
+        if is_welmv4_mtp and not model_worker_batch.forward_mode.is_idle():
+            root_only_verify_mask = (
+                self._validate_welmv4_mtp_root_only_verify_mask(
+                    draft_input, int(model_worker_batch.seq_lens.numel())
+                )
+            )
+        root_only_rows = getattr(model_worker_batch, "welm_mtp_root_only_rows", None)
         if (
             is_welmv4_mtp
             and not model_worker_batch.forward_mode.is_idle()
@@ -3276,19 +3412,31 @@ class EagleDraftWorker(BaseDraftWorker):
             use_welmv4_mtp_draft_proposal = self._has_welmv4_mtp_draft_proposal(
                 draft_input
             )
+        root_only_seed_batch = False
         if (
             is_welmv4_mtp
             and not model_worker_batch.forward_mode.is_idle()
             and not use_welmv4_mtp_draft_proposal
         ):
-            raise RuntimeError(
-                "WeLM MTP requires a draft proposal from merged_extend_draft."
+            root_only_seed_batch = bool(
+                root_only_verify_mask is not None
+                and root_only_rows
+                and all(root_only_rows)
             )
+            if not root_only_seed_batch:
+                raise RuntimeError(
+                    "WeLM MTP requires a draft proposal from merged_extend_draft."
+                )
         if is_welmv4_mtp and model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+            )
+
+        if root_only_verify_mask is not None:
+            self._prepare_welmv4_mtp_root_only_oe_history(
+                draft_input, model_worker_batch
             )
 
         # Run draft
@@ -3324,6 +3472,8 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list, top_scores_index, draft_tokens = (
                 self._build_welmv4_mtp_draft_proposal_results(draft_input)
             )
+        elif root_only_seed_batch:
+            parent_list = top_scores_index = draft_tokens = None
         else:
             forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                 self.req_to_token_pool,
@@ -3359,7 +3509,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 draft_input,
             )
 
-        if not use_welmv4_mtp_draft_proposal:
+        if not use_welmv4_mtp_draft_proposal and not root_only_seed_batch:
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens = (
                     self.cuda_graph_runner.replay(forward_batch)
@@ -3419,6 +3569,10 @@ class EagleDraftWorker(BaseDraftWorker):
                     draft_input, model_worker_batch.seq_lens
                 )
             )
+        if linear_verify is None and root_only_verify_mask is not None:
+            raise RuntimeError(
+                "WeLM MTP root-only verify requires fixed-width linear staging."
+            )
         linear_hash_seq_lens = None
         if linear_verify is not None:
             (
@@ -3470,6 +3624,7 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_probs=draft_input.draft_probs,
             draft_topk_indices=draft_input.welm_mtp_draft_topk_indices,
             draft_topk_values=draft_input.welm_mtp_draft_topk_values,
+            welm_mtp_root_only_verify_mask=root_only_verify_mask,
         )
         if self._should_use_welmv4_mtp_oe_hash_kernel() and hasattr(
             draft_input, "welm_mtp_oe_history_state"
@@ -3932,7 +4087,430 @@ class EagleDraftWorker(BaseDraftWorker):
         valid_accept = path_order.unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
         return (row_offsets.unsqueeze(1) + path_order.unsqueeze(0))[valid_accept]
 
+    @staticmethod
+    def _welmv4_mtp_subset_list(values, row_ids: List[int]):
+        if values is None:
+            return None
+        return [values[index] for index in row_ids]
+
+    def _welmv4_mtp_subset_sampling_info(
+        self,
+        sampling_info,
+        row_ids: List[int],
+        row_indices: torch.Tensor,
+    ):
+        if sampling_info is None:
+            return None
+        subset = copy.deepcopy(sampling_info)
+        subset.filter_batch(row_ids, row_indices.to(dtype=torch.long))
+        return subset
+
+    def _subset_welmv4_mtp_continuation(
+        self,
+        batch: ModelWorkerBatch,
+        batch_result: GenerationBatchResult,
+        row_ids: List[int],
+    ) -> Tuple[ModelWorkerBatch, GenerationBatchResult]:
+        """Build a compact request-row view of a fixed-width verify result."""
+        draft_token_num = int(self.speculative_num_draft_tokens)
+        batch_size = int(batch.seq_lens.numel())
+        if any(row_id < 0 or row_id >= batch_size for row_id in row_ids):
+            raise RuntimeError("WeLM MTP continuation rows are invalid.")
+        row_indices = torch.tensor(
+            row_ids, device=batch.seq_lens.device, dtype=torch.long
+        )
+        row_indices_cpu = torch.tensor(row_ids, dtype=torch.long)
+
+        token_offsets = torch.arange(
+            draft_token_num, device=row_indices.device, dtype=torch.long
+        )
+        token_indices = (
+            row_indices.unsqueeze(1) * draft_token_num + token_offsets.unsqueeze(0)
+        ).reshape(-1)
+
+        subset_batch = copy.copy(batch)
+        subset_batch.input_ids = batch.input_ids[token_indices]
+        subset_batch.req_pool_indices = batch.req_pool_indices[row_indices]
+        subset_batch.seq_lens = batch.seq_lens[row_indices]
+        subset_batch.seq_lens_cpu = (
+            None
+            if batch.seq_lens_cpu is None
+            else batch.seq_lens_cpu[row_indices_cpu]
+        )
+        subset_batch.seq_lens_sum = sum(
+            int(batch.seq_lens_cpu[index]) for index in row_ids
+        )
+        subset_batch.out_cache_loc = batch.out_cache_loc[token_indices]
+        subset_batch.reqs = self._welmv4_mtp_subset_list(batch.reqs, row_ids)
+        subset_batch.lora_ids = self._welmv4_mtp_subset_list(
+            getattr(batch, "lora_ids", None), row_ids
+        )
+        subset_batch.top_logprobs_nums = self._welmv4_mtp_subset_list(
+            getattr(batch, "top_logprobs_nums", None), row_ids
+        )
+        subset_batch.token_ids_logprobs = self._welmv4_mtp_subset_list(
+            getattr(batch, "token_ids_logprobs", None), row_ids
+        )
+        subset_batch.orig_seq_lens = (
+            None
+            if getattr(batch, "orig_seq_lens", None) is None
+            else batch.orig_seq_lens[
+                row_indices.to(device=batch.orig_seq_lens.device)
+            ]
+        )
+        subset_batch.sampling_info = self._welmv4_mtp_subset_sampling_info(
+            batch.sampling_info, row_ids, row_indices
+        )
+        subset_batch.oe_context = None
+        subset_batch.welm_mtp_root_only_rows = None
+        subset_verify_input = copy.copy(batch.spec_info)
+        subset_verify_input.welm_mtp_root_only_verify_mask = None
+        oe_history = getattr(batch.spec_info, "welm_mtp_oe_history_state", None)
+        if oe_history is not None:
+            subset_verify_input.welm_mtp_oe_history_state = oe_history[row_indices]
+        subset_batch.spec_info = subset_verify_input
+
+        accept_index = batch_result.spec_accept_index[row_indices].clone()
+        row_shift = (
+            row_indices
+            - torch.arange(row_indices.numel(), device=row_indices.device)
+        ) * draft_token_num
+        accept_index = torch.where(
+            accept_index >= 0,
+            accept_index - row_shift.unsqueeze(1),
+            accept_index,
+        )
+
+        subset_logits = copy.copy(batch_result.logits_output)
+        if subset_logits.next_token_logits is not None:
+            subset_logits.next_token_logits = subset_logits.next_token_logits[
+                token_indices
+            ]
+        if subset_logits.hidden_states is not None:
+            subset_logits.hidden_states = subset_logits.hidden_states[token_indices]
+        if subset_logits.model_specific_states is not None:
+            if getattr(self, "welm_mtp_direct_kv_enabled", False):
+                raise RuntimeError(
+                    "WeLM MTP direct continuation must be payload-free."
+                )
+            subset_logits.model_specific_states = slice_welmv4_mtp_kv_mirror_states(
+                subset_logits.model_specific_states, token_indices
+            )
+
+        source_draft_input = batch_result.draft_continuation_state.draft_input
+        subset_draft_input = EagleDraftInput(
+            bonus_tokens=source_draft_input.bonus_tokens[row_indices],
+            new_seq_lens=source_draft_input.new_seq_lens[row_indices],
+            verify_done=source_draft_input.verify_done,
+            hidden_states=(
+                None
+                if source_draft_input.hidden_states is None
+                else source_draft_input.hidden_states[row_indices]
+            ),
+        )
+        subset_result = copy.copy(batch_result)
+        subset_result.logits_output = subset_logits
+        subset_result.next_token_ids = batch_result.next_token_ids[token_indices]
+        subset_result.accept_lens = batch_result.accept_lens[row_indices]
+        subset_result.spec_accept_index = accept_index
+        subset_result.welm_mtp_accepted_draft_token_ids = (
+            None
+            if batch_result.welm_mtp_accepted_draft_token_ids is None
+            else batch_result.welm_mtp_accepted_draft_token_ids[row_indices]
+        )
+        subset_result.draft_continuation_state = DraftContinuationState(
+            subset_draft_input
+        )
+        return subset_batch, subset_result
+
+    @staticmethod
+    def _collect_welmv4_mtp_partitioned_continuation(
+        rows: List[int],
+        partition: EagleDraftInput,
+        merged: dict[str, Optional[torch.Tensor]],
+        covered: List[bool],
+    ) -> None:
+        if not rows:
+            return
+        batch_size = len(covered)
+        for row in rows:
+            if row < 0 or row >= batch_size:
+                raise RuntimeError("WeLM MTP continuation partition row is invalid.")
+            if covered[row]:
+                raise RuntimeError("WeLM MTP continuation partitions overlap.")
+
+        row_indices = None
+        for field in _WELM_MTP_PARTITIONED_CONTINUATION_FIELDS:
+            value = getattr(partition, field, None)
+            if value is not None and (
+                value.ndim == 0 or value.shape[0] != len(rows)
+            ):
+                raise RuntimeError(
+                    f"WeLM MTP continuation field {field} is not request-aligned."
+                )
+            if field not in merged:
+                merged[field] = (
+                    None
+                    if value is None
+                    else torch.empty(
+                        (batch_size, *value.shape[1:]),
+                        dtype=value.dtype,
+                        device=value.device,
+                    )
+                )
+            output = merged[field]
+            if value is None and output is None:
+                continue
+            if value is None or output is None:
+                raise RuntimeError(
+                    f"WeLM MTP continuation field {field} is missing from a "
+                    "partition."
+                )
+            if (
+                output.shape[1:] != value.shape[1:]
+                or output.dtype != value.dtype
+                or output.device != value.device
+            ):
+                raise RuntimeError(
+                    f"WeLM MTP continuation field {field} is not request-aligned."
+                )
+            if row_indices is None:
+                row_indices = torch.tensor(rows, device=value.device, dtype=torch.long)
+            output.index_copy_(0, row_indices, value)
+
+        for row in rows:
+            covered[row] = True
+
+    @staticmethod
+    def _finish_welmv4_mtp_partitioned_continuations(
+        destination: EagleDraftInput,
+        merged: dict[str, Optional[torch.Tensor]],
+        covered: List[bool],
+    ) -> None:
+        if not all(covered):
+            raise RuntimeError("WeLM MTP continuation partitions are incomplete.")
+        for field in _WELM_MTP_PARTITIONED_CONTINUATION_FIELDS:
+            setattr(destination, field, merged.get(field))
+
+        destination.welm_mtp_deferred_prefill_draft = False
+        destination.welm_mtp_deferred_prefill_draft_mask = None
+        destination.welm_mtp_root_only_verify_mask = None
+        destination.welm_mtp_linear_verify_ready = False
+        destination.welm_mtp_prebuilt_verify_input = None
+        destination.welm_mtp_prebuilt_verify_bs = -1
+
     def _draft_extend_for_decode(
+        self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+    ):
+        next_draft_input = batch_result.draft_continuation_state.draft_input
+        root_only_mask = getattr(
+            next_draft_input, "welm_mtp_root_only_verify_mask", None
+        )
+        batch_size = int(batch.seq_lens.numel())
+        root_only_rows = getattr(batch, "welm_mtp_root_only_rows", None)
+        if root_only_mask is not None and (
+            root_only_mask.dtype != torch.bool
+            or root_only_mask.ndim != 1
+            or root_only_mask.numel() != batch_size
+        ):
+            raise RuntimeError("WeLM MTP root-only mask is not request-aligned.")
+        if root_only_rows is None:
+            if root_only_mask is not None:
+                torch._assert_async(
+                    torch.all(~root_only_mask),
+                    "WeLM MTP root-only mask disagrees with scheduler rows.",
+                )
+                root_only_mask = None
+            if not is_dp_attention_enabled():
+                return self._draft_extend_for_decode_unpartitioned(
+                    batch, batch_result
+                )
+        elif len(root_only_rows) != batch_size:
+            raise RuntimeError("WeLM MTP root-only CPU rows are not request-aligned.")
+        seed_rows = (
+            []
+            if root_only_rows is None
+            else [
+                index for index, is_root in enumerate(root_only_rows) if is_root
+            ]
+        )
+        if root_only_mask is not None:
+            torch._assert_async(
+                torch.all(
+                    root_only_mask
+                    == torch.tensor(
+                        root_only_rows,
+                        dtype=torch.bool,
+                        device=root_only_mask.device,
+                    )
+                ),
+                "WeLM MTP root-only mask disagrees with scheduler rows.",
+            )
+        elif seed_rows:
+            raise RuntimeError("WeLM MTP root-only continuation is missing its mask.")
+        ordinary_counts, seed_counts = (
+            self._get_welmv4_mtp_continuation_partition_counts(
+                batch,
+                ordinary_rows=batch_size - len(seed_rows),
+                seed_rows=len(seed_rows),
+            )
+        )
+        if not any(seed_counts):
+            return self._draft_extend_for_decode_unpartitioned(batch, batch_result)
+        if batch.seq_lens_cpu is None:
+            raise RuntimeError(
+                "WeLM MTP root-only continuation requires CPU sequence lengths."
+            )
+        if (
+            not self._is_welmv4_mtp_draft_model()
+            or self.topk != 1
+            or self.speculative_num_steps <= 1
+        ):
+            raise RuntimeError(
+                "WeLM MTP root-only continuation requires active topk=1 linear MTP."
+            )
+        ordinary_rows = (
+            list(range(batch_size))
+            if root_only_rows is None
+            else [
+                index for index, is_root in enumerate(root_only_rows) if not is_root
+            ]
+        )
+        merged = {}
+        covered = [False] * batch_size
+
+        if any(ordinary_counts):
+            ordinary_batch, ordinary_result = (
+                self._subset_welmv4_mtp_continuation(
+                    batch, batch_result, ordinary_rows
+                )
+            )
+            self._set_welmv4_mtp_partition_dp_metadata(
+                ordinary_batch,
+                request_counts=ordinary_counts,
+                token_counts=[
+                    count * int(self.speculative_num_draft_tokens)
+                    for count in ordinary_counts
+                ],
+            )
+            self._draft_extend_for_decode_unpartitioned(
+                ordinary_batch, ordinary_result
+            )
+            self._collect_welmv4_mtp_partitioned_continuation(
+                ordinary_rows,
+                ordinary_result.draft_continuation_state.draft_input,
+                merged,
+                covered,
+            )
+
+        seed_batch, seed_result = self._subset_welmv4_mtp_continuation(
+            batch, batch_result, seed_rows
+        )
+        self._set_welmv4_mtp_partition_dp_metadata(
+            seed_batch,
+            request_counts=seed_counts,
+            token_counts=seed_counts,
+        )
+        self._draft_extend_for_decode_unpartitioned(seed_batch, seed_result)
+        self._collect_welmv4_mtp_partitioned_continuation(
+            seed_rows,
+            seed_result.draft_continuation_state.draft_input,
+            merged,
+            covered,
+        )
+
+        self._finish_welmv4_mtp_partitioned_continuations(
+            next_draft_input, merged, covered
+        )
+
+    def _get_welmv4_mtp_continuation_partition_counts(
+        self,
+        batch: ModelWorkerBatch,
+        *,
+        ordinary_rows: int,
+        seed_rows: int,
+    ) -> Tuple[List[int], List[int]]:
+        local_counts = [int(ordinary_rows), int(seed_rows)]
+        if not is_dp_attention_enabled():
+            return ([local_counts[0]], [local_counts[1]])
+
+        global_num_reqs = getattr(batch, "global_num_reqs", None)
+        if global_num_reqs is None or len(global_num_reqs) <= 1:
+            raise RuntimeError(
+                "WeLM MTP root-only DP continuation requires synchronized DP slots."
+            )
+        root_counts = getattr(batch, "welm_mtp_global_root_only_num_reqs", None)
+        root_token_counts = getattr(
+            batch, "welm_mtp_global_root_only_num_tokens", None
+        )
+        if (
+            root_counts is None
+            or root_token_counts is None
+            or len(root_counts) != len(global_num_reqs)
+            or len(root_token_counts) != len(global_num_reqs)
+        ):
+            raise RuntimeError(
+                "WeLM MTP root-only DP continuation requires synchronized "
+                "partition counts."
+            )
+        ordinary_counts = [
+            int(total) - int(root)
+            for total, root in zip(global_num_reqs, root_counts)
+        ]
+        if any(count < 0 for count in ordinary_counts):
+            raise RuntimeError("WeLM MTP root-only DP partition counts are invalid.")
+        seed_counts = [int(count) for count in root_counts]
+        seed_token_counts = [int(count) for count in root_token_counts]
+        if seed_token_counts != seed_counts:
+            raise RuntimeError(
+                "WeLM MTP root-only continuation requires one token per request."
+            )
+        dp_rank = int(get_attention_dp_rank())
+        if not 0 <= dp_rank < len(global_num_reqs):
+            raise RuntimeError("WeLM MTP root-only DP rank is invalid.")
+        if [
+            ordinary_counts[dp_rank],
+            seed_counts[dp_rank],
+        ] != local_counts:
+            raise RuntimeError(
+                "WeLM MTP root-only DP continuation count metadata mismatch."
+            )
+        return ordinary_counts, seed_counts
+
+    @staticmethod
+    def _set_welmv4_mtp_partition_dp_metadata(
+        batch: ModelWorkerBatch,
+        *,
+        request_counts: List[int],
+        token_counts: List[int],
+    ) -> None:
+        if len(request_counts) != len(token_counts):
+            raise RuntimeError("WeLM MTP partition DP metadata is misaligned.")
+        if not is_dp_attention_enabled():
+            batch.forward_mode = ForwardMode.DECODE
+            return
+        batch.global_num_reqs = [int(count) for count in request_counts]
+        batch.global_num_tokens = [int(count) for count in token_counts]
+        batch.global_num_tokens_for_logprob = [
+            int(count) for count in token_counts
+        ]
+        batch.global_forward_modes = [
+            ForwardMode.DECODE.value if count > 0 else ForwardMode.IDLE.value
+            for count in request_counts
+        ]
+        batch.welm_mtp_global_prefill_num_tokens = [0] * len(request_counts)
+        batch.welm_deferred_prefill_flags = [False] * len(request_counts)
+        batch.welm_kv_mirror_contract_flags = [False] * len(request_counts)
+        batch.is_extend_in_batch = False
+        batch.all_extend_in_batch = False
+        dp_rank = int(get_attention_dp_rank())
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if request_counts[dp_rank] == 0
+            else ForwardMode.DECODE
+        )
+
+    def _draft_extend_for_decode_unpartitioned(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         is_idle_decode = batch.forward_mode.is_idle()
@@ -4346,38 +4924,151 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.welm_mtp_kv_mirror_state_buffers = None
+        self._is_welm_mtp_lightweight_prefill = (
+            should_use_welm_mtp_lightweight_prefill(
+                server_args,
+                target_worker.model_runner.model_config,
+            )
+        )
+        self.welm_mtp_direct_kv_enabled = should_use_welm_mtp_direct_kv(
+            server_args, target_worker.model_runner.model_config
+        )
+        self.welm_mtp_storage_draft_kv_pool = None
+        use_welm_mtp_storage_draft_kv = should_use_welm_mtp_storage_draft_kv(
+            server_args, target_worker.model_runner.model_config
+        )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            nccl_port,
-            target_worker,
+        self._draft_worker = (
+            None
+            if self._is_welm_mtp_lightweight_prefill
+            else EagleDraftWorker(
+                server_args,
+                gpu_id,
+                tp_rank,
+                dp_rank,
+                moe_ep_rank,
+                attn_cp_rank,
+                moe_dp_rank,
+                nccl_port,
+                target_worker,
+                defer_cuda_graph_capture=self.welm_mtp_direct_kv_enabled,
+            )
         )
+
+        if self.welm_mtp_direct_kv_enabled:
+            self._initialize_welm_mtp_direct_kv()
+        elif use_welm_mtp_storage_draft_kv:
+            self._initialize_welm_mtp_storage_draft_kv()
 
         # Some dummy tensors
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
+        self.num_new_pages_per_topk = (
+            None
+            if self._is_welm_mtp_lightweight_prefill
+            else torch.empty((), dtype=torch.int64, device=self.device)
         )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self.extend_lens = (
+            None
+            if self._is_welm_mtp_lightweight_prefill
+            else torch.empty((), dtype=torch.int64, device=self.device)
+        )
         self._welmv4_mtp_target_verify_attn_backend = None
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        if self._is_welm_mtp_lightweight_prefill:
+            self.plan_stream = None
+            self.plan_stream_ctx = contextlib.nullcontext()
+        else:
+            self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     @property
     def target_worker(self):
         return self._target_worker
 
+    def _initialize_welm_mtp_direct_kv(self) -> None:
+        draft_worker = self._require_draft_worker("initialize direct K/V")
+        target_runner = self.target_worker.model_runner
+        draft_runner = draft_worker.draft_runner
+        if not uses_welmv4_nextn_draft(draft_runner):
+            raise RuntimeError(
+                "WeLM MTP direct K/V requires a WeLM NextN Draft model"
+            )
+        if (
+            target_runner.token_to_kv_pool_allocator
+            is not draft_runner.token_to_kv_pool_allocator
+        ):
+            raise RuntimeError("WeLM MTP direct K/V requires a shared allocator")
+        if self.req_to_token_pool is not draft_worker.req_to_token_pool:
+            raise RuntimeError("WeLM MTP direct K/V requires a shared request pool")
+        target_pool = target_runner.token_to_kv_pool
+        draft_pool = draft_runner.token_to_kv_pool
+        if int(target_pool.page_size) != int(draft_pool.page_size):
+            raise RuntimeError(
+                "WeLM MTP direct K/V Target/Draft page sizes do not match: "
+                f"{target_pool.page_size} vs {draft_pool.page_size}"
+            )
+        target_runner.model.model.bind_mtp_direct_kv(
+            draft_runner.model.model,
+            target_kv_pool=target_pool,
+            draft_kv_pool=draft_pool,
+        )
+        draft_worker.welm_mtp_direct_kv_enabled = True
+        target_runner.init_welm_mtp_direct_kv_graphs()
+        with (
+            draft_worker.draft_tp_context(draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            draft_worker.init_cuda_graphs()
+
+    def _initialize_welm_mtp_storage_draft_kv(self) -> None:
+        target_runner = self.target_worker.model_runner
+        draft_config = target_runner.welm_mtp_storage_draft_model_config
+        if draft_config is None:
+            raise RuntimeError("WeLM storage-only Draft config is not initialized")
+        draft_pool = target_runner.create_storage_only_kv_pool(draft_config)
+        if int(target_runner.token_to_kv_pool.page_size) != int(
+            draft_pool.page_size
+        ):
+            raise RuntimeError(
+                "WeLM storage-only Target/Draft page sizes do not match: "
+                f"{target_runner.token_to_kv_pool.page_size} vs "
+                f"{draft_pool.page_size}"
+            )
+        target_runner.model.model.bind_mtp_storage_draft_kv(
+            draft_config,
+            draft_kv_pool=draft_pool,
+        )
+        self.welm_mtp_storage_draft_kv_pool = draft_pool
+        self.welm_mtp_direct_kv_enabled = True
+        target_mem = float(getattr(target_runner.token_to_kv_pool, "mem_usage", 0))
+        draft_mem = float(getattr(draft_pool, "mem_usage", 0))
+        logger.info(
+            "WeLM storage-only KV pools: target=%.2f GB, draft=%.2f GB, "
+            "total=%.2f GB",
+            target_mem,
+            draft_mem,
+            target_mem + draft_mem,
+        )
+        target_runner.init_welm_mtp_direct_kv_graphs()
+
     @property
     def draft_worker(self):
         return self._draft_worker
+
+    def _require_draft_worker(self, operation: str) -> EagleDraftWorker:
+        if self._draft_worker is None:
+            raise RuntimeError(
+                "WeLM lightweight MTP worker role=prefill has no Draft model; "
+                f"cannot {operation}"
+            )
+        return self._draft_worker
+
+    _get_welmv4_mtp_last_prefill_hidden_states = (
+        EagleDraftWorker._get_welmv4_mtp_last_prefill_hidden_states
+    )
 
     def _get_welmv4_mtp_target_verify_attn_backend(self):
         if self._welmv4_mtp_target_verify_attn_backend is None:
@@ -4414,29 +5105,106 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Flush drains WeLM MTP asynchronous proposal work before rebuilding the
         # shared allocator metadata, otherwise late writes can corrupt the next
         # request's freshly reset free list.
+        if self.draft_worker is None:
+            return
         if self.draft_worker._is_welmv4_mtp_draft_model() and torch.cuda.is_available():
             device_module = torch.get_device_module(self.device)
             if self.plan_stream is not None:
                 device_module.current_stream().wait_stream(self.plan_stream)
             device_module.synchronize()
 
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        draft_pool = self._require_draft_worker(
+            "offload paired Target/Draft KV"
+        ).draft_runner.token_to_kv_pool
+        return {
+            "target": self.token_to_kv_pool_allocator.get_cpu_copy(
+                indices, mamba_indices=mamba_indices
+            ),
+            "draft": draft_pool.get_cpu_copy(indices),
+        }
+
+    def load_cpu_copy(self, payload, indices, mamba_indices=None):
+        if not isinstance(payload, dict) or set(payload) != {"target", "draft"}:
+            raise RuntimeError("invalid WeLM MTP paired KV CPU payload")
+        draft_pool = self._require_draft_worker(
+            "restore paired Target/Draft KV"
+        ).draft_runner.token_to_kv_pool
+        self.token_to_kv_pool_allocator.load_cpu_copy(
+            payload["target"], indices, mamba_indices=mamba_indices
+        )
+        draft_pool.load_cpu_copy(payload["draft"], indices)
+
+    def _consume_welm_deferred_prefill_completion(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        batch_output: GenerationBatchResult,
+    ) -> bool:
+        completion = batch_output.welm_deferred_prefill_completion
+        if completion is None:
+            return False
+        if not isinstance(completion, WelmDeferredPrefillCompletion):
+            raise RuntimeError("invalid WeLM deferred Prefill completion marker")
+        if getattr(self, "welm_mtp_direct_kv_enabled", False):
+            if completion.model_specific_states is not None:
+                raise RuntimeError(
+                    "WeLM MTP direct K/V completion must be payload-free"
+                )
+            return True
+        buffers = self.welm_mtp_kv_mirror_state_buffers
+        if not buffers:
+            raise RuntimeError("WeLM MTP mirror buffers are not initialized")
+        out_cache_loc = model_worker_batch.out_cache_loc
+        if out_cache_loc is None:
+            raise RuntimeError("WeLM MTP mirror copy requires output cache locations")
+        copy_welmv4_mtp_kv_mirror_states_to_buffers(
+            buffers,
+            completion.model_specific_states,
+            indices=out_cache_loc,
+        )
+        batch_output.welm_deferred_prefill_completion = (
+            WelmDeferredPrefillCompletion()
+        )
+        return True
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
-        if (
+        is_extend = (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
+        )
+        if self._is_welm_mtp_lightweight_prefill and not is_extend:
+            self._require_draft_worker("run decode")
+        if (
+            self._is_welm_mtp_lightweight_prefill
+            and self.server_args.welm_kv_mirror_pd_mode == "deferred-last-prompt"
         ):
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            batch_output = self.target_worker.forward_batch_generation(model_worker_batch)
+            self._consume_welm_deferred_prefill_completion(
+                model_worker_batch, batch_output
+            )
+            return batch_output
+
+        if is_extend:
             # Target prefill
-            is_welmv4_mtp = self.draft_worker._is_welmv4_mtp_draft_model()
+            draft_worker = self.draft_worker
+            is_welmv4_mtp = self._is_welm_mtp_lightweight_prefill or (
+                draft_worker is not None
+                and draft_worker._is_welmv4_mtp_draft_model()
+            )
             defer_welmv4_mtp_pd_prefill = (
                 self.server_args.disaggregation_mode == "prefill"
                 and self.server_args.enable_welm_kv_mirror_opt
                 and is_welmv4_mtp
             )
-            model_worker_batch.capture_hidden_mode = (
-                CaptureHiddenMode.LAST
-                if defer_welmv4_mtp_pd_prefill
-                else CaptureHiddenMode.FULL
-            )
+            if getattr(model_worker_batch, "welm_deferred_prefill", False):
+                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            else:
+                model_worker_batch.capture_hidden_mode = (
+                    CaptureHiddenMode.LAST
+                    if defer_welmv4_mtp_pd_prefill
+                    else CaptureHiddenMode.FULL
+                )
             if (
                 is_welmv4_mtp
                 and self.topk > 1
@@ -4449,11 +5217,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
+            if self._consume_welm_deferred_prefill_completion(
+                model_worker_batch, batch_output
+            ):
+                return batch_output
+
             if defer_welmv4_mtp_pd_prefill:
-                self.draft_worker._copy_welmv4_mtp_pd_prefill_mirror_states(
-                    model_worker_batch,
-                    batch_output.logits_output.model_specific_states,
-                )
+                if (
+                    self.welm_mtp_direct_kv_enabled
+                    and batch_output.logits_output.model_specific_states is not None
+                ):
+                    raise RuntimeError(
+                        "WeLM MTP direct K/V Prefill must be payload-free"
+                    )
+                if not self.welm_mtp_direct_kv_enabled:
+                    EagleDraftWorker._copy_welmv4_mtp_pd_prefill_mirror_states(
+                        self,
+                        model_worker_batch,
+                        batch_output.logits_output.model_specific_states,
+                    )
                 next_draft_input = EagleDraftInput(
                     hidden_states=batch_output.logits_output.hidden_states,
                     bonus_tokens=batch_output.next_token_ids,
@@ -4461,7 +5243,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     num_tokens_per_req=1,
                     num_tokens_for_logprob_per_req=1,
                 )
-                self.draft_worker._prepare_welmv4_mtp_deferred_prefill_draft_input(
+                EagleDraftWorker._prepare_welmv4_mtp_deferred_prefill_draft_input(
+                    self,
                     next_draft_input,
                     model_worker_batch,
                     batch_output.logits_output.hidden_states,
@@ -4475,17 +5258,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
 
             # Draft prefill
+            draft_worker = self._require_draft_worker("run Draft prefill")
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
+                draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
                 batch_output.draft_continuation_state = (
                     DraftContinuationState.from_draft_input(
-                        self.draft_worker._draft_extend_for_prefill(
+                        draft_worker._draft_extend_for_prefill(
                             model_worker_batch,
                             batch_output.logits_output.hidden_states,
                             batch_output.next_token_ids,
@@ -4496,6 +5278,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            draft_worker = self._require_draft_worker("run Draft decode")
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -4505,15 +5288,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
+                draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
-                verify_input: EagleVerifyInput = self.draft_worker.draft(
-                    model_worker_batch
-                )
+                verify_input: EagleVerifyInput = draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             # Record a CUDA event after draft() GPU work is dispatched.
             # This event will be waited on by plan_stream in verify()
@@ -4652,7 +5431,69 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = packed_cache_locs
         return packed_cache_locs
 
+    def _commit_welmv4_mtp_root_only_mirror_states(
+        self,
+        batch: ModelWorkerBatch,
+        verify_input: EagleVerifyInput,
+        accept_index: torch.Tensor,
+        model_specific_states,
+    ) -> None:
+        root_only_mask = getattr(
+            verify_input, "welm_mtp_root_only_verify_mask", None
+        )
+        if root_only_mask is None:
+            return
+        root_rows = torch.nonzero(root_only_mask, as_tuple=False).flatten()
+        if root_rows.numel() == 0:
+            return
+        if accept_index.ndim != 2 or accept_index.shape[0] != root_only_mask.numel():
+            raise RuntimeError("WeLM MTP root-only accept path is not request-aligned.")
+
+        root_source_indices = accept_index[root_rows, 0].to(dtype=torch.long)
+        expected_source_indices = root_rows.to(dtype=torch.long) * int(
+            self.speculative_num_draft_tokens
+        )
+        torch._assert_async(
+            torch.all(root_source_indices == expected_source_indices),
+            "WeLM MTP root-only accept path does not select the Target root slot.",
+        )
+        req_indices = batch.req_pool_indices[root_rows].to(dtype=torch.long)
+        logical_positions = batch.seq_lens[root_rows].to(dtype=torch.long)
+        canonical_slots = self.req_to_token_pool.req_to_token[
+            req_indices, logical_positions
+        ].to(dtype=torch.long)
+        target_root_slots = batch.out_cache_loc[root_source_indices].to(
+            dtype=torch.long
+        )
+        torch._assert_async(
+            torch.all(canonical_slots > 0),
+            "WeLM MTP root-only canonical Target slot is invalid.",
+        )
+        torch._assert_async(
+            torch.all(canonical_slots == target_root_slots),
+            "WeLM MTP root-only canonical Target slot identity failed.",
+        )
+        if getattr(self, "welm_mtp_direct_kv_enabled", False):
+            if model_specific_states is not None:
+                raise RuntimeError(
+                    "WeLM MTP direct K/V root commit must be payload-free."
+                )
+            return
+        buffers = self.welm_mtp_kv_mirror_state_buffers
+        if not buffers:
+            raise RuntimeError("WeLM MTP root-only mirror buffers are not initialized.")
+
+        root_states = slice_welmv4_mtp_kv_mirror_states(
+            model_specific_states, root_source_indices
+        )
+        copy_welmv4_mtp_kv_mirror_states_to_buffers(
+            buffers,
+            root_states,
+            indices=canonical_slots,
+        )
+
     def verify(self, batch: ModelWorkerBatch):
+        self._require_draft_worker("run verify")
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -4826,6 +5667,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+        self._commit_welmv4_mtp_root_only_mirror_states(
+            batch,
+            verify_input,
+            accept_index,
+            logits_output.model_specific_states,
+        )
         if self.topk > 1 and not batch.forward_mode.is_idle():
             accept_lens, accept_index = self._sanitize_topk_accept_path(
                 accept_index, accept_lens, self.speculative_num_draft_tokens
@@ -4950,12 +5797,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         # Construct the next draft input
+        root_only_verify_mask = getattr(
+            verify_input, "welm_mtp_root_only_verify_mask", None
+        )
+        if root_only_verify_mask is not None:
+            root_only_verify_mask = root_only_verify_mask.clone()
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
             hidden_states=packed_hidden_states,
             mirrored_kv_indices=mirrored_kv_indices,
+            welm_mtp_root_only_verify_mask=root_only_verify_mask,
         )
 
         return GenerationBatchResult(
@@ -4967,6 +5820,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_accept_index=accept_index,
             routed_experts_output=forward_batch_output.routed_experts_output,
             welm_mtp_accepted_draft_token_ids=welm_mtp_accepted_draft_token_ids,
+            welm_mtp_root_only_verify_mask=root_only_verify_mask,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )
 

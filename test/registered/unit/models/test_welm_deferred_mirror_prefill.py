@@ -23,6 +23,7 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 def _mirror_config():
     return SimpleNamespace(
         num_hidden_layers=48,
+        num_nextn_predict_layers=1,
         kv_mirror_layers=list(range(48, 32, -1)),
         kv_mirror_imitated_layers=list(range(16)),
     )
@@ -43,6 +44,7 @@ def _model_config(role: str | None):
             config,
             build_welm_deferred_mirror_plan(config),
             role=role,
+            capture_nextn=True,
         )
     return config
 
@@ -80,23 +82,62 @@ def test_execution_binding_is_explicit_and_round_trips_through_config():
         bind_welm_deferred_model_execution(config, plan, role="invalid")
 
 
-def test_prefill_and_monolithic_filter_nextn_pair_but_decode_keeps_existing_pairs():
+def test_prefill_and_monolithic_project_base_and_nextn_pairs():
     prefill_config = _model_config("prefill")
     decode_config = _model_config("decode")
     monolithic_config = _model_config("monolithic")
 
     assert welmv4_model._welm_effective_kv_mirror_pairs(prefill_config) == (
-        list(range(33, 48)),
-        list(range(15, 0, -1)),
+        [*range(33, 48), 48],
+        [*range(15, 0, -1), 0],
     )
     assert welmv4_model._welm_effective_kv_mirror_pairs(decode_config) == (
         list(range(48, 32, -1)),
         list(range(16)),
     )
     assert welmv4_model._welm_effective_kv_mirror_pairs(monolithic_config) == (
+        [*range(33, 48), 48],
+        [*range(15, 0, -1), 0],
+    )
+
+
+def test_deferred_execution_does_not_capture_nextn_unless_requested():
+    config = _mirror_config()
+    bind_welm_deferred_model_execution(
+        config,
+        build_welm_deferred_mirror_plan(config),
+        role="prefill",
+    )
+
+    assert welmv4_model._welm_effective_kv_mirror_pairs(config) == (
         list(range(33, 48)),
         list(range(15, 0, -1)),
     )
+
+
+def test_nextn_capture_source_must_be_in_executed_prefill_prefix():
+    config = _model_config("prefill")
+    config.kv_mirror_imitated_layers[0] = 40
+
+    with pytest.raises(ValueError, match="executed Target prefix"):
+        welmv4_model._welm_effective_kv_mirror_pairs(config)
+
+
+def test_take_nextn_capture_states_requires_complete_layer_set():
+    config = _model_config("prefill")
+    nextn_state = (
+        torch.ones((2, 4), dtype=torch.bfloat16),
+        torch.full((2, 4), 2, dtype=torch.bfloat16),
+    )
+    states = {48: nextn_state}
+
+    captured = welmv4_model._welm_take_nextn_kv_mirror_states(config, states)
+
+    assert captured == {48: nextn_state}
+    assert states == {}
+
+    with pytest.raises(RuntimeError, match="missing NextN mirror K/V.*48"):
+        welmv4_model._welm_take_nextn_kv_mirror_states(config, {})
 
 
 class _FakeDecoderLayer(nn.Module):
@@ -270,8 +311,8 @@ def test_target_finalizer_applies_target_norm_rope_and_layer_identity(
     monkeypatch, target_layer_id
 ):
     captured = {}
-    finalizer = welmv4_model.WelmDeferredTargetKVFinalizer.__new__(
-        welmv4_model.WelmDeferredTargetKVFinalizer
+    finalizer = welmv4_model.WelmMirrorTargetKVFinalizer.__new__(
+        welmv4_model.WelmMirrorTargetKVFinalizer
     )
     nn.Module.__init__(finalizer)
     finalizer.target_layer_id = target_layer_id
@@ -305,11 +346,14 @@ def test_target_finalizer_applies_target_norm_rope_and_layer_identity(
         lambda key, _weight, _eps: normalized_k.view(2, 1, 4),
     )
 
-    def write_kv(cache_layer, key, value, forward_batch):
+    def write_kv(
+        cache_layer, key, value, forward_batch, *, token_to_kv_pool=None
+    ):
         captured["cache_layer"] = cache_layer
         captured["write_key"] = key.clone()
         captured["write_value"] = value.clone()
         captured["forward_batch"] = forward_batch
+        captured["token_to_kv_pool"] = token_to_kv_pool
 
     monkeypatch.setattr(welmv4_model, "_welm_write_kv_cache_only", write_kv)
     forward_batch = SimpleNamespace(
@@ -322,6 +366,7 @@ def test_target_finalizer_applies_target_norm_rope_and_layer_identity(
     assert torch.equal(captured["rope_positions"], positions)
     assert torch.equal(captured["rope_key"], normalized_k)
     assert captured["cache_layer"].layer_id == target_layer_id
+    assert captured["token_to_kv_pool"] is None
     assert torch.equal(captured["write_key"], normalized_k)
     assert torch.equal(captured["write_value"], raw_v)
     assert captured["forward_batch"] is forward_batch
@@ -434,7 +479,7 @@ def test_source_finalization_consumes_raw_mirror_state_immediately():
     positions = torch.tensor([0, 1], dtype=torch.int64)
     forward_batch = object()
 
-    welmv4_model._welm_finalize_deferred_target_kv(
+    welmv4_model._welm_finalize_target_kv(
         finalizers,
         positions,
         forward_batch,
@@ -450,7 +495,7 @@ def test_source_finalization_fails_when_projection_did_not_produce_target_kv():
     finalizers = nn.ModuleDict({"33": nn.Identity()})
 
     with pytest.raises(RuntimeError, match="target layer 33"):
-        welmv4_model._welm_finalize_deferred_target_kv(
+        welmv4_model._welm_finalize_target_kv(
             finalizers,
             torch.tensor([0]),
             object(),
@@ -459,8 +504,8 @@ def test_source_finalization_fails_when_projection_did_not_produce_target_kv():
 
 
 def test_target_finalizer_fails_instead_of_dropping_nonempty_kv_without_cache():
-    finalizer = welmv4_model.WelmDeferredTargetKVFinalizer.__new__(
-        welmv4_model.WelmDeferredTargetKVFinalizer
+    finalizer = welmv4_model.WelmMirrorTargetKVFinalizer.__new__(
+        welmv4_model.WelmMirrorTargetKVFinalizer
     )
     nn.Module.__init__(finalizer)
     finalizer.target_layer_id = 33
@@ -544,7 +589,7 @@ def test_target_finalizer_matches_target_layer_kv_preparation_exactly(
         is_neox_style=True,
         dtype=torch.bfloat16,
     ).cuda()
-    finalizer = welmv4_model.WelmDeferredTargetKVFinalizer(
+    finalizer = welmv4_model.WelmMirrorTargetKVFinalizer(
         target_layer_id=33,
         num_kv_heads=2,
         head_dim=8,
@@ -593,11 +638,14 @@ def test_target_finalizer_matches_target_layer_kv_preparation_exactly(
 
     captured = {}
 
-    def write_kv(cache_layer, key, value, forward_batch):
+    def write_kv(
+        cache_layer, key, value, forward_batch, *, token_to_kv_pool=None
+    ):
         captured["layer_id"] = cache_layer.layer_id
         captured["key"] = key.clone()
         captured["value"] = value.clone()
         captured["forward_batch"] = forward_batch
+        captured["token_to_kv_pool"] = token_to_kv_pool
 
     monkeypatch.setattr(welmv4_model, "_welm_write_kv_cache_only", write_kv)
     forward_batch = SimpleNamespace(
@@ -607,12 +655,15 @@ def test_target_finalizer_matches_target_layer_kv_preparation_exactly(
     finalizer(positions, raw_key.clone(), raw_value, forward_batch)
 
     assert captured["layer_id"] == 33
+    assert captured["token_to_kv_pool"] is None
     assert captured["forward_batch"] is forward_batch
     torch.testing.assert_close(captured["key"], expected_key, rtol=0, atol=0)
     torch.testing.assert_close(captured["value"], raw_value, rtol=0, atol=0)
 
 
-def _make_weight_loader_model(monkeypatch, *, include_v_route=True):
+def _make_weight_loader_model(
+    monkeypatch, *, include_v_route=True, storage_only=False
+):
     loaded = {}
 
     class FakeProjection(nn.Module):
@@ -635,9 +686,9 @@ def _make_weight_loader_model(monkeypatch, *, include_v_route=True):
             return mapping
 
     class FakeFinalizer(nn.Module):
-        def __init__(self):
+        def __init__(self, target_layer_id=33):
             super().__init__()
-            self.target_layer_id = 33
+            self.target_layer_id = target_layer_id
             self.k_norm = nn.Module()
             self.k_norm.weight = nn.Parameter(
                 torch.zeros(4, dtype=torch.bfloat16)
@@ -647,7 +698,7 @@ def _make_weight_loader_model(monkeypatch, *, include_v_route=True):
         welmv4_model, "ImitateQkvMultiBankKvProjection", FakeProjection
     )
     monkeypatch.setattr(
-        welmv4_model, "WelmDeferredTargetKVFinalizer", FakeFinalizer
+        welmv4_model, "WelmMirrorTargetKVFinalizer", FakeFinalizer
     )
     monkeypatch.setattr(
         welmv4_model.FusedMoE,
@@ -660,7 +711,7 @@ def _make_weight_loader_model(monkeypatch, *, include_v_route=True):
             super().__init__()
             self.qkv_proj = FakeProjection()
             self.deferred_target_kv_finalizers = nn.ModuleDict(
-                {"33": FakeFinalizer()}
+                {"33": FakeFinalizer(33), "48": FakeFinalizer(48)}
             )
 
     class FakeLayer(nn.Module):
@@ -681,7 +732,8 @@ def _make_weight_loader_model(monkeypatch, *, include_v_route=True):
         welmv4_model.WeLMV4MoeForCausalLM
     )
     nn.Module.__init__(model)
-    config = _model_config("prefill")
+    config = _model_config(None if storage_only else "prefill")
+    config._sglang_welm_mtp_storage_draft_kv = storage_only
     config.num_experts = 0
     model.config = config
     model.model = FakeBaseModel()
@@ -712,6 +764,32 @@ def test_deferred_weight_loader_relocates_target_kv_and_knorm(monkeypatch):
     assert torch.equal(loaded["projection"]["k2_0"], target_k)
     assert torch.equal(loaded["projection"]["v2_0"], target_v)
     finalizer = model.model.layers[15].self_attn.deferred_target_kv_finalizers["33"]
+    assert torch.equal(finalizer.k_norm.weight, target_k_norm)
+
+
+def test_deferred_weight_loader_relocates_nextn_knorm(monkeypatch):
+    model, _ = _make_weight_loader_model(monkeypatch)
+    target_k_norm = torch.arange(4, dtype=torch.bfloat16)
+
+    model.load_weights(
+        [("model.layers.48.self_attn.k_norm.weight", target_k_norm)]
+    )
+
+    finalizer = model.model.layers[15].self_attn.deferred_target_kv_finalizers["48"]
+    assert torch.equal(finalizer.k_norm.weight, target_k_norm)
+
+
+def test_storage_only_weight_loader_relocates_nextn_knorm_without_deferred(
+    monkeypatch,
+):
+    model, _ = _make_weight_loader_model(monkeypatch, storage_only=True)
+    target_k_norm = torch.arange(4, dtype=torch.bfloat16)
+
+    model.load_weights(
+        [("model.layers.48.self_attn.k_norm.weight", target_k_norm)]
+    )
+
+    finalizer = model.model.layers[15].self_attn.deferred_target_kv_finalizers["48"]
     assert torch.equal(finalizer.k_norm.weight, target_k_norm)
 
 

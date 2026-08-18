@@ -4,7 +4,7 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.observability.scheduler_metrics_mixin import (
@@ -265,6 +265,48 @@ class TestForwardPassMetrics(unittest.TestCase):
             scheduler.init_metrics(tp_rank=0, pp_rank=0, dp_rank=0)
 
         self.assertFalse(scheduler.enable_fpm)
+
+    def test_report_decode_stats_allows_seed_only_spec_window(self):
+        scheduler = _DummyScheduler()
+        scheduler.enable_mfu_metrics = False
+        scheduler.current_scheduler_metrics_enabled = False
+        scheduler.forward_ct_decode = 1
+        scheduler.is_stats_logging_rank = True
+        scheduler.last_decode_stats_tic = 1.0
+        scheduler.num_generated_tokens = 1
+        scheduler.waiting_queue = []
+        scheduler.spec_num_accept_tokens = 0
+        scheduler.spec_num_forward_ct = 0
+        scheduler.spec_total_num_accept_tokens = 0
+        scheduler.spec_total_num_forward_ct = 0
+        scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        scheduler.server_args = types.SimpleNamespace(
+            decode_log_interval=1,
+            speculative_num_draft_tokens=3,
+            speculative_num_steps=2,
+            language_only=False,
+        )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.get_pool_stats = lambda: types.SimpleNamespace(
+            get_decode_usage_msg_parts=lambda: []
+        )
+        scheduler._graph_backend_label = "CUDA Graph"
+        scheduler._publish_kv_events = MagicMock()
+        batch = types.SimpleNamespace(
+            reqs=[types.SimpleNamespace()],
+            batch_size=lambda: 1,
+            forward_iter=1,
+        )
+
+        with patch(
+            "sglang.srt.observability.scheduler_metrics_mixin.time.perf_counter",
+            return_value=2.0,
+        ):
+            scheduler.report_decode_stats(False, running_batch=batch)
+
+        self.assertEqual(scheduler.spec_num_accept_tokens, 0)
+        self.assertEqual(scheduler.spec_num_forward_ct, 0)
+        scheduler._publish_kv_events.assert_called_once_with()
 
 
 if __name__ == "__main__":

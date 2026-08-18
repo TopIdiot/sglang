@@ -59,12 +59,14 @@ class WelmDeferredMirrorPlan:
 
 
 _WELM_DEFERRED_MODEL_EXECUTION_ATTR = "_sglang_welm_deferred_model_execution"
+WELM_MTP_STORAGE_DRAFT_KV_ATTR = "_sglang_welm_mtp_storage_draft_kv"
 
 
 @dataclass(frozen=True)
 class WelmDeferredModelExecution:
     role: WelmDeferredExecutionRole
     plan: WelmDeferredMirrorPlan
+    capture_nextn: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -109,8 +111,13 @@ def bind_welm_deferred_model_execution(
     plan: WelmDeferredMirrorPlan,
     *,
     role: WelmDeferredExecutionRole | str,
+    capture_nextn: bool = False,
 ) -> WelmDeferredModelExecution:
-    execution = WelmDeferredModelExecution(role=role, plan=plan)
+    execution = WelmDeferredModelExecution(
+        role=role,
+        plan=plan,
+        capture_nextn=capture_nextn,
+    )
     setattr(config, _WELM_DEFERRED_MODEL_EXECUTION_ATTR, execution)
     return execution
 
@@ -184,7 +191,9 @@ def get_welm_deferred_request_unsupported_reason(req: Any) -> Optional[str]:
     return None
 
 
-def prepare_welm_deferred_prefill_span(req: Any) -> WelmDeferredPrefillSpan:
+def prepare_welm_deferred_prefill_span(
+    req: Any, *, require_mtp_prompt: bool = False
+) -> WelmDeferredPrefillSpan:
     unsupported_reason = get_welm_deferred_request_unsupported_reason(req)
     if unsupported_reason is not None:
         raise ValueError(
@@ -192,6 +201,8 @@ def prepare_welm_deferred_prefill_span(req: Any) -> WelmDeferredPrefillSpan:
         )
 
     span = build_welm_deferred_prefill_span(req.origin_input_ids)
+    if require_mtp_prompt and span.prompt_len < 2:
+        raise ValueError("WeLM deferred MTP requires at least two prompt tokens")
     existing = getattr(req, "welm_deferred_prefill_span", None)
     if existing is not None:
         if existing != span:
@@ -370,10 +381,28 @@ def resolve_welm_deferred_mirror_plan(
         raise ValueError(
             "deferred WeLM mirror mode does not support pipeline parallelism"
         )
-    if getattr(server_args, "speculative_algorithm", None) is not None:
-        raise ValueError(
-            "deferred WeLM mirror mode does not support speculative decoding"
+    speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
+    if speculative_algorithm is not None:
+        is_welm_mtp = (
+            isinstance(speculative_algorithm, str)
+            and speculative_algorithm.upper() == "EAGLE"
+            and int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0) > 0
         )
+        if not is_welm_mtp:
+            raise ValueError(
+                "deferred WeLM mirror speculative decoding requires WeLM MTP"
+            )
+        if int(getattr(server_args, "speculative_eagle_topk", 0) or 0) != 1:
+            raise ValueError("deferred WeLM MTP currently requires topk=1")
+        if getattr(server_args, "disable_overlap_schedule", False):
+            raise ValueError(
+                "deferred WeLM MTP requires overlap scheduling/spec-v2"
+            )
+        if int(getattr(server_args, "attn_cp_size", 1) or 1) != 1:
+            raise ValueError(
+                "deferred WeLM MTP requires attn_cp_size=1 until the base "
+                "AttnCP MTP path is available"
+            )
     if getattr(server_args, "enable_hierarchical_cache", False):
         raise ValueError("deferred WeLM mirror mode does not support HiCache")
     if getattr(server_args, "disaggregation_decode_enable_offload_kvcache", False):

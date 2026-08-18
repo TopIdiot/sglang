@@ -1585,7 +1585,7 @@ def test_welm_mtp_proposal_graph_uses_global_sampling_mode(
         WelmMTPDraftProposalCudaGraphRunner
     )
     runner.eagle_worker = SimpleNamespace(
-        _is_welmv4_mtp_draft_sampling_enabled=lambda: sample_draft,
+        welmv4_mtp_sample_draft=sample_draft,
         welmv4_mtp_draft_fixed_top_p=fixed_top_p,
         _has_welmv4_mtp_fixed_draft_sampling_params=(lambda: has_fixed_sampling_params),
     )
@@ -1640,7 +1640,7 @@ def test_welm_mtp_owner_graph_fails_fast_on_sampling_mode_mismatch():
     runner.topk = 1
     runner.graphs_by_mode = {(True, False): {}}
     runner.eagle_worker = SimpleNamespace(
-        _is_welmv4_mtp_draft_sampling_enabled=lambda: True,
+        welmv4_mtp_sample_draft=True,
         welmv4_mtp_draft_fixed_top_p=None,
         _has_welmv4_mtp_fixed_draft_sampling_params=lambda: True,
     )

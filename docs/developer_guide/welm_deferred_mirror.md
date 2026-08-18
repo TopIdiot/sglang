@@ -31,8 +31,9 @@ mirrored K/V；target layer 只投影自己的 Q，并消费提前生成的 K/V�
 source layer 15..1  -> target layer 33..47
 ```
 
-`source layer 0 -> target layer 48` 属于 NextN/MTP，不在当前单体 Deferred
-Mirror Layer 的处理范围内。
+`source layer 0 -> target layer 48` 属于 NextN/MTP。基础 Deferred 只截断主模型的
+mirror suffix；启用 WeLM MTP 时，Prefill 还会把 NextN 所需的 Draft prefix KV
+直接写入 Draft KV pool，供 Decode 侧后续 verify/draft 使用。
 
 Mirror 结构使 target layer 的 prefix K/V 可以在 source layer 提前产生。
 Deferred 模式进一步在 source 侧完成目标层要求的 K normalization、位置处理、
@@ -105,9 +106,17 @@ Deferred Prefill 返回的是类型明确的 `WelmDeferredPrefillCompletion`，�
 占位 logits，也不是伪造的生成 token。这样可以避免 seed 被提前计入
 `output_ids`、grammar、penalty、streaming 或生成 token 指标。
 
+启用 WeLM MTP 时，Prefill 同样只提交完整 prefix 的 Target/Draft KV，不返回
+bootstrap hidden state。seed 进入普通 MTP target verify batch，但首轮只消费
+canonical root token：该轮 `accept_len=1`，不会把尚未由完整 prompt 验证的 draft
+token 计入输出。首轮 continuation 完成后，请求恢复普通 MTP 生命周期。READY seed
+可以和普通 MTP verify rows 叠 batch；实现允许重算 seed 对应的单个 token，以保持
+原有 verify/continuation 数据流。
+
 单体部署仍只加载一份完整模型。运行 Deferred Prefill 时通过 batch metadata
-动态设置执行截止层；运行 seed 和后续 Decode 时则执行完整模型。P/D 分离部署
-可以只在 Prefill worker 构造截止层之前的模型，而 Decode worker 保持完整模型。
+动态设置执行截止层；运行 seed 和后续 Decode 时则执行完整模型。P/D 分离部署中，
+Prefill worker 不加载完整 MTP Draft 执行权重，只构造写入 Draft prefix KV 所需的
+storage-only Draft KV pool；Decode worker 保持完整 Target/Draft 执行能力。
 
 ## 新增的调度机制
 
@@ -167,6 +176,12 @@ lock、私有 KV tail 与未提交的 seed slot。若单体 retraction 已释放
 KV，请求回到 `PREFILL_PENDING` 并重新匹配 Radix；若底层仍保留 prefix，则可以
 从 `READY` 重试。
 
+WeLM MTP 默认使用 direct-pool：NextN mirror K/V 在 Prefill 中直接写入对应 Draft
+KV pool，不随 completion 携带中间 mirror tensor。该机制与是否启用 Deferred
+解耦，P/D legacy 和 Deferred 调度都使用相同存储语义。P/D 传输会同时描述 Target
+和 Draft KV pool，并要求两者 page size 与 allocator 映射一致。当前支持配置固定
+为 `--page-size 16`。
+
 ### DP 协同
 
 DP attention 下，不同 DP rank 可能同时运行 Deferred Prefill、普通 Prefill、
@@ -199,9 +214,16 @@ CUDA Graph bucket、Prefill 调度压力，以及 P/D 两侧是否有可重叠�
 ## 当前边界
 
 当前实现面向纯文本 `WeLMV4MoeForCausalLM`，并要求 Prefill/Decode 使用 FA3。
-暂不支持 mixed chunk、pipeline parallelism、speculative decoding、HiCache、
-KV offload、LoRA、suffix parallel、Scale-Seq、previous-precision execution 或
-非 BF16 KV cache。P/D 分离模式当前使用 Mooncake 作为 KV transfer backend。
+Speculative decoding 仅支持 WeLM NextN/MTP、Spec V2、`topk=1` 的线性路径；其他
+speculative algorithm 和 tree verify 不在支持范围内。暂不支持 mixed chunk、
+pipeline parallelism、HiCache、LoRA、suffix parallel、Scale-Seq、
+previous-precision execution 或非 BF16 KV cache。当前 MTP runtime 尚未支持
+AttnCP，因此不在验证矩阵中；Deferred 生命周期本身不依赖具体并行策略。P/D
+分离模式当前使用 Mooncake 作为 KV transfer backend。
+
+`SGLANG_WELM_MTP_LEGACY_MIRROR_STATE=1` 只保留用于 P/D legacy 模式的短期兼容
+回退。它会恢复 completion 携带 mirror tensor 的旧路径，默认关闭、不会继续扩展，
+并计划在 direct-pool 完成迁移后删除。
 
 不满足 fast path 前置条件时会显式报错，不会静默回退到完整 Prefill 或其他低性能
 路径。

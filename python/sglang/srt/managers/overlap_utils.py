@@ -259,6 +259,15 @@ class FutureMap:
         )
         self.has_welm_mtp_oe_history_buf = True
 
+    def _ensure_welm_mtp_root_only_verify_buf(self):
+        if hasattr(self, "welm_mtp_root_only_verify_buf"):
+            return
+        self.welm_mtp_root_only_verify_buf = torch.zeros(
+            (self.future_buffer_len,),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
     def alloc_future_indices(
         self, bs: int, req_pool_indices: Optional[torch.Tensor] = None
     ) -> FutureIndices:
@@ -280,6 +289,27 @@ class FutureMap:
                 )
             self.req_pool_indices_buf[start:end] = req_pool_indices
         return FutureIndices(indices=indices, interval=slice(start, end))
+
+    @staticmethod
+    def _resolve_optional_rows(
+        value_indices: torch.Tensor,
+        presence: torch.Tensor,
+        *buffers: torch.Tensor,
+        allow_missing: bool,
+    ):
+        if presence.numel() == 0:
+            return (None,) * len(buffers)
+        present_rows = int(presence.sum().item())
+        if present_rows == presence.numel():
+            return tuple(buffer[value_indices] for buffer in buffers)
+        if present_rows == 0 or not allow_missing:
+            return (None,) * len(buffers)
+
+        values = tuple(buffer[value_indices] for buffer in buffers)
+        missing = ~presence
+        for value in values:
+            value[missing] = 0
+        return values
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
@@ -312,65 +342,81 @@ class FutureMap:
                     if draft_input.welm_mtp_deferred_prefill_draft_mask.numel() > 0
                     else False
                 )
+            root_only_mask = None
+            if hasattr(self, "welm_mtp_root_only_verify_buf"):
+                candidate_mask = self.welm_mtp_root_only_verify_buf[indices]
+                root_only_rows = getattr(
+                    model_worker_batch, "welm_mtp_root_only_rows", None
+                )
+                if root_only_rows is not None and len(root_only_rows) != len(indices):
+                    raise RuntimeError(
+                        "WeLM MTP root-only CPU rows are not request-aligned."
+                    )
+                if root_only_rows is not None:
+                    expected_mask = torch.tensor(
+                        root_only_rows,
+                        dtype=torch.bool,
+                        device=candidate_mask.device,
+                    )
+                    torch._assert_async(
+                        torch.all(candidate_mask == expected_mask),
+                        "WeLM MTP root-only future mask disagrees with scheduler rows.",
+                    )
+                    root_only_mask = candidate_mask
+                draft_input.welm_mtp_root_only_verify_mask = root_only_mask
+            allow_missing_optional_rows = (
+                root_only_mask is not None
+                and not draft_input.welm_mtp_deferred_prefill_draft
+            )
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
-            has_draft_probs = False
             if (
                 getattr(self, "has_welm_mtp_draft_probs_buf", False)
                 and hasattr(self, "welm_mtp_has_draft_probs_buf")
             ):
                 draft_probs_flags = self.welm_mtp_has_draft_probs_buf[indices]
-                has_draft_probs = (
-                    bool(draft_probs_flags.all().item())
-                    if draft_probs_flags.numel() > 0
-                    else False
+                (draft_input.draft_probs,) = self._resolve_optional_rows(
+                    req_pool_indices,
+                    draft_probs_flags,
+                    self.welm_mtp_draft_probs_buf,
+                    allow_missing=allow_missing_optional_rows,
                 )
-            draft_input.draft_probs = (
-                self.welm_mtp_draft_probs_buf[req_pool_indices]
-                if has_draft_probs
-                else None
-            )
-            has_draft_topk = False
+            else:
+                draft_input.draft_probs = None
             if (
                 getattr(self, "has_welm_mtp_draft_topk_buf", False)
                 and hasattr(self, "welm_mtp_has_draft_topk_buf")
             ):
                 draft_topk_flags = self.welm_mtp_has_draft_topk_buf[indices]
-                has_draft_topk = (
-                    bool(draft_topk_flags.all().item())
-                    if draft_topk_flags.numel() > 0
-                    else False
-                )
-            if has_draft_topk:
-                draft_input.welm_mtp_draft_topk_indices = (
-                    self.welm_mtp_draft_topk_indices_buf[req_pool_indices]
-                )
-                draft_input.welm_mtp_draft_topk_values = (
-                    self.welm_mtp_draft_topk_values_buf[req_pool_indices]
+                (
+                    draft_input.welm_mtp_draft_topk_indices,
+                    draft_input.welm_mtp_draft_topk_values,
+                ) = self._resolve_optional_rows(
+                    req_pool_indices,
+                    draft_topk_flags,
+                    self.welm_mtp_draft_topk_indices_buf,
+                    self.welm_mtp_draft_topk_values_buf,
+                    allow_missing=allow_missing_optional_rows,
                 )
             else:
                 draft_input.welm_mtp_draft_topk_indices = None
                 draft_input.welm_mtp_draft_topk_values = None
-            has_draft_proposal = False
             if (
                 getattr(self, "has_welm_mtp_draft_proposal_buf", False)
                 and hasattr(self, "welm_mtp_has_draft_proposal_buf")
             ):
                 draft_proposal_flags = self.welm_mtp_has_draft_proposal_buf[indices]
-                has_draft_proposal = (
-                    bool(draft_proposal_flags.all().item())
-                    if draft_proposal_flags.numel() > 0
-                    else False
-                )
-            if has_draft_proposal:
-                draft_input.draft_proposal_parent_list = (
-                    self.welm_mtp_draft_proposal_parent_list_buf[indices]
-                )
-                draft_input.draft_proposal_top_scores_index = (
-                    self.welm_mtp_draft_proposal_top_scores_index_buf[indices]
-                )
-                draft_input.draft_proposal_tokens = (
-                    self.welm_mtp_draft_proposal_tokens_buf[indices]
+                (
+                    draft_input.draft_proposal_parent_list,
+                    draft_input.draft_proposal_top_scores_index,
+                    draft_input.draft_proposal_tokens,
+                ) = self._resolve_optional_rows(
+                    indices,
+                    draft_proposal_flags,
+                    self.welm_mtp_draft_proposal_parent_list_buf,
+                    self.welm_mtp_draft_proposal_top_scores_index_buf,
+                    self.welm_mtp_draft_proposal_tokens_buf,
+                    allow_missing=allow_missing_optional_rows,
                 )
             else:
                 draft_input.draft_proposal_parent_list = None
@@ -433,6 +479,18 @@ class FutureMap:
         deferred_mask = getattr(
             draft_input, "welm_mtp_deferred_prefill_draft_mask", None
         )
+        root_only_mask = getattr(
+            draft_input, "welm_mtp_root_only_verify_mask", None
+        )
+        if root_only_mask is not None:
+            self._ensure_welm_mtp_root_only_verify_buf()
+        missing_state_mask = deferred_mask
+        if root_only_mask is not None:
+            missing_state_mask = (
+                root_only_mask
+                if missing_state_mask is None
+                else missing_state_mask | root_only_mask
+            )
         if hasattr(self, "welm_mtp_deferred_prefill_draft_buf"):
             if deferred_mask is None:
                 self.welm_mtp_deferred_prefill_draft_buf[intv] = bool(
@@ -440,10 +498,14 @@ class FutureMap:
                 )
             else:
                 self.welm_mtp_deferred_prefill_draft_buf[intv] = deferred_mask
+        if hasattr(self, "welm_mtp_root_only_verify_buf"):
+            self.welm_mtp_root_only_verify_buf[intv] = (
+                False if root_only_mask is None else root_only_mask
+            )
         if hasattr(self, "welm_mtp_has_draft_probs_buf"):
             has_draft_probs = getattr(draft_input, "draft_probs", None) is not None
-            if has_draft_probs and deferred_mask is not None:
-                self.welm_mtp_has_draft_probs_buf[intv] = ~deferred_mask
+            if has_draft_probs and missing_state_mask is not None:
+                self.welm_mtp_has_draft_probs_buf[intv] = ~missing_state_mask
             else:
                 self.welm_mtp_has_draft_probs_buf[intv] = has_draft_probs
         if hasattr(self, "welm_mtp_has_draft_topk_buf"):
@@ -452,8 +514,8 @@ class FutureMap:
                 and getattr(draft_input, "welm_mtp_draft_topk_values", None)
                 is not None
             )
-            if has_draft_topk and deferred_mask is not None:
-                self.welm_mtp_has_draft_topk_buf[intv] = ~deferred_mask
+            if has_draft_topk and missing_state_mask is not None:
+                self.welm_mtp_has_draft_topk_buf[intv] = ~missing_state_mask
             else:
                 self.welm_mtp_has_draft_topk_buf[intv] = has_draft_topk
         if hasattr(self, "welm_mtp_has_draft_proposal_buf"):
@@ -463,8 +525,8 @@ class FutureMap:
                 is not None
                 and getattr(draft_input, "draft_proposal_tokens", None) is not None
             )
-            if has_draft_proposal and deferred_mask is not None:
-                self.welm_mtp_has_draft_proposal_buf[intv] = ~deferred_mask
+            if has_draft_proposal and missing_state_mask is not None:
+                self.welm_mtp_has_draft_proposal_buf[intv] = ~missing_state_mask
             else:
                 self.welm_mtp_has_draft_proposal_buf[intv] = has_draft_proposal
         if hasattr(self, "welm_mtp_has_oe_history_buf"):

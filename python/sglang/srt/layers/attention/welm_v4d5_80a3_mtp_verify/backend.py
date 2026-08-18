@@ -561,7 +561,15 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
                 forward_batch=forward_batch,
             )
             return None, False
-        if k is None or v is None or not save_kv_cache:
+        cache_ready_q_only = bool(
+            k is None
+            and v is None
+            and not save_kv_cache
+            and getattr(layer, "welm_mirror_kv_cache_ready", False)
+        )
+        if not cache_ready_q_only and (
+            k is None or v is None or not save_kv_cache
+        ):
             self._log_fallback(
                 SupportDecision.reject(
                     FallbackReason.LAYOUT,
@@ -570,7 +578,10 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
                         "value_is_none": v is None,
                         "save_kv_cache": save_kv_cache,
                     },
-                    expected="K/V tensors with save_kv_cache=True",
+                    expected=(
+                        "K/V tensors with save_kv_cache=True or an explicitly "
+                        "cache-ready Q-only layer"
+                    ),
                 ),
                 layer=layer,
                 forward_batch=forward_batch,
@@ -643,7 +654,8 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
                     forward_batch=forward_batch,
                 )
                 return None, False
-            self._store_kv(k, v, layer, forward_batch)
+            if not cache_ready_q_only:
+                self._store_kv(k, v, layer, forward_batch)
             result = self.engine.try_run_cuda_graph(
                 query,
                 key_cache,
@@ -709,7 +721,8 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
                     forward_batch=forward_batch,
                 )
                 return None, False
-            self._store_kv(k, v, layer, forward_batch)
+            if not cache_ready_q_only:
+                self._store_kv(k, v, layer, forward_batch)
             result = self.engine.try_run(
                 query,
                 key_cache,
@@ -734,7 +747,7 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
             )
         else:
             self._log_mk_use(layer, forward_batch, cuda_graph=cuda_graph)
-        return result, True
+        return result, not cache_ready_q_only
 
     def forward_extend(
         self,
@@ -751,6 +764,16 @@ class WeLMV4D5MTPVerifyAttentionBackend(AttentionBackend):
         )
         if result is not None:
             return result.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if (
+            k is None
+            and v is None
+            and not save_kv_cache
+            and getattr(layer, "welm_mirror_kv_cache_ready", False)
+        ):
+            raise RuntimeError(
+                "MK WeLM verify backend failed to execute cache-ready Q-only "
+                "attention; fallback is disabled"
+            )
         return self.fallback.forward_extend(
             q,
             k,

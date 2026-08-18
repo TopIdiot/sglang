@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import welmv4 as welmv4_model
 from sglang.srt.models import welmv4_token_owner as token_owner
@@ -32,6 +33,7 @@ class _Attention(nn.Module):
         self.scale_seq_attn_per_suffix = False
         self.attn = SimpleNamespace(layer_id=layer_id)
         self.deferred_target_kv_finalizers = nn.ModuleDict()
+        self.mtp_direct_kv_finalizers = nn.ModuleDict()
 
 
 class _Layer(nn.Module):
@@ -77,6 +79,355 @@ def test_monolithic_finalizers_borrow_target_modules_without_registration():
         assert state_keys.count(target_name) == 1
 
 
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_direct_finalizer_writes_canonical_slot_through_swa_pool(page_size):
+    canonical_slot = 2 * page_size
+    physical_slot = 3 * page_size
+    destination_pool = SWAKVPool.__new__(SWAKVPool)
+    destination_pool.page_size = page_size
+    destination_pool.swa_loc = None
+    destination_pool.layers_mapping = {4: (0, True)}
+    destination_pool.swa_kv_pool = MagicMock()
+    destination_pool.full_kv_pool = MagicMock()
+    mapping = torch.zeros((canonical_slot + 1,), dtype=torch.int64)
+    mapping[canonical_slot] = physical_slot
+    destination_pool.register_mapping(mapping)
+
+    finalizer = welmv4_model.WelmMirrorTargetKVFinalizer.__new__(
+        welmv4_model.WelmMirrorTargetKVFinalizer
+    )
+    nn.Module.__init__(finalizer)
+    finalizer.target_layer_id = 4
+    finalizer.num_kv_heads = 1
+    finalizer.head_dim = 4
+    finalizer.scale_seq_factor = 1
+    finalizer.scale_rope_positions = False
+    finalizer.apply_k_norm = False
+    finalizer.k_norm = nn.Identity()
+    finalizer.rotary_emb = SimpleNamespace(forward_k_only_cuda=lambda *_args: None)
+    finalizer.cache_layer = welmv4_model.WelmDeferredKVCacheLayer(
+        layer_id=4,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=4,
+        v_head_dim=4,
+    )
+    finalizer.destination_pool = destination_pool
+    forward_batch = SimpleNamespace(
+        out_cache_loc=torch.tensor([canonical_slot], dtype=torch.int64),
+        token_to_kv_pool=MagicMock(),
+        attn_cp_prefill_runtime_layout=None,
+    )
+    key = torch.arange(4, dtype=torch.bfloat16).view(1, 4)
+    value = torch.arange(4, 8, dtype=torch.bfloat16).view(1, 4)
+
+    finalizer(torch.tensor([3], dtype=torch.int64), key, value, forward_batch)
+
+    destination_pool.swa_kv_pool.set_kv_buffer.assert_called_once()
+    args = destination_pool.swa_kv_pool.set_kv_buffer.call_args.args
+    assert args[0] is None
+    torch.testing.assert_close(
+        args[1], torch.tensor([physical_slot], dtype=torch.int32)
+    )
+    torch.testing.assert_close(args[2].view_as(key), key)
+    torch.testing.assert_close(args[3].view_as(value), value)
+    assert destination_pool.swa_kv_pool.set_kv_buffer.call_args.kwargs == {
+        "layer_id_override": 0
+    }
+    destination_pool.full_kv_pool.set_kv_buffer.assert_not_called()
+    forward_batch.token_to_kv_pool.set_kv_buffer.assert_not_called()
+
+
+def test_bind_mtp_direct_kv_uses_preserved_target_layer_count():
+    class DirectAttention(_Attention):
+        def __init__(self, layer_id, projection):
+            super().__init__(layer_id)
+            self.qkv_proj = projection
+            self.mtp_direct_kv_finalizers = nn.ModuleDict()
+
+    class DirectLayer(nn.Module):
+        def __init__(self, layer_id, projection):
+            super().__init__()
+            self.self_attn = DirectAttention(layer_id, projection)
+
+    def mirror_projection(projection_cls, mirror_layer_idx):
+        projection = projection_cls.__new__(projection_cls)
+        nn.Module.__init__(projection)
+        projection.imitated_layer_idx = 0
+        projection.mirror_layer_idx = mirror_layer_idx
+        return projection
+
+    target = welmv4_model.WeLMV4MoeForCausalLM.__new__(
+        welmv4_model.WeLMV4MoeForCausalLM
+    )
+    nn.Module.__init__(target)
+    target.config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_target_hidden_layers=4,
+        num_nextn_predict_layers=1,
+        kv_mirror_layers=[2, 4],
+        kv_mirror_imitated_layers=[0, 1],
+    )
+    target.model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
+    nn.Module.__init__(target.model)
+    target.model.config = target.config
+    target.model.start_layer = 0
+    target.model.end_layer = 4
+    target.model.layers = nn.ModuleList(
+        [
+            DirectLayer(0, nn.Identity()),
+            DirectLayer(1, nn.Identity()),
+            DirectLayer(2, mirror_projection(welmv4_model.MirrorQProjection, 2)),
+            DirectLayer(3, nn.Identity()),
+        ]
+    )
+
+    draft = SimpleNamespace(
+        model=SimpleNamespace(
+            decoder_layers=nn.ModuleList(
+                [
+                    DirectLayer(
+                        0,
+                        mirror_projection(welmv4_model.NextnMirrorQProjection, 4),
+                    )
+                ]
+            )
+        )
+    )
+    target_pool = object()
+    draft_pool = object()
+    target.model.layers[0].self_attn.deferred_target_kv_finalizers["2"] = (
+        nn.Identity()
+    )
+    target.model.layers[1].self_attn.deferred_target_kv_finalizers["4"] = (
+        nn.Identity()
+    )
+
+    target.model.bind_mtp_direct_kv(
+        draft.model,
+        target_kv_pool=target_pool,
+        draft_kv_pool=draft_pool,
+    )
+
+    base_finalizer = target.model.layers[0].self_attn.mtp_direct_kv_finalizers["2"]
+    nextn_finalizer = target.model.layers[1].self_attn.mtp_direct_kv_finalizers["4"]
+    assert base_finalizer.target_layer_id == 2
+    assert base_finalizer.cache_layer.layer_id == 2
+    assert base_finalizer.destination_pool is target_pool
+    assert nextn_finalizer.target_layer_id == 4
+    assert nextn_finalizer.cache_layer.layer_id == 0
+    assert nextn_finalizer.destination_pool is draft_pool
+    assert target.model.layers[2].self_attn.qkv_proj.mirror_kv_cache_ready
+    assert draft.model.decoder_layers[0].self_attn.qkv_proj.mirror_kv_cache_ready
+    assert not target.model.layers[0].self_attn.deferred_target_kv_finalizers
+    assert not target.model.layers[1].self_attn.deferred_target_kv_finalizers
+    assert target.model.mtp_direct_kv_enabled
+
+
+def test_bind_storage_draft_kv_maps_logical_nextn_to_local_layer():
+    model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=4,
+        num_nextn_predict_layers=1,
+        kv_mirror_layers=[4],
+        kv_mirror_imitated_layers=[1],
+    )
+    model.layers = nn.ModuleList([_Layer(i) for i in range(4)])
+    model.start_layer = 0
+    model.end_layer = 4
+    model.mtp_direct_kv_enabled = False
+    finalizer = welmv4_model.WelmMirrorTargetKVFinalizer(
+        target_layer_id=4,
+        num_kv_heads=1,
+        head_dim=4,
+        qk_norm=False,
+        k_norm=False,
+        qk_norm_eps=1e-5,
+        rotary_emb=object(),
+        scale_seq_factor=1,
+        scale_rope_positions=False,
+    )
+    model.layers[1].self_attn.deferred_target_kv_finalizers["4"] = finalizer
+    draft_config = SimpleNamespace(
+        full_attention_layer_ids=[],
+        swa_attention_layer_ids=[0],
+        head_dim=4,
+        v_head_dim=4,
+        get_num_kv_heads=lambda tp_size: 1,
+    )
+    draft_pool = SimpleNamespace(
+        page_size=16,
+        head_num=1,
+        head_dim=4,
+        swa_kv_pool=SimpleNamespace(head_num=1, head_dim=4, v_head_dim=4),
+        full_kv_pool=SimpleNamespace(head_num=1, head_dim=4, v_head_dim=4),
+        layers_mapping={0: (0, True)},
+    )
+
+    model.bind_mtp_storage_draft_kv(
+        draft_config,
+        draft_kv_pool=draft_pool,
+    )
+
+    assert finalizer.target_layer_id == 4
+    assert finalizer.cache_layer.layer_id == 0
+    assert finalizer.destination_pool is draft_pool
+    assert model.layers[1].self_attn.mtp_direct_kv_finalizers["4"] is finalizer
+    assert "4" not in model.layers[1].self_attn.deferred_target_kv_finalizers
+    assert model.mtp_direct_kv_enabled
+
+
+def test_storage_prefill_builds_nextn_finalizers_without_deferred_execution():
+    model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=4,
+        num_nextn_predict_layers=1,
+        kv_mirror_layers=[4],
+        kv_mirror_imitated_layers=[1],
+        scale_seq_times=0,
+        scale_seq_attn_per_suffix_layerwise=[],
+        _sglang_welm_mtp_storage_draft_kv=True,
+    )
+    model.layers = nn.ModuleList([_Layer(i) for i in range(4)])
+    model.start_layer = 0
+    model.end_layer = 4
+
+    model._bind_storage_draft_target_kv_finalizers()
+
+    finalizers = model.layers[1].self_attn.deferred_target_kv_finalizers
+    assert tuple(finalizers) == ("4",)
+    assert finalizers["4"].target_layer_id == 4
+
+
+@pytest.mark.parametrize(("target_pool", "draft_pool"), [(None, object()), (object(), None)])
+def test_bind_mtp_direct_kv_rejects_missing_destination_pool(
+    target_pool, draft_pool
+):
+    model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
+    nn.Module.__init__(model)
+    model.mtp_direct_kv_enabled = False
+
+    with pytest.raises(RuntimeError, match="destination pools"):
+        model.bind_mtp_direct_kv(
+            SimpleNamespace(),
+            target_kv_pool=target_pool,
+            draft_kv_pool=draft_pool,
+        )
+
+
+def test_direct_source_finalization_consumes_all_mirror_kv_without_deferred_flag():
+    calls = []
+
+    class Finalizer(nn.Module):
+        def __init__(self, target_layer_id):
+            super().__init__()
+            self.target_layer_id = target_layer_id
+
+        def forward(self, positions, key, value, forward_batch):
+            calls.append((self.target_layer_id, positions, key, value, forward_batch))
+
+    attention = SimpleNamespace(
+        mtp_direct_kv_finalizers=nn.ModuleDict(
+            {"2": Finalizer(2), "4": Finalizer(4)}
+        ),
+        deferred_target_kv_finalizers=nn.ModuleDict({"3": Finalizer(3)}),
+    )
+    positions = torch.tensor([0, 1], dtype=torch.int64)
+    forward_batch = SimpleNamespace(welm_deferred_prefill=False)
+    states = {
+        layer: (
+            torch.full((2, 4), layer, dtype=torch.bfloat16),
+            torch.full((2, 4), -layer, dtype=torch.bfloat16),
+        )
+        for layer in (2, 4)
+    }
+
+    welmv4_model._welm_finalize_source_kv(
+        attention,
+        positions,
+        forward_batch,
+        states,
+    )
+
+    assert [target for target, *_rest in calls] == [2, 4]
+    assert states == {}
+
+
+def test_storage_source_finalizes_direct_nextn_and_deferred_base_kv():
+    calls = []
+
+    class Finalizer(nn.Module):
+        def __init__(self, target_layer_id):
+            super().__init__()
+            self.target_layer_id = target_layer_id
+
+        def forward(self, positions, key, value, forward_batch):
+            calls.append(self.target_layer_id)
+
+    attention = SimpleNamespace(
+        mtp_direct_kv_finalizers=nn.ModuleDict({"4": Finalizer(4)}),
+        deferred_target_kv_finalizers=nn.ModuleDict({"3": Finalizer(3)}),
+    )
+    states = {
+        layer: (torch.ones((1, 4)), torch.ones((1, 4))) for layer in (3, 4)
+    }
+
+    welmv4_model._welm_finalize_source_kv(
+        attention,
+        torch.tensor([0]),
+        SimpleNamespace(welm_deferred_prefill=True),
+        states,
+    )
+
+    assert calls == [4, 3]
+    assert states == {}
+
+
+@pytest.mark.parametrize(
+    ("projection_cls", "apply_method"),
+    [
+        (welmv4_model.MirrorQProjection, "_apply_qkv"),
+        (welmv4_model.NextnMirrorQProjection, "_apply_q_only"),
+    ],
+)
+def test_direct_mirror_consumer_projects_q_without_mirror_tensor(
+    monkeypatch, projection_cls, apply_method
+):
+    projection = projection_cls.__new__(projection_cls)
+    nn.Module.__init__(projection)
+    projection.imitated_layer_idx = 1
+    projection.mirror_layer_idx = 4
+    projection.mirror_kv_cache_ready = True
+    project_q = MagicMock(
+        side_effect=lambda hidden, *_args: hidden.new_empty((hidden.shape[0], 8))
+    )
+    setattr(projection, apply_method, project_q)
+    hidden = torch.empty((2, 4), dtype=torch.bfloat16)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_cp_prefill_runtime_layout=None,
+        spec_info=SimpleNamespace(mirrored_kv_indices=None),
+    )
+    attn = SimpleNamespace(q_size=8, kv_size=4, need_clear_kv_cache=False)
+    states = {}
+    monkeypatch.setattr(
+        welmv4_model, "_welm_should_contract_kv_mirror", lambda _batch: False
+    )
+
+    q, k, v, projected_hidden = projection(
+        attn, hidden, forward_batch, kv_mirror_states=states
+    )
+
+    assert q.shape == (2, 8)
+    assert k is None
+    assert v is None
+    assert projected_hidden is hidden
+    assert states == {}
+    project_q.assert_called_once()
+
+
 class _CountingLayer(nn.Module):
     def __init__(self, layer_id, calls):
         super().__init__()
@@ -97,14 +448,26 @@ class _CountingLayer(nn.Module):
 
 
 @pytest.mark.parametrize(
-    ("deferred_prefill", "expected_layers", "expected_value", "norm_calls"),
+    (
+        "deferred_prefill",
+        "direct_kv",
+        "expected_layers",
+        "expected_value",
+        "norm_calls",
+    ),
     [
-        (True, [0, 1], 2, 0),
-        (False, [0, 1, 2, 3], 4, 1),
+        (True, False, [0, 1], 2, 0),
+        (False, False, [0, 1, 2, 3], 4, 1),
+        (True, True, [0, 1], 2, 0),
     ],
 )
 def test_monolithic_runtime_cutoff_preserves_ordinary_full_forward(
-    monkeypatch, deferred_prefill, expected_layers, expected_value, norm_calls
+    monkeypatch,
+    deferred_prefill,
+    direct_kv,
+    expected_layers,
+    expected_value,
+    norm_calls,
 ):
     calls = []
     model = welmv4_model.Qwen2MoeModel.__new__(welmv4_model.Qwen2MoeModel)
@@ -117,6 +480,7 @@ def test_monolithic_runtime_cutoff_preserves_ordinary_full_forward(
         omit_final_output=False,
     )
     model.execution_end_layer = 4
+    model.mtp_direct_kv_enabled = direct_kv
     model.start_layer = 0
     model.end_layer = 4
     model.layers = nn.ModuleList([_CountingLayer(i, calls) for i in range(4)])
@@ -140,6 +504,12 @@ def test_monolithic_runtime_cutoff_preserves_ordinary_full_forward(
         welmv4_model, "_welm_should_contract_kv_mirror", lambda _batch: False
     )
     monkeypatch.setattr(welmv4_model, "_set_welm_kv_mirror_states", lambda *_args: None)
+    take_nextn = MagicMock(
+        side_effect=AssertionError("direct K/V must not materialize mirror payload")
+    )
+    monkeypatch.setattr(
+        welmv4_model, "_welm_take_nextn_kv_mirror_states", take_nextn
+    )
     monkeypatch.setattr(
         welmv4_model,
         "model_forward_maybe_tbo",
@@ -160,7 +530,7 @@ def test_monolithic_runtime_cutoff_preserves_ordinary_full_forward(
         welm_deferred_prefill=deferred_prefill,
         can_run_tbo=deferred_prefill,
         spec_info=None,
-        spec_algorithm=None,
+        spec_algorithm=SimpleNamespace(is_eagle=lambda: True) if direct_kv else None,
         capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
         model_specific_states=None,
         attn_cp_prefill_runtime_layout=None,
@@ -178,6 +548,7 @@ def test_monolithic_runtime_cutoff_preserves_ordinary_full_forward(
         torch.full((2, 4), expected_value, dtype=torch.bfloat16),
     )
     assert model.norm.call_count == norm_calls
+    take_nextn.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -445,6 +445,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         next_attn_cp_owner_rotation: int = 0,
+        kv_cache_offload_owner=None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -501,6 +502,7 @@ class PrefillAdder:
             else []
         )
         self.next_attn_cp_owner_rotation = int(next_attn_cp_owner_rotation)
+        self.kv_cache_offload_owner = kv_cache_offload_owner
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -1437,7 +1439,10 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    server_args,
+                    kv_cache_offload_owner=self.kv_cache_offload_owner,
                 )
             else:
                 keep_indices.append(i)

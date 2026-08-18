@@ -155,6 +155,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.models.welm_deferred_mirror import (
+    is_welm_deferred_mirror_enabled,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -529,7 +532,7 @@ async def validate_json_request(raw_request: Request):
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
-    Check the health of the inference server by sending a special request to generate one token.
+    Check server health with a minimal request that generates one token.
 
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
@@ -549,12 +552,19 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    input_ids = (
+        [0, 0]
+        if is_welm_deferred_mirror_enabled(
+            _global_state.tokenizer_manager.server_args
+        )
+        else [0]
+    )
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
 
     if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
-            input_ids=[0],
+            input_ids=input_ids,
             sampling_params=sampling_params,
             log_metrics=False,
         )

@@ -8,18 +8,13 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import overlap_utils
 from sglang.srt.managers import schedule_batch as schedule_batch_module
 from sglang.srt.managers import scheduler_dp_attn_mixin
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.welm_deferred_mirror import WelmPDExecutionMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
-
-
-def test_deferred_seed_state_is_not_duplicated_in_batch_metadata():
-    for batch_type in (ScheduleBatch, ModelWorkerBatch, ForwardBatch):
-        assert "welm_deferred_seed_mask" not in batch_type.__dataclass_fields__
 
 
 def _server_args(disaggregation_mode=DisaggregationMode.DECODE):
@@ -34,6 +29,26 @@ def _server_args(disaggregation_mode=DisaggregationMode.DECODE):
 
 def _spec_algorithm_none():
     return SimpleNamespace(is_none=lambda: True)
+
+
+def _spec_algorithm_eagle_v2():
+    return SimpleNamespace(
+        is_none=lambda: False,
+        is_eagle=lambda: True,
+        supports_spec_v2=lambda: True,
+    )
+
+
+def test_spec_v2_decode_without_draft_input_fails_fast():
+    batch = ScheduleBatch.__new__(ScheduleBatch)
+    batch.enable_overlap = True
+    batch.spec_algorithm = _spec_algorithm_eagle_v2()
+    batch.forward_mode = ForwardMode.DECODE
+    batch.welm_deferred_prefill = False
+    batch.spec_info = None
+
+    with pytest.raises(RuntimeError, match="missing draft input"):
+        batch.maybe_wait_verify_done()
 
 
 def _seed_req(rid: str, prompt_token_ids):
@@ -75,6 +90,9 @@ def _normal_req(rid: str, *, finished=False):
     return SimpleNamespace(
         rid=rid,
         output_ids=[91],
+        return_logprob=False,
+        stream=False,
+        grammar=None,
         welm_deferred_decode_state=None,
         attn_cp_prefill_split_spec=None,
         finished=lambda: finished,
@@ -92,7 +110,7 @@ def _scheduler(
         reqs=list(running_reqs),
         batch_size=lambda: len(running_batch.reqs),
     )
-    return SimpleNamespace(
+    scheduler = SimpleNamespace(
         grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
         waiting_queue=list(waiting_queue),
         enable_priority_scheduling=False,
@@ -100,13 +118,26 @@ def _scheduler(
         req_to_token_pool=SimpleNamespace(size=capacity, device="cpu"),
         token_to_kv_pool_allocator=object(),
         tree_cache=object(),
-        model_config=SimpleNamespace(is_encoder_decoder=False, vocab_size=128),
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False,
+            vocab_size=128,
+            spec_hidden_size=8,
+            dtype=torch.float32,
+        ),
         enable_overlap=False,
         spec_algorithm=_spec_algorithm_none(),
         max_running_requests=capacity,
-        server_args=_server_args(disaggregation_mode),
+        server_args=SimpleNamespace(
+            **vars(_server_args(disaggregation_mode)),
+            speculative_eagle_topk=1,
+            speculative_num_steps=3,
+        ),
         disaggregation_mode=disaggregation_mode,
     )
+    scheduler._prepare_welm_deferred_seed_batch = lambda batch: (
+        Scheduler._prepare_welm_deferred_seed_batch(scheduler, batch)
+    )
+    return scheduler
 
 
 @pytest.mark.parametrize(
@@ -140,6 +171,46 @@ def test_seed_only_admission_builds_standard_decode_row_metadata(
     assert (
         req.welm_deferred_decode_state.phase
         is schedule_batch_module.WelmDeferredDecodePhase.READY
+    )
+
+
+def test_overlap_mtp_seed_admission_registers_root_only_future_rows_once():
+    from sglang.srt.managers.overlap_utils import FutureIndices
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    req = _seed_req("seed-0", [11, 12, 13])
+    scheduler = _scheduler(
+        [req], disaggregation_mode=DisaggregationMode.NULL
+    )
+    scheduler.enable_overlap = True
+    scheduler.spec_algorithm = _spec_algorithm_eagle_v2()
+    scheduler.future_map = MagicMock()
+    future_indices = FutureIndices(torch.tensor([7], dtype=torch.int64))
+    scheduler.future_map.alloc_future_indices.return_value = future_indices
+
+    with patch(
+        "sglang.srt.managers.schedule_batch."
+        "SamplingBatchInfo.from_schedule_batch",
+        return_value=MagicMock(),
+    ):
+        batch = Scheduler.get_new_welm_deferred_seed_batch(scheduler)
+
+    assert isinstance(batch.spec_info, EagleDraftInput)
+    assert batch.spec_info.bonus_tokens is batch.output_ids
+    assert batch.spec_info.new_seq_lens is batch.seq_lens
+    assert batch.spec_info.welm_mtp_root_only_verify_mask.tolist() == [True]
+    assert batch.welm_mtp_root_only_rows == [True]
+    assert batch.spec_info.topk_p.shape == (1, 3)
+    assert batch.spec_info.topk_index.tolist() == [[13, 13, 13]]
+    assert batch.spec_info.hidden_states.shape == (1, 8)
+    assert batch.spec_info.num_tokens_per_req == 1
+    assert batch.spec_info.num_tokens_for_logprob_per_req == 1
+    assert batch.spec_info.future_indices is future_indices
+    scheduler.future_map.alloc_future_indices.assert_called_once_with(
+        1, batch.req_pool_indices
+    )
+    scheduler.future_map.store_to_map_for_new_batch.assert_called_once_with(
+        future_indices, batch.spec_info
     )
 
 
@@ -579,6 +650,143 @@ def test_prepare_for_decode_rejects_prefill_pending_seed_row():
         batch.prepare_for_decode()
 
 
+def test_prepare_for_decode_snapshots_request_aligned_root_only_rows():
+    normal = _normal_req("normal")
+    seed = _seed_req("seed-1", [11, 12, 13])
+    batch = _decode_batch(
+        [normal, seed], output_ids=[91, 13], seq_lens=[5, 2]
+    )
+    batch.enable_overlap = True
+    batch.spec_algorithm = _spec_algorithm_eagle_v2()
+    batch.spec_info = MagicMock()
+
+    batch.prepare_for_decode()
+
+    assert batch.welm_mtp_root_only_rows == [False, True]
+    batch.spec_info.prepare_for_decode.assert_called_once()
+
+
+def test_root_only_sched_sync_counts_one_decode_token_per_seed():
+    batch = _decode_batch(
+        [_normal_req("normal"), _seed_req("seed-1", [11, 12, 13])],
+        output_ids=[91, 13],
+        seq_lens=[4096, 2],
+    )
+    batch.welm_mtp_root_only_rows = [False, True]
+
+    with patch.object(
+        scheduler_dp_attn_mixin.TboDPAttentionPreparer,
+        "prepare_all_gather",
+        return_value=(False, ForwardMode.DECODE.value),
+    ):
+        info, _ = scheduler_dp_attn_mixin.compute_local_mlp_sync_info(
+            batch,
+            dp_size=2,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            disable_cuda_graph=False,
+        )
+
+    assert info.welm_mtp_root_only_num_reqs == 1
+    assert info.welm_mtp_root_only_num_tokens == 1
+
+
+def test_fused_sched_sync_refreshes_inflight_seed_rows_before_gather():
+    seed = _seed_req("seed-1", [11, 12, 13])
+    seed.welm_deferred_decode_state.transition_to(
+        schedule_batch_module.WelmDeferredDecodePhase.INFLIGHT
+    )
+    batch = _decode_batch([seed], output_ids=[13], seq_lens=[2])
+    batch.spec_algorithm = _spec_algorithm_eagle_v2()
+    batch.welm_mtp_root_only_rows = [True]
+    batch.prepare_for_decode = MagicMock()
+
+    scheduler = SimpleNamespace(
+        running_batch=batch,
+        server_args=SimpleNamespace(dp_size=1, disable_cuda_graph=False),
+        attn_tp_size=1,
+        attn_cp_size=1,
+        forward_ct=7,
+        _check_decode_mem=lambda _: True,
+        new_token_ratio=0.5,
+        new_token_ratio_decay=0.1,
+        min_new_token_ratio=0.1,
+        _welm_fused_leader_group=object(),
+        attn_tp_cpu_group=object(),
+        attn_tp_group=SimpleNamespace(ranks=[0]),
+        attn_tp_rank=0,
+        attn_cp_rank=0,
+        chunked_req=None,
+        waiting_queue=[],
+        grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+        get_idle_batch=lambda: None,
+    )
+    gathered_root_info = []
+
+    def gather(info, **_kwargs):
+        gathered_root_info.append(
+            (
+                info.welm_mtp_root_only_num_reqs,
+                info.welm_mtp_root_only_num_tokens,
+            )
+        )
+        info.all_rows = info._get_local_tensor(device="cpu").unsqueeze(0)
+        info._finish_parse(info.all_rows)
+
+    with (
+        patch.object(
+            scheduler_dp_attn_mixin.TboDPAttentionPreparer,
+            "prepare_all_gather",
+            return_value=(True, ForwardMode.DECODE.value),
+        ),
+        patch.object(
+            scheduler_dp_attn_mixin.MLPSyncBatchInfo,
+            "gather_hierarchical",
+            new=gather,
+        ),
+        patch.object(
+            scheduler_dp_attn_mixin,
+            "apply_gathered_mlp_sync",
+            return_value=batch,
+        ),
+        patch.object(
+            scheduler_dp_attn_mixin,
+            "require_mlp_tp_gather",
+            return_value=False,
+        ),
+    ):
+        is_fast, result = Scheduler.welm_fused_sched_sync_round(scheduler, 0, 0)
+
+    assert is_fast
+    assert result is batch
+    assert gathered_root_info == [(0, 0)]
+
+
+def test_root_only_cpu_rows_follow_batch_merge_and_filter():
+    normal_batch = _decode_batch(
+        [_normal_req("normal")], output_ids=[91], seq_lens=[5]
+    )
+    seed_batch = _decode_batch(
+        [_seed_req("seed-1", [11, 12, 13])], output_ids=[13], seq_lens=[2]
+    )
+    seed_batch.welm_mtp_root_only_rows = [True]
+
+    normal_batch.merge_batch(seed_batch)
+    assert normal_batch.welm_mtp_root_only_rows == [False, True]
+
+    normal_batch.filter_batch(keep_indices=[1])
+    assert normal_batch.welm_mtp_root_only_rows == [True]
+
+    mixed_batch = _decode_batch(
+        [_normal_req("normal"), _seed_req("seed-1", [11, 12, 13])],
+        output_ids=[91, 13],
+        seq_lens=[5, 2],
+    )
+    mixed_batch.welm_mtp_root_only_rows = [False, True]
+    mixed_batch.filter_batch(keep_indices=[0])
+    assert mixed_batch.welm_mtp_root_only_rows is None
+
+
 def _decode_batch(reqs, *, output_ids, seq_lens):
     sampling_info = MagicMock()
     sampling_info.penalizer_orchestrator.is_required = False
@@ -617,6 +825,8 @@ def test_deferred_seed_remains_dp_cuda_graph_eligible():
         welm_kv_mirror_contract_flags=[False],
         welm_deferred_prefill_flags=[False],
         welm_mtp_global_prefill_num_tokens=[0],
+        welm_mtp_global_root_only_num_reqs=[0],
+        welm_mtp_global_root_only_num_tokens=[0],
         global_has_non_greedy_sampling=False,
         global_needs_top_p_sampling=False,
         can_cuda_graph=True,
@@ -633,6 +843,8 @@ def test_deferred_seed_remains_dp_cuda_graph_eligible():
 
     assert batch.can_run_dp_cuda_graph
     assert batch.welm_deferred_prefill_flags == [False]
+    assert batch.welm_mtp_global_root_only_num_reqs == [0]
+    assert batch.welm_mtp_global_root_only_num_tokens == [0]
 
 
 def test_overlap_resolution_leaves_non_negative_seed_token_untouched():

@@ -8,7 +8,11 @@ import torch
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    WelmDeferredDecodePhase,
+    WelmDeferredDecodeState,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -34,7 +38,7 @@ _MLP_SYNC_FLAG_TOP_P_SAMPLING = 1 << 5
 # dp-spec-prefill all_reduce). Words 0-7 keep their classic meaning; classic
 # gathers simply carry zeros in the new words.
 _MLP_SYNC_ROW_WORDS = 12
-_WELM_FUSED_SCHED_SYNC_SCHEMA = 1
+_WELM_FUSED_SCHED_SYNC_SCHEMA = 2
 
 # Intent word (row index 8) bits. Any nonzero intent on any rank sends the
 # whole round down the classic scheduling path.
@@ -135,6 +139,8 @@ class MLPSyncBatchInfo:
     local_has_non_greedy_sampling: bool = False
     local_needs_top_p_sampling: bool = False
     welm_mtp_prefill_num_tokens: int = 0
+    welm_mtp_root_only_num_reqs: int = 0
+    welm_mtp_root_only_num_tokens: int = 0
     # WeLM fused sched-sync extras (zero on classic gathers)
     fused_intent: int = 0
     fused_stamp: int = 0
@@ -151,6 +157,8 @@ class MLPSyncBatchInfo:
     welm_kv_mirror_contract_flags: list[bool] = None
     welm_deferred_prefill_flags: list[bool] = None
     welm_mtp_global_prefill_num_tokens: list[int] = None
+    welm_mtp_global_root_only_num_reqs: list[int] = None
+    welm_mtp_global_root_only_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -184,7 +192,10 @@ class MLPSyncBatchInfo:
                 self.fused_intent,
                 self.fused_stamp,
                 _WELM_FUSED_SCHED_SYNC_SCHEMA,
-                0,  # reserved
+                _pack_welm_mtp_prefill_info(
+                    self.welm_mtp_root_only_num_tokens,
+                    self.welm_mtp_root_only_num_reqs,
+                ),
             ],
             device=device,
             dtype=dtype,
@@ -204,7 +215,7 @@ class MLPSyncBatchInfo:
                 0,  # fused_intent
                 self.fused_stamp,  # keep the stamp assert happy on substitution
                 _WELM_FUSED_SCHED_SYNC_SCHEMA,
-                0,  # reserved
+                _pack_welm_mtp_prefill_info(0, 0),  # root-only partition info
             ],
             device=device,
             dtype=dtype,
@@ -275,7 +286,7 @@ class MLPSyncBatchInfo:
     def _finish_parse(self, tp0_info: torch.Tensor):
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, [0, 1, 2, 3, 5, 6, 7]].cpu()
+        cpu_data = tp0_info[:, [0, 1, 2, 3, 5, 6, 7, 11]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(cpu_data[:, 2].min().item())
@@ -309,6 +320,16 @@ class MLPSyncBatchInfo:
             item[0] for item in prefill_info
         ]
         self.global_num_reqs = [item[1] for item in prefill_info]
+        root_only_info = [
+            _unpack_welm_mtp_prefill_info(value)
+            for value in cpu_data[:, 7].tolist()
+        ]
+        self.welm_mtp_global_root_only_num_tokens = [
+            item[0] for item in root_only_info
+        ]
+        self.welm_mtp_global_root_only_num_reqs = [
+            item[1] for item in root_only_info
+        ]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -363,6 +384,12 @@ def _update_gather_batch(
         batch.welm_mtp_global_prefill_num_tokens = (
             mlp_sync_info.welm_mtp_global_prefill_num_tokens
         )
+        batch.welm_mtp_global_root_only_num_reqs = (
+            mlp_sync_info.welm_mtp_global_root_only_num_reqs
+        )
+        batch.welm_mtp_global_root_only_num_tokens = (
+            mlp_sync_info.welm_mtp_global_root_only_num_tokens
+        )
         batch.global_has_non_greedy_sampling = (
             mlp_sync_info.global_has_non_greedy_sampling
         )
@@ -408,6 +435,7 @@ def compute_local_mlp_sync_info(
     attn_tp_size: int,
     attn_cp_size: int,
     disable_cuda_graph: bool,
+    derive_welm_mtp_root_only_from_lifecycle: bool = False,
 ):
     """Compute this rank's mlp-sync row from local scheduler state.
 
@@ -461,6 +489,36 @@ def compute_local_mlp_sync_info(
     is_welm_deferred_prefill = bool(
         local_batch is not None and local_batch.welm_deferred_prefill
     )
+    root_only_rows = (
+        getattr(local_batch, "welm_mtp_root_only_rows", None)
+        if local_batch is not None
+        else None
+    )
+    if root_only_rows is not None and len(root_only_rows) != num_reqs:
+        raise RuntimeError("WeLM MTP root-only CPU rows are not request-aligned.")
+    root_only_indices = [
+        index for index, is_root in enumerate(root_only_rows or ()) if is_root
+    ]
+    # Fused sched-sync runs before prepare_for_decode(), so a stored root row
+    # may describe the previous launch. Re-derive flagged rows without mutation.
+    if derive_welm_mtp_root_only_from_lifecycle and root_only_indices:
+        previous_root_only_indices = root_only_indices
+        root_only_indices = []
+        for index in previous_root_only_indices:
+            req = local_batch.reqs[index]
+            state = vars(req).get("welm_deferred_decode_state")
+            if not isinstance(state, WelmDeferredDecodeState):
+                raise RuntimeError(
+                    "decode batch received invalid WeLM deferred lifecycle state"
+                )
+            if state.phase is WelmDeferredDecodePhase.PREFILL_PENDING:
+                raise RuntimeError(
+                    "WeLM deferred seed entered decode before Prefill completion"
+                )
+            if state.phase is WelmDeferredDecodePhase.READY:
+                root_only_indices.append(index)
+    welm_mtp_root_only_num_reqs = len(root_only_indices)
+    welm_mtp_root_only_num_tokens = welm_mtp_root_only_num_reqs
     has_non_greedy_sampling = _has_non_greedy_sampling(local_batch)
     needs_top_p_sampling = _needs_top_p_sampling(local_batch)
     welm_mtp_prefill_num_tokens = _get_welm_mtp_prefill_num_tokens(local_batch)
@@ -488,6 +546,8 @@ def compute_local_mlp_sync_info(
         local_has_non_greedy_sampling=has_non_greedy_sampling,
         local_needs_top_p_sampling=needs_top_p_sampling,
         welm_mtp_prefill_num_tokens=welm_mtp_prefill_num_tokens,
+        welm_mtp_root_only_num_reqs=welm_mtp_root_only_num_reqs,
+        welm_mtp_root_only_num_tokens=welm_mtp_root_only_num_tokens,
     )
     return mlp_sync_info, tbo_preparer
 
@@ -658,6 +718,7 @@ class SchedulerDPAttnMixin:
             attn_tp_size=self.attn_tp_size,
             attn_cp_size=self.attn_cp_size,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
+            derive_welm_mtp_root_only_from_lifecycle=True,
         )
         mlp_sync_info.fused_intent = intent
         mlp_sync_info.fused_stamp = self.forward_ct

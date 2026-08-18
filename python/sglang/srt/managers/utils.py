@@ -91,6 +91,8 @@ class GenerationBatchResult:
     welm_deferred_prefill_completion: Optional[
         WelmDeferredPrefillCompletion
     ] = None
+    # Request-aligned identity snapshot for asynchronous root-only verify output.
+    welm_mtp_root_only_verify_mask: Optional[torch.Tensor] = None
 
     def __post_init__(self, next_draft_input: Optional["EagleDraftInput"]) -> None:
         if next_draft_input is None:
@@ -159,6 +161,10 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+        if self.welm_mtp_root_only_verify_mask is not None:
+            self.welm_mtp_root_only_verify_mask = (
+                self.welm_mtp_root_only_verify_mask.to("cpu", non_blocking=True)
+            )
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()

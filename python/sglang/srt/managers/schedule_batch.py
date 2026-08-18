@@ -1849,7 +1849,7 @@ class Req(ReqDllmMixin):
         if self._check_str_based_finish():
             return
 
-    def prepare_for_retract(self) -> bool:
+    def prepare_for_retract(self, *, is_spec_v2: bool = False) -> bool:
         """Restore deferred seed state before releasing a decode row.
 
         Returns whether release_kv_cache must reclaim one uncommitted KV tail.
@@ -1863,9 +1863,13 @@ class Req(ReqDllmMixin):
             )
         if state.phase is WelmDeferredDecodePhase.CONSUMED:
             return False
-        if state.phase is not WelmDeferredDecodePhase.INFLIGHT:
+        if state.phase not in (
+            WelmDeferredDecodePhase.READY,
+            WelmDeferredDecodePhase.INFLIGHT,
+        ):
             raise RuntimeError(
-                "WeLM deferred decode retraction requires INFLIGHT or CONSUMED "
+                "WeLM deferred decode retraction requires READY, INFLIGHT, or "
+                "CONSUMED "
                 f"state, got {state.phase.value}"
             )
 
@@ -1874,10 +1878,25 @@ class Req(ReqDllmMixin):
             raise RuntimeError(
                 "WeLM deferred seed cannot be retracted after producing output"
             )
+        if state.phase is WelmDeferredDecodePhase.READY:
+            if (
+                self.kv_committed_len != state.committed_kv_len
+                or self.kv_allocated_len != state.committed_kv_len
+            ):
+                raise RuntimeError(
+                    "WeLM deferred READY seed KV accounting changed before "
+                    "retraction"
+                )
+            return False
+
         expected_allocated_len = state.committed_kv_len + 1
         if (
             self.kv_committed_len != expected_allocated_len
-            or self.kv_allocated_len != expected_allocated_len
+            or (
+                self.kv_allocated_len < expected_allocated_len
+                if is_spec_v2
+                else self.kv_allocated_len != expected_allocated_len
+            )
         ):
             raise RuntimeError(
                 "WeLM deferred seed KV accounting changed before retraction: "
@@ -1888,7 +1907,7 @@ class Req(ReqDllmMixin):
 
         state.rollback_inflight_to_ready()
         self.kv_committed_len = state.committed_kv_len
-        return True
+        return not is_spec_v2
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
@@ -1943,21 +1962,21 @@ class Req(ReqDllmMixin):
             not self.return_logprob or self.input_token_logprobs_val is not None
         )
 
-    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def offload_kv_cache(self, req_to_token_pool, kv_cache_offload_owner):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+        self.kv_cache_cpu = kv_cache_offload_owner.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
 
-    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def load_kv_cache(self, req_to_token_pool, kv_cache_offload_owner):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
-        token_to_kv_pool_allocator.load_cpu_copy(
+        kv_cache_offload_owner.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
         del self.kv_cache_cpu
@@ -2108,6 +2127,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     welm_kv_mirror_contract_flags: Optional[List[bool]] = None
     welm_deferred_prefill_flags: Optional[List[bool]] = None
     welm_mtp_global_prefill_num_tokens: Optional[List[int]] = None
+    welm_mtp_global_root_only_num_reqs: Optional[List[int]] = None
+    welm_mtp_global_root_only_num_tokens: Optional[List[int]] = None
     global_has_non_greedy_sampling: bool = False
     global_needs_top_p_sampling: bool = False
     is_extend_in_batch: bool = False
@@ -2175,6 +2196,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # scheduler installs GenerationBatchResult.draft_continuation_state.draft_input
     # here for the next step; it is not a public generation result or PP output.
     spec_info: Optional[SpecInput] = None
+    # Scheduler-owned CPU rows for MTP continuation; None means no local seed.
+    welm_mtp_root_only_rows: Optional[List[bool]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2981,10 +3004,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_all(self, server_args: ServerArgs):
+    def retract_all(self, server_args: ServerArgs, kv_cache_offload_owner=None):
         retracted_reqs = self.reqs
         for idx in range(len(self.reqs)):
-            self.release_req(idx, len(self.reqs) - idx, server_args)
+            self.release_req(
+                idx,
+                len(self.reqs) - idx,
+                server_args,
+                kv_cache_offload_owner=kv_cache_offload_owner,
+            )
 
         self.filter_batch(retracted_reqs)
         return retracted_reqs
@@ -2993,6 +3021,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         server_args: ServerArgs,
         check_decode_mem: Optional[Callable[[Optional[List[int]]], bool]] = None,
+        kv_cache_offload_owner=None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         check_decode_mem = check_decode_mem or self.check_decode_mem
@@ -3026,7 +3055,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                kv_cache_offload_owner=kv_cache_offload_owner,
+            )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not check_decode_mem(
@@ -3042,7 +3076,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(
+                last_idx,
+                0,
+                server_args,
+                kv_cache_offload_owner=kv_cache_offload_owner,
+            )
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -3063,16 +3102,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        kv_cache_offload_owner=None,
+    ):
         req = self.reqs[idx]
-        allow_uncommitted_tail = req.prepare_for_retract()
+        state = getattr(req, "welm_deferred_decode_state", None)
+        is_unconsumed_deferred_seed = isinstance(
+            state, WelmDeferredDecodeState
+        ) and state.phase in (
+            WelmDeferredDecodePhase.READY,
+            WelmDeferredDecodePhase.INFLIGHT,
+        )
+        is_spec_v2 = self.spec_algorithm is not None and self.is_spec_v2
+        allow_uncommitted_tail = req.prepare_for_retract(is_spec_v2=is_spec_v2)
 
         if self.hisparse_coordinator is not None and not req.finished():
             self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
+            offload_owner = (
+                kv_cache_offload_owner
+                if kv_cache_offload_owner is not None
+                else self.token_to_kv_pool_allocator
+            )
             req.offload_kv_cache(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
+                self.req_to_token_pool,
+                offload_owner,
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if allow_uncommitted_tail:
@@ -3084,7 +3143,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         else:
             release_kv_cache(req, self.tree_cache, is_insert=False)
-        if allow_uncommitted_tail and server_args.disaggregation_mode != "decode":
+        if (
+            is_unconsumed_deferred_seed
+            and server_args.disaggregation_mode != "decode"
+        ):
             req.welm_deferred_decode_state.rollback_ready_to_prefill_pending()
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
@@ -3099,6 +3161,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self._clear_welm_deferred_prefill_metadata()
+        self.welm_mtp_root_only_rows = None
         self._clear_attn_cp_prefill_split_specs(clear_reqs=True)
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -3195,10 +3258,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self._clear_welm_deferred_prefill_metadata()
         bs = len(self.reqs)
         deferred_seed_states = []
+        root_only_rows = None
         deferred_seed_requires_logprob = False
         deferred_penalty_active_mask = []
         has_inactive_deferred_penalty_row = False
-        for req in self.reqs:
+        for index, req in enumerate(self.reqs):
             state = vars(req).get("welm_deferred_decode_state")
             if state is None:
                 deferred_penalty_active_mask.append(True)
@@ -3212,6 +3276,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "WeLM deferred seed entered decode before Prefill completion"
                 )
             is_ready_seed = state.phase is WelmDeferredDecodePhase.READY
+            if is_ready_seed and not self.spec_algorithm.is_none():
+                if root_only_rows is None:
+                    root_only_rows = [False] * bs
+                root_only_rows[index] = True
             penalty_active = state.phase is WelmDeferredDecodePhase.CONSUMED
             deferred_penalty_active_mask.append(penalty_active)
             has_inactive_deferred_penalty_row |= not penalty_active
@@ -3231,6 +3299,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 deferred_seed_states.append(state)
                 deferred_seed_requires_logprob |= req.return_logprob
 
+        self.welm_mtp_root_only_rows = root_only_rows
+
         if deferred_seed_states:
             self.return_logprob |= deferred_seed_requires_logprob
             self.top_logprobs_nums = (
@@ -3244,6 +3314,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else None
             )
 
+        penalty_active_mask = (
+            torch.tensor(
+                deferred_penalty_active_mask,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if self.sampling_info.penalizer_orchestrator.is_required
+            and has_inactive_deferred_penalty_row
+            else None
+        )
+
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3256,23 +3337,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
+            draft_input.prepare_for_decode(
+                self, row_active_mask=penalty_active_mask
+            )
 
         if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
+            for state in deferred_seed_states:
+                state.transition_to(WelmDeferredDecodePhase.INFLIGHT)
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            penalty_active_mask = (
-                torch.tensor(
-                    deferred_penalty_active_mask,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-                if has_inactive_deferred_penalty_row
-                else None
-            )
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = torch.tensor(
@@ -3457,6 +3533,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
+            if draft_input is None:
+                if self.forward_mode.is_extend() and self.welm_deferred_prefill:
+                    return
+                raise RuntimeError("Spec V2 batch is missing draft input")
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
@@ -3540,6 +3620,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests
             self.reqs = []
             self.spec_info = None
+            self.welm_mtp_root_only_rows = None
             self.attn_cp_prefill_split_specs = None
             return
 
@@ -3559,6 +3640,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.welm_mtp_root_only_rows is not None:
+            root_only_rows = [
+                self.welm_mtp_root_only_rows[i] for i in keep_indices
+            ]
+            self.welm_mtp_root_only_rows = (
+                root_only_rows if any(root_only_rows) else None
+            )
         self._refresh_attn_cp_prefill_split_specs()
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
@@ -3663,6 +3751,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        if (
+            self.welm_mtp_root_only_rows is not None
+            or other.welm_mtp_root_only_rows is not None
+        ):
+            if (
+                self.welm_mtp_root_only_rows is not None
+                and len(self.welm_mtp_root_only_rows) != len(self.reqs)
+            ) or (
+                other.welm_mtp_root_only_rows is not None
+                and len(other.welm_mtp_root_only_rows) != len(other.reqs)
+            ):
+                raise RuntimeError(
+                    "WeLM MTP root-only CPU rows are not request-aligned."
+                )
+            self.welm_mtp_root_only_rows = (
+                self.welm_mtp_root_only_rows or [False] * len(self.reqs)
+            ) + (other.welm_mtp_root_only_rows or [False] * len(other.reqs))
         self.reqs.extend(other.reqs)
         self._refresh_attn_cp_prefill_split_specs()
         if self.multimodal_inputs is not None:
@@ -3735,6 +3840,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             welm_mtp_global_prefill_num_tokens=(
                 self.welm_mtp_global_prefill_num_tokens
             ),
+            welm_mtp_global_root_only_num_reqs=(
+                self.welm_mtp_global_root_only_num_reqs
+            ),
+            welm_mtp_global_root_only_num_tokens=(
+                self.welm_mtp_global_root_only_num_tokens
+            ),
             global_has_non_greedy_sampling=self.global_has_non_greedy_sampling,
             global_needs_top_p_sampling=self.global_needs_top_p_sampling,
             is_extend_in_batch=self.is_extend_in_batch,
@@ -3797,6 +3908,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             forward_iter=self.forward_iter,
             welm_deferred_prefill=self.welm_deferred_prefill,
+            welm_mtp_root_only_rows=self.welm_mtp_root_only_rows,
         )
 
     def _get_welm_kv_mirror_last_q_indices(
@@ -4013,6 +4125,8 @@ class ModelWorkerBatch:
     welm_kv_mirror_contract_flags: Optional[List[bool]]
     welm_deferred_prefill_flags: Optional[List[bool]]
     welm_mtp_global_prefill_num_tokens: Optional[List[int]]
+    welm_mtp_global_root_only_num_reqs: Optional[List[int]]
+    welm_mtp_global_root_only_num_tokens: Optional[List[int]]
     global_has_non_greedy_sampling: bool
     global_needs_top_p_sampling: bool
     is_extend_in_batch: bool
@@ -4052,6 +4166,7 @@ class ModelWorkerBatch:
 
     # Uniform model-execution marker; request-aligned finality stays in scheduler.
     welm_deferred_prefill: bool = False
+    welm_mtp_root_only_rows: Optional[List[bool]] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None

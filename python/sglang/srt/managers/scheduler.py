@@ -211,7 +211,11 @@ from sglang.srt.mem_cache.cp_sharded_capacity import (
     ensure_cp_sharded_kv_capacity,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    PPProxyTensors,
+    is_welm_deferred_dp_idle_peer,
+)
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.models.welm_deferred_mirror import (
     is_welm_deferred_mirror_enabled,
@@ -236,8 +240,14 @@ from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import (
-    make_welmv4_mtp_kv_mirror_state_buffers,
+from sglang.srt.speculative.spec_utils import uses_welmv4_nextn_draft
+from sglang.srt.speculative.welmv4_mtp_kv import (
+    allocate_welmv4_mtp_kv_mirror_state_buffers,
+    build_welmv4_mtp_kv_mirror_buffer_spec,
+    get_welmv4_mtp_kv_mirror_max_rows,
+    is_welmv4_mtp_pd,
+    is_welmv4_mtp_target_config,
+    should_use_welm_mtp_legacy_mirror_state,
 )
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -521,6 +531,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.init_welm_mtp_legacy_mirror_state_mode()
         self.install_device_timer_on_runners()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
@@ -882,6 +893,18 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def init_welm_mtp_legacy_mirror_state_mode(self) -> None:
+        enabled = should_use_welm_mtp_legacy_mirror_state(
+            self.server_args, self.model_config
+        )
+        if enabled and getattr(
+            self.draft_worker, "welm_mtp_direct_kv_enabled", False
+        ):
+            raise RuntimeError(
+                "WeLM MTP legacy mirror state and direct K/V are mutually exclusive"
+            )
+        self._welm_mtp_legacy_mirror_state_enabled = enabled
+
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
         uses_transformers_backend = (
@@ -1104,7 +1127,7 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _get_draft_kv_pool(self):
+    def _get_execution_draft_kv_pool(self):
         """Return (draft_token_to_kv_pool, draft_model_config) for the current
         draft worker, or (None, None) when no draft KV pool is available."""
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
@@ -1114,19 +1137,66 @@ class Scheduler(
         if draft_runner is not None:
             return draft_runner.token_to_kv_pool, draft_runner.model_config
 
-        return (
-            self.draft_worker.model_runner.token_to_kv_pool,
-            self.draft_worker.model_config,
-        )
+        legacy_runner = getattr(self.draft_worker, "model_runner", None)
+        if legacy_runner is None:
+            return None, None
+        return legacy_runner.token_to_kv_pool, self.draft_worker.model_config
+
+    def _get_disaggregation_draft_kv_pool(self):
+        draft_kv_pool, draft_model_config = self._get_execution_draft_kv_pool()
+        if is_welmv4_mtp_pd(self.server_args, self.model_config):
+            if self._welm_mtp_legacy_mirror_state_enabled:
+                return None, draft_model_config
+            if self.server_args.disaggregation_mode == "prefill":
+                draft_kv_pool = getattr(
+                    self.draft_worker, "welm_mtp_storage_draft_kv_pool", None
+                )
+                draft_model_config = getattr(
+                    self.tp_worker.model_runner,
+                    "welm_mtp_storage_draft_model_config",
+                    None,
+                )
+            if draft_kv_pool is None or draft_model_config is None:
+                raise RuntimeError(
+                    "WeLM MTP direct K/V requires a Draft KV pool on both P/D roles"
+                )
+        return draft_kv_pool, draft_model_config
+
+    def _get_draft_kv_pool(self):
+        return self._get_execution_draft_kv_pool()
+
+    def _get_decode_kv_cache_offload_owner(self):
+        if (
+            is_welmv4_mtp_pd(self.server_args, self.model_config)
+            and self.server_args.disaggregation_mode == "decode"
+            and not self._welm_mtp_legacy_mirror_state_enabled
+        ):
+            owner = self.draft_worker
+            if owner is None or not all(
+                callable(getattr(owner, name, None))
+                for name in ("get_cpu_copy", "load_cpu_copy")
+            ):
+                raise RuntimeError(
+                    "WeLM MTP direct decode is missing its paired KV owner"
+                )
+            return owner
+        return self.token_to_kv_pool_allocator
 
     def _get_draft_model_runner(self):
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None
 
         if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+            inner_draft_worker = getattr(self.draft_worker, "draft_worker", None)
+            if inner_draft_worker is None:
+                if getattr(
+                    self.draft_worker, "_is_welm_mtp_lightweight_prefill", False
+                ):
+                    return None
+                raise RuntimeError("Spec-v2 worker is missing its Draft worker")
             if self.server_args.enable_multi_layer_eagle:
-                return self.draft_worker.draft_worker.draft_runner_list[0]
-            return self.draft_worker.draft_worker.draft_runner
+                return inner_draft_worker.draft_runner_list[0]
+            return inner_draft_worker.draft_runner
 
         return getattr(self.draft_worker, "model_runner", None)
 
@@ -1134,18 +1204,56 @@ class Scheduler(
         self.welm_mtp_kv_mirror_state_buffers = None
         if not self.server_args.enable_welm_kv_mirror_opt:
             return
-        if self.disaggregation_mode is DisaggregationMode.NULL:
+        if not self._welm_mtp_legacy_mirror_state_enabled:
+            return
+        if (
+            self.disaggregation_mode is not DisaggregationMode.DECODE
+            and not is_welmv4_mtp_target_config(self.model_config)
+        ):
             return
 
         draft_runner = self._get_draft_model_runner()
-        if draft_runner is None:
-            return
+        lightweight_prefill = bool(
+            getattr(
+                getattr(self, "draft_worker", None),
+                "_is_welm_mtp_lightweight_prefill",
+                False,
+            )
+        )
+        if draft_runner is not None:
+            if not uses_welmv4_nextn_draft(draft_runner):
+                return
+            model_config = draft_runner.model_config
+            attention_tp_size = draft_runner.tp_size
+            dtype = model_config.dtype
+            device = draft_runner.device
+        else:
+            if not lightweight_prefill or not is_welmv4_mtp_target_config(
+                self.model_config
+            ):
+                return
+            model_config = self.model_config
+            attention_tp_size = self.attn_tp_group.world_size
+            dtype = model_config.dtype
+            device = self.device
 
-        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        max_rows = token_to_kv_pool.size + getattr(token_to_kv_pool, "page_size", 1)
-        buffers = make_welmv4_mtp_kv_mirror_state_buffers(draft_runner, max_rows)
+        spec = build_welmv4_mtp_kv_mirror_buffer_spec(
+            model_config=model_config,
+            attention_tp_size=attention_tp_size,
+            dtype=dtype,
+            device=device,
+        )
+        max_rows = get_welmv4_mtp_kv_mirror_max_rows(
+            self.token_to_kv_pool_allocator
+        )
+        buffers = allocate_welmv4_mtp_kv_mirror_state_buffers(
+            spec, max_rows=max_rows
+        )
         self.welm_mtp_kv_mirror_state_buffers = buffers or None
 
+        self.draft_worker.welm_mtp_kv_mirror_state_buffers = (
+            self.welm_mtp_kv_mirror_state_buffers
+        )
         inner_draft_worker = getattr(self.draft_worker, "draft_worker", None)
         if inner_draft_worker is not None:
             inner_draft_worker.welm_mtp_kv_mirror_state_buffers = (
@@ -1153,7 +1261,7 @@ class Scheduler(
             )
 
         logger.info(
-            "WeLM MTP mirror state buffers for PD: %s",
+            "WeLM MTP mirror state buffers: %s",
             (
                 sorted(self.welm_mtp_kv_mirror_state_buffers)
                 if self.welm_mtp_kv_mirror_state_buffers
@@ -1370,8 +1478,8 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        _, model_config = self._get_execution_draft_kv_pool()
+        draft_token_to_kv_pool, _ = self._get_disaggregation_draft_kv_pool()
         self._init_welm_mtp_kv_mirror_state_buffers()
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
@@ -2818,12 +2926,9 @@ class Scheduler(
         )
         if (
             session_id is not None
-            and self.disaggregation_mode is DisaggregationMode.NULL
             and is_welm_deferred_mirror_enabled(self.server_args)
         ):
-            error_msg = (
-                "WeLM deferred monolithic mode does not support session continuation"
-            )
+            error_msg = "WeLM deferred mirror mode does not support session continuation"
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -3099,7 +3204,10 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if is_welm_deferred_mirror_enabled(self.server_args):
                 try:
-                    span = prepare_welm_deferred_prefill_span(req)
+                    span = prepare_welm_deferred_prefill_span(
+                        req,
+                        require_mtp_prompt=not self.spec_algorithm.is_none(),
+                    )
                 except ValueError as exc:
                     message = str(exc)
                     logger.error(message)
@@ -3443,6 +3551,12 @@ class Scheduler(
 
             # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
+                if (
+                    self.disaggregation_mode is DisaggregationMode.NULL
+                    and self.last_batch.welm_deferred_prefill
+                    and not self.spec_algorithm.is_none()
+                ):
+                    self._prepare_welm_deferred_seed_batch(self.last_batch)
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -3608,8 +3722,54 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
         )
-        new_batch.prepare_for_welm_deferred_seed_decode()
+        self._prepare_welm_deferred_seed_batch(new_batch)
         return new_batch
+
+    def _prepare_welm_deferred_seed_batch(self, batch: ScheduleBatch) -> None:
+        batch.prepare_for_welm_deferred_seed_decode()
+        if self.spec_algorithm.is_none():
+            return
+
+        topk = int(self.server_args.speculative_eagle_topk or 0)
+        proposal_width = int(self.server_args.speculative_num_steps or 0)
+        if topk != 1 or proposal_width <= 1:
+            raise RuntimeError(
+                "WeLM deferred MTP seed admission requires topk=1 linear MTP."
+            )
+
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        batch_size = batch.batch_size()
+        root_input = EagleDraftInput(
+            topk_p=torch.ones(
+                (batch_size, proposal_width),
+                dtype=torch.float32,
+                device=batch.device,
+            ),
+            topk_index=batch.output_ids.view(-1, 1)
+            .expand(-1, proposal_width)
+            .contiguous(),
+            hidden_states=torch.empty(
+                (batch_size, self.model_config.spec_hidden_size),
+                dtype=self.model_config.dtype,
+                device=batch.device,
+            ),
+            bonus_tokens=batch.output_ids,
+            new_seq_lens=batch.seq_lens,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+            welm_mtp_root_only_verify_mask=torch.ones(
+                (batch_size,), dtype=torch.bool, device=batch.device
+            ),
+        )
+        if self.enable_overlap:
+            future_indices = self.future_map.alloc_future_indices(
+                batch_size, batch.req_pool_indices
+            )
+            root_input.future_indices = future_indices
+            self.future_map.store_to_map_for_new_batch(future_indices, root_input)
+        batch.spec_info = root_input
+        batch.welm_mtp_root_only_rows = [True] * batch_size
 
     def _admit_new_welm_deferred_seed_batch(self) -> None:
         deferred_seed_batch = self.get_new_welm_deferred_seed_batch()
@@ -3632,6 +3792,14 @@ class Scheduler(
         ):
             raise RuntimeError(
                 "zero-forward deferred Prefill completion has invalid topology"
+            )
+        if (
+            getattr(self, "spec_algorithm", None) is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            raise RuntimeError(
+                "WeLM deferred MTP requires a final Prefill forward before seed "
+                "admission."
             )
 
         for req in reqs:
@@ -3771,6 +3939,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             next_attn_cp_owner_rotation=self.next_attn_cp_owner_rotation,
+            kv_cache_offload_owner=(
+                self._get_decode_kv_cache_offload_owner()
+                if self.enable_priority_preemption
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                else None
+            ),
         )
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -4153,7 +4327,9 @@ class Scheduler(
                 mamba_pool.available_size() if mamba_pool is not None else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, check_decode_mem=check_decode_mem
+                self.server_args,
+                check_decode_mem=check_decode_mem,
+                kv_cache_offload_owner=self._get_decode_kv_cache_offload_owner(),
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_retract_mem_snapshot = self._retract_mem_snapshot()
@@ -4310,13 +4486,25 @@ class Scheduler(
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
                 bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(
-                    bs, model_worker_batch.req_pool_indices
+                is_deferred_spec_prefill = (
+                    batch.is_spec_v2
+                    and (
+                        batch.welm_deferred_prefill
+                        or is_welm_deferred_dp_idle_peer(batch)
+                    )
+                )
+                future_indices = (
+                    None
+                    if is_deferred_spec_prefill
+                    else self.future_map.alloc_future_indices(
+                        bs, model_worker_batch.req_pool_indices
+                    )
                 )
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    if not is_deferred_spec_prefill:
+                        self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                         # here pp is not compatible with overlap
@@ -4325,21 +4513,30 @@ class Scheduler(
                         self._prepare_welm_deferred_prefill_result_for_decode(
                             batch, batch_result
                         )
+                    elif is_deferred_spec_prefill:
+                        raise RuntimeError(
+                            "WeLM deferred MTP Prefill requires a typed completion"
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
+                        if not is_deferred_spec_prefill:
+                            self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(
                             return_logprob=batch.return_logprob,
                             return_hidden_states=batch.return_hidden_states,
                         )
                     else:
+                        assert future_indices is not None
                         batch_result.future_indices = future_indices
 
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                if is_deferred_spec_prefill:
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                else:
+                    # FIXME(lsyin): move this assignment elsewhere
+                    future_indices_or_next_token_ids = -future_indices.indices
 
-                if batch.is_spec_v2:
+                if batch.is_spec_v2 and not is_deferred_spec_prefill:
                     # Spec-v2 keeps draft continuation state local to the
                     # scheduler/draft worker path. It is not part of the public
                     # generation result.
@@ -5001,7 +5198,10 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                retracted_reqs = self.running_batch.retract_all(
+                    self.server_args,
+                    kv_cache_offload_owner=self._get_decode_kv_cache_offload_owner(),
+                )
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 

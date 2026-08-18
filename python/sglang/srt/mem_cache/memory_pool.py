@@ -874,6 +874,10 @@ class MHATokenToKVPool(KVCache):
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
+        if self.layer_num == 0:
+            self._kv_copy_config = None
+            return
+
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
@@ -1110,6 +1114,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.layer_num == 0:
+            return
+
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return

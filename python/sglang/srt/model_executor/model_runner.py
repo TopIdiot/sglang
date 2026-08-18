@@ -166,6 +166,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_deferred_mirror import (
+    WELM_MTP_STORAGE_DRAFT_KV_ATTR,
     WelmDeferredExecutionRole,
     WelmPDExecutionMode,
     bind_welm_deferred_model_execution,
@@ -527,6 +528,58 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable_show_time_cost()
 
         self._init_welm_deferred_mirror_plan()
+        from sglang.srt.speculative.welmv4_mtp_kv import (
+            should_use_welm_mtp_direct_kv,
+            should_use_welm_mtp_storage_draft_kv,
+        )
+
+        self.welm_mtp_storage_draft_model_config = None
+        use_welm_mtp_storage_draft_kv = (
+            not self.is_draft_worker
+            and should_use_welm_mtp_storage_draft_kv(server_args, self.model_config)
+        )
+        setattr(
+            self.model_config.hf_config,
+            WELM_MTP_STORAGE_DRAFT_KV_ATTR,
+            use_welm_mtp_storage_draft_kv,
+        )
+        if self.model_config.hf_text_config is not self.model_config.hf_config:
+            setattr(
+                self.model_config.hf_text_config,
+                WELM_MTP_STORAGE_DRAFT_KV_ATTR,
+                use_welm_mtp_storage_draft_kv,
+            )
+        if use_welm_mtp_storage_draft_kv:
+            self.welm_mtp_storage_draft_model_config = self._build_model_config(
+                server_args,
+                model_path=(
+                    server_args.speculative_draft_model_path
+                    or server_args.model_path
+                ),
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            draft_archs = (
+                getattr(
+                    self.welm_mtp_storage_draft_model_config.hf_config,
+                    "architectures",
+                    None,
+                )
+                or []
+            )
+            if draft_archs[:1] != ["WeLMV4MoeForCausalLMNextN"]:
+                raise RuntimeError(
+                    "WeLM storage-only Draft pool requires a "
+                    "WeLMV4MoeForCausalLMNextN config"
+                )
+
+        self._welm_mtp_direct_kv_graph_pending = (
+            not self.is_draft_worker
+            and (
+                should_use_welm_mtp_direct_kv(server_args, self.model_config)
+                or use_welm_mtp_storage_draft_kv
+            )
+        )
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -632,6 +685,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _init_welm_deferred_mirror_plan(self) -> None:
         self.welm_deferred_mirror_plan = None
+        if self.is_draft_worker:
+            return
+
         raw_mode = getattr(self.server_args, "welm_kv_mirror_pd_mode", "legacy")
         if raw_mode == WelmPDExecutionMode.LEGACY.value:
             return
@@ -657,12 +713,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model_config.hf_config,
             plan,
             role=role,
+            capture_nextn=self.spec_algorithm.is_eagle(),
         )
         if self.model_config.hf_text_config is not self.model_config.hf_config:
             bind_welm_deferred_model_execution(
                 self.model_config.hf_text_config,
                 plan,
                 role=role,
+                capture_nextn=self.spec_algorithm.is_eagle(),
             )
 
         if self.tp_rank == 0 and self.pp_rank == 0:
@@ -894,10 +952,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_device_graphs()
+            self._maybe_init_device_graphs()
         elif self.device == "cpu":
             self.init_attention_backend()
-            self.init_device_graphs()
+            self._maybe_init_device_graphs()
         elif self.device == "npu":
             self.init_attention_backend()
             # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
@@ -911,11 +969,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-            self.init_device_graphs()
+            self._maybe_init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
             if current_platform.support_cuda_graph():
-                self.init_device_graphs()
+                self._maybe_init_device_graphs()
             else:
                 self.graph_runner = None
                 self.graph_mem_usage = 0
@@ -928,9 +986,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             register_forward_hooks(self.model, server_args.forward_hooks)
 
         # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        if not self._welm_mtp_direct_kv_graph_pending:
+            self.init_piecewise_cuda_graphs()
 
-        self.prealloc_symmetric_memory_pool()
+        if not self._welm_mtp_direct_kv_graph_pending:
+            self.prealloc_symmetric_memory_pool()
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -3388,6 +3448,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_lens=torch.ones_like(ngram_embedding_info.out_column_starts),
             ignore_tokens=None,
         )
+
+    def _maybe_init_device_graphs(self) -> None:
+        if self._welm_mtp_direct_kv_graph_pending:
+            self.graph_runner = None
+            self.graph_mem_usage = 0
+            return
+        self.init_device_graphs()
+
+    def init_welm_mtp_direct_kv_graphs(self) -> None:
+        if not self._welm_mtp_direct_kv_graph_pending:
+            raise RuntimeError(
+                "WeLM MTP direct K/V Target graph capture is not pending"
+            )
+        self._welm_mtp_direct_kv_graph_pending = False
+        self.init_device_graphs()
+        self.init_piecewise_cuda_graphs()
+        self.prealloc_symmetric_memory_pool()
 
     def init_device_graphs(self):
         """Capture device graphs."""

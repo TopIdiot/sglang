@@ -903,6 +903,63 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+    def create_storage_only_kv_pool(self: ModelRunner, model_config):
+        """Create a Draft KV pool that shares the Target slot namespace."""
+        if getattr(model_config, "attention_arch", None) is not None and getattr(
+            model_config.attention_arch, "name", "MHA"
+        ) != "MHA":
+            raise RuntimeError("WeLM storage-only Draft pool requires MHA attention")
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            raise RuntimeError("WeLM storage-only Draft pool does not support FP4 KV")
+        common_kwargs = dict(
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=model_config.head_dim,
+            v_head_dim=model_config.v_head_dim,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=True,
+        )
+        if model_config.is_hybrid_swa:
+            swa_kwargs = {}
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                swa_kwargs = {
+                    "swa_head_num": model_config.get_swa_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    "swa_head_dim": model_config.swa_head_dim,
+                    "swa_v_head_dim": model_config.swa_v_head_dim,
+                }
+            pool = SWAKVPool(
+                size=self.full_max_total_num_tokens,
+                size_swa=self.swa_max_total_num_tokens,
+                swa_attention_layer_ids=model_config.swa_attention_layer_ids,
+                full_attention_layer_ids=model_config.full_attention_layer_ids,
+                enable_kvcache_transpose=False,
+                **common_kwargs,
+                **swa_kwargs,
+            )
+            allocator = unwrap_cp_sharded_allocator(
+                self.token_to_kv_pool_allocator
+            )
+            mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+            if mapping is None:
+                raise RuntimeError(
+                    "WeLM storage-only Draft SWA pool requires the Target mapping"
+                )
+            pool.register_mapping(mapping)
+            return pool
+
+        return MHATokenToKVPool(
+            self.max_total_num_tokens,
+            layer_num=len(model_config.full_attention_layer_ids),
+            start_layer=0,
+            end_layer=len(model_config.full_attention_layer_ids),
+            **common_kwargs,
+        )
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 

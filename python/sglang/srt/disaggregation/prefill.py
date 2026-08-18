@@ -307,7 +307,11 @@ class PrefillBootstrapQueue:
             return True
 
         try:
-            prepare_welm_deferred_prefill_span(req)
+            spec_algorithm = self.scheduler.spec_algorithm
+            prepare_welm_deferred_prefill_span(
+                req,
+                require_mtp_prompt=not spec_algorithm.is_none(),
+            )
         except ValueError as exc:
             message = str(exc)
             logger.error(message)
@@ -708,6 +712,10 @@ class SchedulerDisaggregationPrefillMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ) -> None:
+        if result.welm_deferred_prefill_completion.model_specific_states is not None:
+            raise RuntimeError(
+                "WeLM deferred Prefill completion has an unconsumed mirror payload"
+            )
         if result.logits_output is not None:
             raise RuntimeError(
                 "WeLM deferred Prefill completion must not carry logits"

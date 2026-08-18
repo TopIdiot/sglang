@@ -324,6 +324,22 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([1], keep)
         self.assertIsNone(info.sampling_seed)
 
+    def test_filter_forward_copy_without_penalizer(self):
+        info = _make_info(batch_size=3, penalizer_orchestrator=None)
+        info.acc_additive_penalties = torch.arange(
+            3 * VOCAB_SIZE, dtype=torch.float32
+        ).reshape(3, VOCAB_SIZE)
+        info.acc_scaling_penalties = info.acc_additive_penalties + 100
+        keep = torch.tensor([0, 2])
+
+        info.filter_batch([0, 2], keep)
+
+        self.assertEqual(info.acc_additive_penalties.shape, (2, VOCAB_SIZE))
+        self.assertEqual(info.acc_additive_penalties[1, 0].item(), 2 * VOCAB_SIZE)
+        self.assertEqual(
+            info.acc_scaling_penalties[1, 0].item(), 100 + 2 * VOCAB_SIZE
+        )
+
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):

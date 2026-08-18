@@ -65,7 +65,8 @@ class SchedulerUpdateWeightsMixin:
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         tp_success = success
-        if success and self.draft_worker is not None:
+        draft_runner = self._get_draft_model_runner()
+        if success and draft_runner is not None:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
@@ -129,7 +130,8 @@ class SchedulerUpdateWeightsMixin:
             return UpdateWeightsFromDistributedReqOutput(success, message)
 
         # Load the same received tensors into the draft model in-process.
-        if self.draft_worker is not None and received:
+        draft_runner = self._get_draft_model_runner()
+        if draft_runner is not None and received:
             success, message = self.draft_worker.load_weights_from_distributed(received)
             if not success:
                 logger.error(message)
@@ -142,10 +144,11 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        if recv_req.disable_draft_model:
+        draft_runner = self._get_draft_model_runner()
+        if recv_req.disable_draft_model or draft_runner is None:
             worker = self.tp_worker
         else:
-            worker = self.draft_worker or self.tp_worker
+            worker = self.draft_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
@@ -160,7 +163,8 @@ class SchedulerUpdateWeightsMixin:
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         tp_success = success
-        if success and self.draft_worker is not None:
+        draft_runner = self._get_draft_model_runner()
+        if success and draft_runner is not None:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
@@ -418,12 +422,13 @@ class SchedulerUpdateWeightsMixin:
 
         self.tp_worker.model_runner.save_remote_model(url)
 
-        if self.draft_worker is not None:
+        draft_runner = self._get_draft_model_runner()
+        if draft_runner is not None:
             draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
-            self.draft_worker.model_runner.save_remote_model(draft_url)
+            draft_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self: Scheduler, params):
         self.tp_worker.model_runner.save_sharded_model(

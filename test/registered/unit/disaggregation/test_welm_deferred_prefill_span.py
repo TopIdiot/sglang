@@ -56,6 +56,7 @@ def _make_req(token_ids, *, deferred: bool) -> Req:
     req.positional_embed_overrides = None
     req.extra_key = None
     req.is_retracted = False
+    req.retracted_stain = False
     req.multimodal_inputs = None
     req._scale_seq_factor = 1
     req.welm_deferred_prefill_span = (
@@ -133,6 +134,9 @@ def test_consumed_deferred_request_restores_ordinary_reprefill_tokens():
 def test_bootstrap_prepares_deferred_span_before_capacity_check():
     queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
     queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
+    queue.scheduler = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_none=lambda: True)
+    )
     queue.max_total_num_tokens = 3
     req = _make_req([11, 22, 33, 44], deferred=False)
 
@@ -141,6 +145,39 @@ def test_bootstrap_prepares_deferred_span_before_capacity_check():
     assert req.welm_deferred_prefill_span.committed_kv_len == 3
     assert vars(req).get("welm_deferred_decode_state") is None
     assert queue._check_if_req_exceed_kv_capacity(req) is False
+
+
+def test_bootstrap_rejects_single_token_deferred_mtp_prompt(monkeypatch):
+    queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+    queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
+    queue.scheduler = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        stream_output=MagicMock(),
+    )
+    req = _make_req([77], deferred=False)
+    req.time_stats = SimpleNamespace(
+        trace_ctx=SimpleNamespace(abort=MagicMock())
+    )
+    prepare_abort = MagicMock()
+    monkeypatch.setattr(prefill_module, "prepare_abort", prepare_abort)
+
+    assert queue._prepare_deferred_req(req) is False
+
+    prepare_abort.assert_called_once()
+    assert "at least two prompt tokens" in prepare_abort.call_args.args[1]
+    queue.scheduler.stream_output.assert_called_once_with([req], req.return_logprob)
+
+
+def test_bootstrap_allows_single_token_deferred_without_mtp():
+    queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+    queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
+    queue.scheduler = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_none=lambda: True)
+    )
+    req = _make_req([77], deferred=False)
+
+    assert queue._prepare_deferred_req(req)
+    assert req.welm_deferred_prefill_span.committed_kv_len == 0
 
 
 def test_topology_neutral_span_preparation_rejects_changed_prompt():
@@ -221,7 +258,10 @@ def test_deferred_prefill_rejects_unsupported_request_payloads(
 ):
     queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
     queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
-    queue.scheduler = SimpleNamespace(stream_output=MagicMock())
+    queue.scheduler = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        stream_output=MagicMock(),
+    )
     req = _make_req([11, 22, 33, 44], deferred=False)
     req.time_stats = SimpleNamespace(
         trace_ctx=SimpleNamespace(abort=MagicMock())
@@ -242,7 +282,10 @@ def test_deferred_prefill_rejects_unsupported_request_payloads(
 def test_deferred_rejection_stops_before_sender_or_capacity_work(monkeypatch):
     queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
     queue.kv_manager = SimpleNamespace(welm_deferred_mirror_capability=object())
-    queue.scheduler = SimpleNamespace(stream_output=MagicMock())
+    queue.scheduler = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        stream_output=MagicMock(),
+    )
     queue._check_if_req_exceed_kv_capacity = MagicMock()
     queue._process_req = MagicMock()
     queue.queue = []

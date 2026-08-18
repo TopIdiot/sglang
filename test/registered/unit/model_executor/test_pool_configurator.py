@@ -55,6 +55,7 @@ def _make_model_runner(
     mr.end_layer = num_layers
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
+    mr.welm_mtp_storage_draft_model_config = None
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
@@ -165,6 +166,27 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_storage_only_full_draft_is_included_in_capacity(self):
+        mr = _make_model_runner(
+            num_kv_heads=1, head_dim=1, v_head_dim=1, num_layers=2
+        )
+        mr.welm_mtp_storage_draft_model_config = SimpleNamespace(
+            is_hybrid_swa=False,
+            full_attention_layer_ids=[0],
+            get_num_kv_heads=lambda tp_size: 1,
+            head_dim=1,
+            v_head_dim=1,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            config = DefaultPoolConfigurator(mr).calculate_pool_sizes(1200, 1)
+
+        # Target costs 2 layers * 4 bytes; Draft adds 1 layer * 4 bytes.
+        self.assertEqual(config.max_total_num_tokens, 100)
+
 
 class TestHybridSWAConfigurator(unittest.TestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
@@ -255,6 +277,43 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             config.swa_max_total_num_tokens,
             int(config.full_max_total_num_tokens * 0.5),
         )
+
+    def test_storage_only_draft_swa_is_included_in_capacity(self):
+        mr = self._make_swa_runner(
+            full_layers=2,
+            swa_layers=2,
+            ratio=0.5,
+            page_size=1,
+        )
+        draft = SimpleNamespace(
+            full_attention_layer_ids=[],
+            swa_attention_layer_ids=[0],
+            swa_head_dim=1,
+            swa_v_head_dim=1,
+            get_swa_num_kv_heads=lambda tp_size: 1,
+        )
+        mr.model_config.head_dim = 1
+        mr.model_config.v_head_dim = 1
+        mr.model_config.swa_head_dim = 1
+        mr.model_config.swa_v_head_dim = 1
+        mr.model_config.get_num_kv_heads = lambda tp_size: 1
+        mr.model_config.get_swa_num_kv_heads = lambda tp_size: 1
+        mr.welm_mtp_storage_draft_model_config = draft
+
+        # bf16 cost per K/V layer is 4 bytes/token. Target costs
+        # 2*4 + 0.5*2*4 = 12; the Draft SWA layer adds 0.5*4 = 2.
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            config = HybridSWAPoolConfigurator(mr).calculate_pool_sizes(
+                available_bytes=1400,
+                page_size=1,
+            )
+
+        self.assertEqual(config.full_max_total_num_tokens, 100)
+        self.assertEqual(config.swa_max_total_num_tokens, 50)
 
 
 class TestAllSWAConfigurator(unittest.TestCase):

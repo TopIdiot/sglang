@@ -998,16 +998,28 @@ class SchedulerMetricsMixin:
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
-            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
-            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.server_args.speculative_num_draft_tokens:
-                draft_per_round = self.server_args.speculative_num_draft_tokens - 1
+            if self.spec_num_forward_ct == 0:
+                spec_accept_length = 0
+                spec_accept_rate = 0
             else:
-                draft_per_round = self.server_args.speculative_num_steps or 0
-            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
-            spec_accept_rate = (
-                num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
-            )
+                spec_accept_length = (
+                    self.spec_num_accept_tokens / self.spec_num_forward_ct
+                )
+                num_correct_drafts = (
+                    self.spec_num_accept_tokens - self.spec_num_forward_ct
+                )
+                if self.server_args.speculative_num_draft_tokens:
+                    draft_per_round = (
+                        self.server_args.speculative_num_draft_tokens - 1
+                    )
+                else:
+                    draft_per_round = self.server_args.speculative_num_steps or 0
+                total_draft_tokens = self.spec_num_forward_ct * draft_per_round
+                spec_accept_rate = (
+                    num_correct_drafts / total_draft_tokens
+                    if total_draft_tokens > 0
+                    else 0
+                )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0

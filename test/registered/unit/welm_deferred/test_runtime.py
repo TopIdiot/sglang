@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -55,6 +56,39 @@ def _mock_warmup_http(monkeypatch, post):
     )
     monkeypatch.setattr(http_server.requests, "post", post)
     return tokenizer_manager
+
+
+def test_health_generate_uses_two_tokens_only_for_deferred(monkeypatch):
+    async def run(mode):
+        captured = []
+
+        async def generate_request(req, _raw_request):
+            captured.append(req)
+            yield None
+
+        tokenizer_manager = SimpleNamespace(
+            gracefully_exit=False,
+            server_status=ServerStatus.Up,
+            is_generation=True,
+            server_args=_server_args(welm_kv_mirror_pd_mode=mode),
+            generate_request=generate_request,
+            last_receive_tstamp=float("inf"),
+            rid_to_state={},
+        )
+        monkeypatch.setattr(
+            http_server,
+            "_global_state",
+            SimpleNamespace(tokenizer_manager=tokenizer_manager),
+        )
+        response = await http_server.health_generate(
+            SimpleNamespace(url=SimpleNamespace(path="/health_generate"))
+        )
+        assert response.status_code == 200
+        assert len(captured) == 1
+        return captured[0].input_ids
+
+    assert asyncio.run(run("legacy")) == [0]
+    assert asyncio.run(run("deferred-last-prompt")) == [0, 0]
 
 
 def test_monolithic_deferred_server_warmup_runs_16k_request_and_flushes_cache(

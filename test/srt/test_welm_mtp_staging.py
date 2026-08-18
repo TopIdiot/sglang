@@ -355,6 +355,57 @@ def test_build_welm_mtp_linear_verify_inputs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_build_welm_mtp_linear_verify_inputs_masks_root_only_rows():
+    bonus = torch.tensor([10, 20], device="cuda", dtype=torch.int32)
+    proposal = torch.tensor(
+        [[11, 12, 13], [91, 92, 93]], device="cuda", dtype=torch.int64
+    )
+    root_only = torch.tensor([False, True], device="cuda", dtype=torch.bool)
+    seq_lens = torch.tensor([100, 200], device="cuda", dtype=torch.int32)
+    tokens = torch.empty(8, device="cuda", dtype=torch.int64)
+    positions = torch.empty(8, device="cuda", dtype=torch.int64)
+
+    build_welm_mtp_linear_verify_inputs(
+        bonus_tokens=bonus,
+        proposal_tokens=proposal,
+        root_only_verify_mask=root_only,
+        seq_lens=seq_lens,
+        output_tokens=tokens,
+        output_positions=positions,
+        batch_size=2,
+        tokens_per_bs=4,
+    )
+    torch.cuda.synchronize()
+
+    assert tokens.cpu().tolist() == [10, 11, 12, 13, 20, 0, 0, 0]
+    assert positions.cpu().tolist() == [100, 101, 102, 103, 200, 201, 202, 203]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_build_welm_mtp_linear_verify_inputs_without_seed_proposals():
+    bonus = torch.tensor([20, 30], device="cuda", dtype=torch.int32)
+    root_only = torch.tensor([True, True], device="cuda", dtype=torch.bool)
+    seq_lens = torch.tensor([200, 300], device="cuda", dtype=torch.int32)
+    tokens = torch.empty(8, device="cuda", dtype=torch.int64)
+    positions = torch.empty(8, device="cuda", dtype=torch.int64)
+
+    build_welm_mtp_linear_verify_inputs(
+        bonus_tokens=bonus,
+        proposal_tokens=None,
+        root_only_verify_mask=root_only,
+        seq_lens=seq_lens,
+        output_tokens=tokens,
+        output_positions=positions,
+        batch_size=2,
+        tokens_per_bs=4,
+    )
+    torch.cuda.synchronize()
+
+    assert tokens.cpu().tolist() == [20, 0, 0, 0, 30, 0, 0, 0]
+    assert positions.cpu().tolist() == [200, 201, 202, 203, 300, 301, 302, 303]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_pack_welm_mtp_linear_graph_outputs():
     batch_size, draft_topk = 2, 8
     # Use deliberately non-contiguous row views.  The live CUDA graph sampler

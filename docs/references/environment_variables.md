@@ -121,6 +121,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
 | `SGLANG_WELM_DISABLE_PREFILL_MIRROR_TOKEN_OWNER` | When WeLM Token Owner and KV mirror are both enabled, ordinary Prefill exits Token Owner at the first contracting mirror layer and uses the replicated output communicator for the mirror tail. Set to `false` to retain Token Owner through the tail. It does not affect Decode, MTP/NextN, Prefill CP, KV cache, or KV transfer. | `true` |
 | `SGLANG_WELM_DISABLE_PURE_TP_DECODE_TOKEN_OWNER` | Controls WeLM Decode Token Owner when `--enable-token-owner` is set. When unset, Decode Token Owner is disabled only for pure-TP non-disaggregated serving; Prefill remains enabled. Set to `true` to disable Decode Token Owner for any topology, or `false` to retain it for any topology. It has no effect with `--enable-mixed-chunk` or without `--enable-token-owner`. | unset (auto) |
+| `SGLANG_WELM_MTP_LEGACY_MIRROR_STATE` (deprecated) | Restore the old completion-carried NextN mirror-state path for WeLM MTP P/D legacy mode. This compatibility path is disabled by default, is not supported with monolithic or Deferred execution, and is planned for removal after direct-pool migration. | `false` |
 
 ## Quantization
 

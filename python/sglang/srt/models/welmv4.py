@@ -130,10 +130,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     WelmDeferredPrefillCompletion,
+    is_welm_deferred_dp_idle_peer,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welm_deferred_mirror import (
+    WELM_MTP_STORAGE_DRAFT_KV_ATTR,
     WelmDeferredExecutionRole,
+    WelmDeferredMirrorPair,
     WelmDeferredModelExecution,
     get_welm_deferred_model_execution,
 )
@@ -1778,6 +1781,8 @@ def _welm_write_kv_cache_only(
     k: torch.Tensor,
     v: torch.Tensor,
     forward_batch: ForwardBatch,
+    *,
+    token_to_kv_pool=None,
 ) -> None:
     if k is None or v is None:
         return
@@ -1791,7 +1796,12 @@ def _welm_write_kv_cache_only(
         return
     if k.numel() == 0 or v.numel() == 0 or cache_loc.numel() == 0:
         return
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    pool = (
+        forward_batch.token_to_kv_pool
+        if token_to_kv_pool is None
+        else token_to_kv_pool
+    )
+    pool.set_kv_buffer(
         attn,
         cache_loc,
         k.view(-1, attn.tp_k_head_num, attn.qk_head_dim),
@@ -2310,10 +2320,99 @@ def _welm_effective_kv_mirror_pairs(
             list(getattr(config, "kv_mirror_layers", [])),
             list(getattr(config, "kv_mirror_imitated_layers", [])),
         )
-    return (
-        [pair.target_layer for pair in execution.plan.pairs],
-        [pair.source_layer for pair in execution.plan.pairs],
+    pairs = list(execution.plan.pairs)
+    if execution.capture_nextn:
+        nextn_pairs = _welm_nextn_kv_mirror_pairs(config)
+        invalid_sources = [
+            pair.source_layer
+            for pair in nextn_pairs
+            if pair.source_layer >= execution.prefill_execution_end_layer
+        ]
+        if invalid_sources:
+            raise ValueError(
+                "NextN mirror sources must be in the executed Target prefix; "
+                f"got {invalid_sources} with cutoff "
+                f"{execution.prefill_execution_end_layer}"
+            )
+        pairs.extend(nextn_pairs)
+    pairs = list(dict.fromkeys((pair.target_layer, pair.source_layer) for pair in pairs))
+    return ([target for target, _ in pairs], [source for _, source in pairs])
+
+
+def _welm_nextn_kv_mirror_pairs(
+    config: PretrainedConfig,
+) -> List[WelmDeferredMirrorPair]:
+    num_hidden_layers = int(
+        getattr(
+            config,
+            "num_target_hidden_layers",
+            getattr(config, "num_hidden_layers", 0),
+        )
+        or 0
     )
+    num_nextn_predict_layers = int(
+        getattr(config, "num_nextn_predict_layers", 0) or 0
+    )
+    mirror_layers = list(getattr(config, "kv_mirror_layers", ()) or ())
+    imitated_layers = list(
+        getattr(config, "kv_mirror_imitated_layers", ()) or ()
+    )
+    if len(mirror_layers) != len(imitated_layers):
+        raise ValueError(
+            "kv_mirror_layers and kv_mirror_imitated_layers must have the same length"
+        )
+    pairs = []
+    for target, source in zip(mirror_layers, imitated_layers):
+        target = int(target)
+        source = int(source)
+        if num_hidden_layers <= target < num_hidden_layers + num_nextn_predict_layers:
+            if not 0 <= source < num_hidden_layers:
+                raise ValueError(
+                    f"NextN mirror source layer {source} is outside the base model"
+                )
+            pairs.append(
+                WelmDeferredMirrorPair(source_layer=source, target_layer=target)
+            )
+        elif target >= num_hidden_layers:
+            raise ValueError(f"unknown NextN mirror target layer {target}")
+    pairs.sort(key=lambda pair: pair.target_layer)
+    expected_layers = list(
+        range(num_hidden_layers, num_hidden_layers + num_nextn_predict_layers)
+    )
+    if [pair.target_layer for pair in pairs] != expected_layers:
+        raise ValueError("WeLM MTP config must define the complete NextN mirror set")
+    return pairs
+
+
+def _welm_take_nextn_kv_mirror_states(
+    config: PretrainedConfig,
+    kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    expected_layers = tuple(
+        pair.target_layer for pair in _welm_nextn_kv_mirror_pairs(config)
+    )
+    missing_layers = [layer for layer in expected_layers if layer not in kv_mirror_states]
+    if missing_layers:
+        raise RuntimeError(
+            "WeLM Target forward is missing NextN mirror K/V for layers "
+            f"{missing_layers}"
+        )
+    captured = {}
+    for layer in expected_layers:
+        tensors = kv_mirror_states.pop(layer)
+        if (
+            not isinstance(tensors, tuple)
+            or len(tensors) != 2
+            or not all(isinstance(tensor, torch.Tensor) for tensor in tensors)
+            or tensors[0].numel() == 0
+            or tensors[1].numel() == 0
+            or tensors[0].shape != tensors[1].shape
+        ):
+            raise RuntimeError(
+                f"WeLM Target forward produced invalid NextN mirror K/V for layer {layer}"
+            )
+        captured[layer] = tensors
+    return captured
 
 
 def _get_kv_mirror_pair_maps(
@@ -2949,6 +3048,7 @@ class MirrorQProjection(BaseWelmQkvProjection):
         super().__init__(shard_layout=("q",), **kwargs)
         self.imitated_layer_idx = imitated_layer_idx
         self.mirror_layer_idx = mirror_layer_idx
+        self.mirror_kv_cache_ready = False
 
     def forward(
         self,
@@ -2996,6 +3096,10 @@ class MirrorQProjection(BaseWelmQkvProjection):
                         hidden_states, forward_batch, first_contract=False
                     )
 
+        if getattr(self, "mirror_kv_cache_ready", False):
+            q = self._apply_qkv(project_hidden_states)
+            return q, None, None, project_hidden_states
+
         pop_key = (
             self.mirror_layer_idx
             if self.mirror_layer_idx is not None
@@ -3034,6 +3138,7 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
         super().__init__(**kwargs)
         self.imitated_layer_idx = imitated_layer_idx
         self.mirror_layer_idx = mirror_layer_idx
+        self.mirror_kv_cache_ready = False
 
     def forward(
         self,
@@ -3046,8 +3151,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
             raise NotImplementedError(
                 "WeLM Phase 2 prefill CP does not support NextN KV mirror"
             )
-        if forward_batch.forward_mode.is_idle() and not getattr(
-            forward_batch, "welm_mtp_merge_kv_fill_draft", False
+        if (
+            not getattr(self, "mirror_kv_cache_ready", False)
+            and forward_batch.forward_mode.is_idle()
+            and not getattr(forward_batch, "welm_mtp_merge_kv_fill_draft", False)
         ):
             # Non-MTP idle batches carry no mirrored activations and do not write cache.
             qkv = self._apply_qkv(hidden_states)
@@ -3076,6 +3183,10 @@ class NextnMirrorQProjection(BaseWelmQkvProjection):
                 project_hidden_states = _welm_select_kv_mirror_rows(
                     hidden_states, forward_batch, first_contract=first_contract
                 )
+
+        if getattr(self, "mirror_kv_cache_ready", False):
+            q = self._apply_q_only(project_hidden_states, attn.q_size)
+            return q, None, None, project_hidden_states
 
         pop_key = (
             self.mirror_layer_idx
@@ -3964,7 +4075,7 @@ class WelmDeferredKVCacheLayer:
     v_scale: Optional[float] = None
 
 
-class WelmDeferredTargetKVFinalizer(nn.Module):
+class WelmMirrorTargetKVFinalizer(nn.Module):
     def __init__(
         self,
         *,
@@ -3977,6 +4088,7 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
         rotary_emb: WelmV4InplaceRotaryEmbedding,
         scale_seq_factor: int,
         scale_rope_positions: bool,
+        destination_pool=None,
     ) -> None:
         super().__init__()
         self.target_layer_id = target_layer_id
@@ -3984,6 +4096,7 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
         self.head_dim = head_dim
         self.scale_seq_factor = scale_seq_factor
         self.scale_rope_positions = scale_rope_positions
+        object.__setattr__(self, "destination_pool", destination_pool)
         self.apply_k_norm = qk_norm or k_norm
         self.k_norm = (
             WelmV4FusedRMSNorm(head_dim, eps=qk_norm_eps)
@@ -4004,10 +4117,17 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
     def borrow_from_target_attention(
         cls,
         target_attention: "Qwen2MoeAttention",
-    ) -> "WelmDeferredTargetKVFinalizer":
+        *,
+        target_layer_id: Optional[int] = None,
+        destination_pool=None,
+    ) -> "WelmMirrorTargetKVFinalizer":
         finalizer = cls.__new__(cls)
         nn.Module.__init__(finalizer)
-        finalizer.target_layer_id = target_attention.layer_idx
+        finalizer.target_layer_id = (
+            target_attention.layer_idx
+            if target_layer_id is None
+            else int(target_layer_id)
+        )
         finalizer.num_kv_heads = target_attention.num_kv_heads
         finalizer.head_dim = target_attention.head_dim
         finalizer.scale_seq_factor = target_attention.scale_seq_factor
@@ -4018,6 +4138,7 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
         object.__setattr__(finalizer, "k_norm", target_attention.k_norm)
         object.__setattr__(finalizer, "rotary_emb", target_attention.rotary_emb)
         object.__setattr__(finalizer, "cache_layer", target_attention.attn)
+        object.__setattr__(finalizer, "destination_pool", destination_pool)
         return finalizer
 
     def forward(
@@ -4029,18 +4150,18 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
     ) -> None:
         if key.shape != value.shape:
             raise RuntimeError(
-                "WeLM deferred target K/V shapes differ for "
+                "WeLM mirror target K/V shapes differ for "
                 f"layer {self.target_layer_id}: {key.shape} vs {value.shape}"
             )
         if key.shape[0] != positions.shape[0]:
             raise RuntimeError(
-                "WeLM deferred target K rows do not match positions for "
+                "WeLM mirror target K rows do not match positions for "
                 f"layer {self.target_layer_id}: {key.shape[0]} vs {positions.shape[0]}"
             )
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if key.shape[0] > 0 and (out_cache_loc is None or out_cache_loc.numel() == 0):
             raise RuntimeError(
-                "WeLM deferred target K/V has rows but no cache destination for "
+                "WeLM mirror target K/V has rows but no cache destination for "
                 f"layer {self.target_layer_id}"
             )
 
@@ -4055,10 +4176,16 @@ class WelmDeferredTargetKVFinalizer(nn.Module):
         if self.scale_rope_positions and self.scale_seq_factor > 1:
             rope_positions = positions // self.scale_seq_factor
         self.rotary_emb.forward_k_only_cuda(rope_positions, key)
-        _welm_write_kv_cache_only(self.cache_layer, key, value, forward_batch)
+        _welm_write_kv_cache_only(
+            self.cache_layer,
+            key,
+            value,
+            forward_batch,
+            token_to_kv_pool=getattr(self, "destination_pool", None),
+        )
 
 
-def _welm_finalize_deferred_target_kv(
+def _welm_finalize_target_kv(
     finalizers: nn.ModuleDict,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -4073,6 +4200,31 @@ def _welm_finalize_deferred_target_kv(
                 f"target layer {target_layer_id}"
             )
         finalizer(positions, *mirror_kv, forward_batch)
+
+
+def _welm_finalize_source_kv(
+    attention: "Qwen2MoeAttention",
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    kv_mirror_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    direct_finalizers = getattr(attention, "mtp_direct_kv_finalizers", None)
+    if direct_finalizers:
+        _welm_finalize_target_kv(
+            direct_finalizers,
+            positions,
+            forward_batch,
+            kv_mirror_states,
+        )
+    if attention.deferred_target_kv_finalizers and getattr(
+        forward_batch, "welm_deferred_prefill", False
+    ):
+        _welm_finalize_target_kv(
+            attention.deferred_target_kv_finalizers,
+            positions,
+            forward_batch,
+            kv_mirror_states,
+        )
 
 
 class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
@@ -4381,12 +4533,23 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
         else:
             self.qkv_proj = StandardQkvProjection(**qkv_proj_kwargs)
         self.deferred_target_kv_finalizers = nn.ModuleDict()
+        self.mtp_direct_kv_finalizers = nn.ModuleDict()
         deferred_execution = get_welm_deferred_model_execution(config)
         if (
             deferred_execution is not None
             and deferred_execution.role is WelmDeferredExecutionRole.PREFILL
         ):
-            for target_layer_id in imitated_to_mirrors.get(
+            finalizer_layers, finalizer_sources = _welm_effective_kv_mirror_pairs(
+                config
+            )
+            _, finalizer_sources_to_layers = _get_kv_mirror_pair_maps(
+                finalizer_layers,
+                finalizer_sources,
+                num_hidden_layers=total_layer_num,
+                num_nextn_predict_layers=num_nextn_predict_layers,
+                is_nextn=False,
+            )
+            for target_layer_id in finalizer_sources_to_layers.get(
                 self.kv_mirror_layer_idx, []
             ):
                 target_uses_scaled_positions = bool(
@@ -4395,7 +4558,7 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
                     and scale_seq_attn_per_suffix_layerwise[target_layer_id]
                 )
                 self.deferred_target_kv_finalizers[str(target_layer_id)] = (
-                    WelmDeferredTargetKVFinalizer(
+                    WelmMirrorTargetKVFinalizer(
                         target_layer_id=target_layer_id,
                         num_kv_heads=self.num_kv_heads,
                         head_dim=self.head_dim,
@@ -4640,6 +4803,12 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
     def _mk_mirror_requires_projection_contract(self, forward_batch: Any) -> bool:
         return _welm_should_contract_kv_mirror(forward_batch)
 
+    def _mk_mirror_direct_kv_enabled(self) -> bool:
+        return bool(
+            getattr(self, "mtp_direct_kv_finalizers", None)
+            or getattr(self.qkv_proj, "mirror_kv_cache_ready", False)
+        )
+
     def _mk_graph_dump_enabled(self) -> bool:
         return _WELM_GRAPH_DUMP_ENABLED
 
@@ -4721,23 +4890,20 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
         else:
             q, k, v = fused_qkv.q, fused_qkv.k, fused_qkv.v
             hidden_states = fused_qkv.hidden_states
-        if self.deferred_target_kv_finalizers and getattr(
-            forward_batch, "welm_deferred_prefill", False
-        ):
-            _welm_finalize_deferred_target_kv(
-                self.deferred_target_kv_finalizers,
-                positions,
-                forward_batch,
-                kv_mirror_states,
-            )
+        _welm_finalize_source_kv(self, positions, forward_batch, kv_mirror_states)
         if (k is None) != (v is None):
             raise RuntimeError(
                 "WeLMV4 attention expects K/V to be both present or both absent."
             )
         has_kv = k is not None
-        if not has_kv:
+        direct_kv_cache_ready = bool(
+            getattr(self.qkv_proj, "mirror_kv_cache_ready", False)
+            and getattr(self.attn, "welm_mirror_kv_cache_ready", False)
+        )
+        if not has_kv and not direct_kv_cache_ready:
             raise RuntimeError(
-                "WeLMV4 attention requires K/V in the merged WeLM MTP path."
+                "WeLMV4 attention permits missing K/V only for an explicitly "
+                "cache-ready mirror consumer."
             )
         if scp_per_suffix and k is not None and k.shape[0] != q.shape[0]:
             k = suffix_scatter(k)
@@ -4787,7 +4953,44 @@ class Qwen2MoeAttention(nn.Module, WeLMV45_80A3H2048HD256PreAttnV2Mixin):
         rope_positions = _scale_rope_positions(positions)
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         k_for_rope = k
-        if not kv_cache_written and qk_nope_head_dim > 0:
+        if not has_kv:
+            last_index = None
+            last_query_positions = None
+            if (
+                _welm_should_contract_kv_mirror(forward_batch)
+                and self.kv_mirror_layer_idx in self.kv_mirror_layers
+                and q.shape[0] == forward_batch.custom_last_index.numel()
+            ):
+                last_index = forward_batch.custom_last_index
+                last_query_positions = getattr(
+                    forward_batch, "welm_mtp_query_positions", None
+                )
+                if last_query_positions is not None:
+                    last_query_positions = last_query_positions.to(
+                        device=positions.device, dtype=positions.dtype
+                    )
+                    active_indices = getattr(
+                        forward_batch, "kv_mirror_active_batch_indices", None
+                    )
+                    output_size = getattr(
+                        forward_batch, "kv_mirror_output_size", None
+                    )
+                    if (
+                        active_indices is not None
+                        and output_size is not None
+                        and last_query_positions.shape[0] == output_size
+                        and active_indices.numel() != output_size
+                    ):
+                        last_query_positions = last_query_positions[active_indices]
+                    last_query_positions = _scale_rope_positions(last_query_positions)
+            self.rotary_emb.forward_q_only_cuda(
+                rope_positions,
+                q,
+                last_index=last_index,
+                last_query_positions=last_query_positions,
+            )
+            q = q.view(q_shape)
+        elif not kv_cache_written and qk_nope_head_dim > 0:
             if (
                 _welm_should_contract_kv_mirror(forward_batch)
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
@@ -6063,6 +6266,7 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         self._bind_monolithic_deferred_target_kv_finalizers()
+        self._bind_storage_draft_target_kv_finalizers()
         self.token_owner_boundary_layer = None
         if self.token_owner_runtime is not None:
             local_end_layer = min(self.end_layer, self.execution_end_layer)
@@ -6082,6 +6286,7 @@ class Qwen2MoeModel(nn.Module):
                 strict=True,
             ):
                 self.layers[layer_id].token_owner_layer_identity = identity
+        self.mtp_direct_kv_enabled = False
         self.mk_moe_router = None
         mk_moe_router_mode = get_mk_moe_router_mode()
         if mk_moe_router_mode is not MkMoeRouterMode.OFF:
@@ -6144,10 +6349,222 @@ class Qwen2MoeModel(nn.Module):
                     f"{pair.target_layer}"
                 )
             source_attention.deferred_target_kv_finalizers[target_key] = (
-                WelmDeferredTargetKVFinalizer.borrow_from_target_attention(
+                WelmMirrorTargetKVFinalizer.borrow_from_target_attention(
                     target_attention
                 )
             )
+
+    def _bind_storage_draft_target_kv_finalizers(self) -> None:
+        if not getattr(self.config, WELM_MTP_STORAGE_DRAFT_KV_ATTR, False):
+            return
+        scale_seq_layerwise = (
+            getattr(self.config, "scale_seq_attn_per_suffix_layerwise", ()) or ()
+        )
+        for pair in _welm_nextn_kv_mirror_pairs(self.config):
+            if not self.start_layer <= pair.source_layer < self.end_layer:
+                raise RuntimeError(
+                    "WeLM storage-only Draft source layer is outside the local "
+                    f"pipeline rank: {pair.source_layer}"
+                )
+            source_attention = self.layers[pair.source_layer].self_attn
+            target_key = str(pair.target_layer)
+            if target_key in source_attention.deferred_target_kv_finalizers:
+                continue
+            source_attention.deferred_target_kv_finalizers[target_key] = (
+                WelmMirrorTargetKVFinalizer(
+                    target_layer_id=pair.target_layer,
+                    num_kv_heads=source_attention.num_kv_heads,
+                    head_dim=source_attention.head_dim,
+                    qk_norm=source_attention.qk_norm,
+                    k_norm=source_attention.only_k_norm,
+                    qk_norm_eps=getattr(source_attention.k_norm, "eps", 1e-5),
+                    rotary_emb=source_attention.rotary_emb,
+                    scale_seq_factor=source_attention.scale_seq_factor,
+                    scale_rope_positions=bool(
+                        len(scale_seq_layerwise) > pair.target_layer
+                        and scale_seq_layerwise[pair.target_layer]
+                    ),
+                )
+            )
+
+    def bind_mtp_direct_kv(
+        self,
+        draft_model: nn.Module,
+        *,
+        target_kv_pool,
+        draft_kv_pool,
+    ) -> None:
+        if getattr(self, "mtp_direct_kv_enabled", False):
+            raise RuntimeError("WeLM MTP direct K/V destinations are already bound")
+        if target_kv_pool is None or draft_kv_pool is None:
+            raise RuntimeError(
+                "WeLM MTP direct K/V requires Target and Draft destination pools"
+            )
+
+        num_hidden_layers = _welm_nextn_target_layer_count(self.config)
+        mirror_layers, source_layers = _welm_effective_kv_mirror_pairs(self.config)
+        draft_layers = draft_model.decoder_layers
+        routes = []
+        for target_layer_id, source_layer_id in zip(mirror_layers, source_layers):
+            if not self.start_layer <= source_layer_id < self.end_layer:
+                raise RuntimeError(
+                    "WeLM MTP direct K/V source layer is outside the local "
+                    f"pipeline rank: {source_layer_id}"
+                )
+            source_attention = self.layers[source_layer_id].self_attn
+            if target_layer_id < num_hidden_layers:
+                if not self.start_layer <= target_layer_id < self.end_layer:
+                    raise RuntimeError(
+                        "WeLM MTP direct K/V target layer is outside the local "
+                        f"pipeline rank: {target_layer_id}"
+                    )
+                target_attention = self.layers[target_layer_id].self_attn
+                destination_pool = target_kv_pool
+                projection_type = MirrorQProjection
+            else:
+                local_layer_id = target_layer_id - num_hidden_layers
+                if not 0 <= local_layer_id < len(draft_layers):
+                    raise RuntimeError(
+                        "WeLM MTP direct K/V has no Draft cache layer for logical "
+                        f"layer {target_layer_id}"
+                    )
+                target_attention = draft_layers[local_layer_id].self_attn
+                destination_pool = draft_kv_pool
+                projection_type = NextnMirrorQProjection
+
+            projection = target_attention.qkv_proj
+            if not isinstance(projection, projection_type) or int(
+                projection.mirror_layer_idx
+            ) != int(target_layer_id):
+                raise RuntimeError(
+                    "WeLM MTP direct K/V consumer does not match logical mirror "
+                    f"layer {target_layer_id}"
+                )
+            routes.append(
+                (
+                    source_attention,
+                    target_attention,
+                    destination_pool,
+                    int(target_layer_id),
+                )
+            )
+
+        for (
+            source_attention,
+            target_attention,
+            destination_pool,
+            target_layer_id,
+        ) in routes:
+            target_key = str(target_layer_id)
+            if target_key in source_attention.mtp_direct_kv_finalizers:
+                raise RuntimeError(
+                    "duplicate WeLM MTP direct K/V finalizer for layer "
+                    f"{target_layer_id}"
+                )
+            source_attention.mtp_direct_kv_finalizers[target_key] = (
+                WelmMirrorTargetKVFinalizer.borrow_from_target_attention(
+                    target_attention,
+                    target_layer_id=target_layer_id,
+                    destination_pool=destination_pool,
+                )
+            )
+            if target_key in source_attention.deferred_target_kv_finalizers:
+                del source_attention.deferred_target_kv_finalizers[target_key]
+            target_attention.qkv_proj.mirror_kv_cache_ready = True
+            target_attention.attn.welm_mirror_kv_cache_ready = True
+        self.mtp_direct_kv_enabled = True
+
+    def bind_mtp_storage_draft_kv(
+        self,
+        draft_model_config,
+        *,
+        draft_kv_pool,
+    ) -> None:
+        if getattr(self, "mtp_direct_kv_enabled", False):
+            raise RuntimeError("WeLM MTP direct K/V destinations are already bound")
+        if draft_kv_pool is None:
+            raise RuntimeError("WeLM storage-only Draft destination pool is missing")
+
+        num_target_layers = _welm_nextn_target_layer_count(self.config)
+        local_layer_ids = set(draft_model_config.full_attention_layer_ids)
+        local_layer_ids.update(draft_model_config.swa_attention_layer_ids)
+        routes = []
+        for pair in _welm_nextn_kv_mirror_pairs(self.config):
+            local_layer_id = pair.target_layer - num_target_layers
+            if local_layer_id not in local_layer_ids:
+                raise RuntimeError(
+                    "WeLM storage-only Draft pool has no local cache layer for "
+                    f"logical layer {pair.target_layer}"
+                )
+            if hasattr(draft_kv_pool, "layers_mapping"):
+                if local_layer_id not in draft_kv_pool.layers_mapping:
+                    raise RuntimeError(
+                        "WeLM storage-only Draft pool mapping is missing local "
+                        f"layer {local_layer_id}"
+                    )
+                _, is_swa_layer = draft_kv_pool.layers_mapping[local_layer_id]
+                shape_pool = (
+                    draft_kv_pool.swa_kv_pool
+                    if is_swa_layer
+                    else draft_kv_pool.full_kv_pool
+                )
+            else:
+                shape_pool = draft_kv_pool
+            expected_heads = int(shape_pool.head_num)
+            expected_head_dim = int(shape_pool.head_dim)
+            expected_v_head_dim = int(shape_pool.v_head_dim)
+            source_attention = self.layers[pair.source_layer].self_attn
+            target_key = str(pair.target_layer)
+            if target_key not in source_attention.deferred_target_kv_finalizers:
+                raise RuntimeError(
+                    "WeLM storage-only Draft finalizer is missing for logical "
+                    f"layer {pair.target_layer}"
+                )
+            finalizer = source_attention.deferred_target_kv_finalizers[target_key]
+            if (
+                finalizer.num_kv_heads != expected_heads
+                or finalizer.head_dim != expected_head_dim
+            ):
+                raise RuntimeError(
+                    "WeLM storage-only Draft finalizer shape does not match "
+                    f"logical layer {pair.target_layer}"
+                )
+            routes.append(
+                (
+                    source_attention,
+                    target_key,
+                    finalizer,
+                    local_layer_id,
+                    expected_heads,
+                    expected_head_dim,
+                    expected_v_head_dim,
+                )
+            )
+
+        for (
+            source_attention,
+            target_key,
+            finalizer,
+            local_layer_id,
+            expected_heads,
+            expected_head_dim,
+            expected_v_head_dim,
+        ) in routes:
+            object.__setattr__(finalizer, "destination_pool", draft_kv_pool)
+            object.__setattr__(
+                finalizer,
+                "cache_layer",
+                WelmDeferredKVCacheLayer(
+                    layer_id=local_layer_id,
+                    tp_k_head_num=expected_heads,
+                    tp_v_head_num=expected_heads,
+                    qk_head_dim=expected_head_dim,
+                    v_head_dim=expected_v_head_dim,
+                ),
+            )
+            source_attention.mtp_direct_kv_finalizers[target_key] = finalizer
+            del source_attention.deferred_target_kv_finalizers[target_key]
+        self.mtp_direct_kv_enabled = True
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
         self.layers_to_capture = layers_to_capture
@@ -6344,9 +6761,8 @@ class Qwen2MoeModel(nn.Module):
                 num_tokens=hidden_states.shape[0],
                 allow_fused_router=not _WELM_DUMP_ENABLED,
             )
-        mtp_kv_mirror_states = None
-
         aux_hidden_states = []
+        mtp_kv_mirror_states = None
         use_previous_precision = welm_use_previous_precision()
         pre_norm_hidden_states = None
         if (
@@ -6405,7 +6821,9 @@ class Qwen2MoeModel(nn.Module):
                         kv_mirror_states,
                     )
                     if (
-                        mtp_kv_mirror_states is None
+                        self.deferred_execution is None
+                        and not getattr(self, "mtp_direct_kv_enabled", False)
+                        and mtp_kv_mirror_states is None
                         and forward_batch.spec_algorithm is not None
                         and forward_batch.spec_algorithm.is_eagle()
                         and not forward_batch.forward_mode.is_draft_extend(
@@ -6441,10 +6859,28 @@ class Qwen2MoeModel(nn.Module):
             self.deferred_execution is not None
             and self.deferred_execution.omit_final_output
         )
-        if deferred_prefill and kv_mirror_states:
+        if (
+            self.deferred_execution is not None
+            and not getattr(self, "mtp_direct_kv_enabled", False)
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_eagle()
+            and not forward_batch.forward_mode.is_idle()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            mtp_kv_mirror_states = _welm_take_nextn_kv_mirror_states(
+                self.config,
+                kv_mirror_states,
+            )
+        if (
+            getattr(self, "mtp_direct_kv_enabled", False)
+            or (
+                self.deferred_execution is not None
+                and getattr(self.deferred_execution, "capture_nextn", False)
+            )
+        ) and kv_mirror_states:
             raise RuntimeError(
-                "WeLM deferred Prefill retained temporary mirror K/V "
-                f"for target layers {sorted(kv_mirror_states)}"
+                "WeLM Target retained temporary mirror K/V for target layers "
+                f"{sorted(kv_mirror_states)}"
             )
         _set_welm_kv_mirror_states(forward_batch, kv_mirror_states)
         if mtp_kv_mirror_states:
@@ -6662,8 +7098,26 @@ class WeLMV4MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_oe_fusion=skip_oe_fusion,
         )
-        deferred_prefill = bool(getattr(forward_batch, "welm_deferred_prefill", False))
-        if deferred_prefill:
+        deferred_prefill = bool(
+            getattr(forward_batch, "welm_deferred_prefill", False)
+        )
+        deferred_prefill_flags = getattr(
+            forward_batch, "welm_deferred_prefill_flags", None
+        )
+        monolithic_deferred_dp = bool(
+            self.deferred_execution is not None
+            and self.deferred_execution.role is WelmDeferredExecutionRole.MONOLITHIC
+            and deferred_prefill_flags
+            and any(deferred_prefill_flags)
+        )
+        deferred_dp_empty_participant = bool(
+            monolithic_deferred_dp
+            and is_welm_deferred_dp_idle_peer(forward_batch)
+            and isinstance(model_output, torch.Tensor)
+            and model_output.shape[0] == 0
+        )
+        deferred_completion = deferred_prefill or deferred_dp_empty_participant
+        if deferred_completion:
             if self.deferred_execution is None or self.deferred_execution.role not in {
                 WelmDeferredExecutionRole.PREFILL,
                 WelmDeferredExecutionRole.MONOLITHIC,
@@ -6675,9 +7129,18 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 raise RuntimeError(
                     "WeLM deferred Prefill completion does not support pipeline parallelism"
                 )
-            if not forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            logical_forward_mode = getattr(
+                forward_batch, "_original_forward_mode", forward_batch.forward_mode
+            )
+            if deferred_prefill and not forward_batch.forward_mode.is_extend(
+                include_draft_extend_v2=True
+            ):
                 raise RuntimeError(
                     "WeLM deferred Prefill completion requires an extend forward"
+                )
+            if deferred_dp_empty_participant and not logical_forward_mode.is_idle():
+                raise RuntimeError(
+                    "WeLM deferred Prefill DP completion requires an idle peer"
                 )
             if isinstance(model_output, tuple):
                 raise RuntimeError(
@@ -6701,13 +7164,24 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     LogitsMetadata.from_forward_batch(forward_batch),
                 )
             capture_hidden_mode = getattr(forward_batch, "capture_hidden_mode", None)
-            if getattr(forward_batch, "return_logprob", False) or (
-                capture_hidden_mode is not None and capture_hidden_mode.need_capture()
+            if deferred_prefill and (
+                getattr(forward_batch, "return_logprob", False)
+                or (
+                    capture_hidden_mode is not None
+                    and capture_hidden_mode.need_capture()
+                )
             ):
                 raise RuntimeError(
                     "WeLM deferred Prefill does not support logprob or hidden-state output payloads"
                 )
-            return WelmDeferredPrefillCompletion()
+            deferred_suffix_has_output = bool(
+                monolithic_deferred_dp
+                and any(getattr(forward_batch, "global_num_tokens_cpu", None) or [])
+            )
+            if not deferred_suffix_has_output:
+                return WelmDeferredPrefillCompletion(
+                    model_specific_states=forward_batch.model_specific_states
+                )
         if (
             self.deferred_execution is not None
             and self.deferred_execution.omit_final_output
@@ -6790,6 +7264,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 prepared_logits,
                 vocab_size=self.config.vocab_size,
             )
+            if deferred_completion:
+                return WelmDeferredPrefillCompletion(
+                    model_specific_states=forward_batch.model_specific_states
+                )
             logits_output.model_specific_states = forward_batch.model_specific_states
             return logits_output
         else:
@@ -6951,9 +7429,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
             and deferred_execution.role is WelmDeferredExecutionRole.PREFILL
         )
         deferred_finalizer_route = {}
-        if is_deferred_prefill:
+        if is_deferred_prefill or getattr(
+            self.config, WELM_MTP_STORAGE_DRAFT_KV_ATTR, False
+        ):
             for module in modules_dict.values():
-                if not isinstance(module, WelmDeferredTargetKVFinalizer):
+                if not isinstance(module, WelmMirrorTargetKVFinalizer):
                     continue
                 k_norm_weight = getattr(getattr(module, "k_norm", None), "weight", None)
                 if k_norm_weight is None:
@@ -7017,6 +7497,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
             extra_nextn_steps = set()
 
         for name, loaded_weight in weights:
+            finalizer_param = deferred_finalizer_route.get(name)
+            if finalizer_param is not None:
+                record_relocated_weight(name)
+                weight_loader = getattr(
+                    finalizer_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(finalizer_param, loaded_weight)
+                continue
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -7078,16 +7566,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         )
             layer_id = get_layer_id(name)
             if is_deferred_prefill:
-                finalizer_param = deferred_finalizer_route.get(name)
-                if finalizer_param is not None:
-                    record_relocated_weight(name)
-                    weight_loader = getattr(
-                        finalizer_param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(finalizer_param, loaded_weight)
-                    continue
-
-                is_pruned_layer = layer_id is not None and layer_id in omitted_layer_ids
+                is_pruned_layer = (
+                    layer_id is not None and layer_id in omitted_layer_ids
+                )
                 if is_pruned_layer and (
                     ".self_attn.k_proj." in name or ".self_attn.v_proj." in name
                 ):

@@ -40,6 +40,7 @@ from sglang.srt.speculative.welmv4_mtp_sampling import (
     welm_mtp_batch_base_positions,
     welm_mtp_deterministic_uniforms,
     welm_mtp_sample_from_weights_with_uniform,
+    welmv4_mtp_apply_root_only_sampling,
     welmv4_mtp_fused_topk_softmax_sample,
     welmv4_mtp_fused_verify_top1_dense_target,
     welmv4_mtp_fused_verify_top1_sparse,
@@ -89,6 +90,32 @@ def _welm_mtp_verify_sampling_topk() -> int:
 
 def _welm_mtp_verify_fused_reject_enabled() -> bool:
     return _env_flag(_WELM_MTP_VERIFY_FUSED_REJECT_ENV, "1")
+
+
+def _welm_mtp_root_only_random_uniforms(
+    root_only_mask: torch.Tensor, width: int
+) -> torch.Tensor:
+    ordinary_rows = torch.nonzero(~root_only_mask, as_tuple=False).flatten()
+    root_rows = torch.nonzero(root_only_mask, as_tuple=False).flatten()
+    uniforms = torch.zeros(
+        (root_only_mask.numel(), width),
+        dtype=torch.float32,
+        device=root_only_mask.device,
+    )
+    if ordinary_rows.numel() > 0:
+        uniforms.index_copy_(
+            0,
+            ordinary_rows,
+            torch.rand(
+                (ordinary_rows.numel(), width),
+                dtype=torch.float32,
+                device=root_only_mask.device,
+            ),
+        )
+    uniforms[root_rows, -1] = torch.rand(
+        (root_rows.numel(),), dtype=torch.float32, device=root_only_mask.device
+    )
+    return uniforms
 
 
 def verify_top1_chain_with_draft_probs_v2(
@@ -356,7 +383,11 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
-    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+    def prepare_for_decode(
+        self: EagleDraftInput,
+        batch: ScheduleBatch,
+        row_active_mask: Optional[torch.Tensor] = None,
+    ):
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -382,7 +413,7 @@ class EagleDraftInputV2Mixin:
                 device=batch.device,
             )
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                output_ids
+                output_ids, row_active_mask=row_active_mask
             )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
@@ -647,22 +678,92 @@ class EagleVerifyInputV2Mixin:
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
         verify_base_positions = None
         verify_uniforms = None
+        root_only_verify_mask = getattr(
+            self, "welm_mtp_root_only_verify_mask", None
+        )
+        if root_only_verify_mask is not None:
+            if (
+                self.topk != 1
+                or root_only_verify_mask.dtype != torch.bool
+                or root_only_verify_mask.ndim != 1
+                or root_only_verify_mask.numel() != bs
+                or root_only_verify_mask.device != device
+            ):
+                raise RuntimeError(
+                    "WeLM MTP root-only sampling requires a batch-aligned bool "
+                    "mask and topk=1."
+                )
+        root_target_predict = None
+        root_target_probs = None
+        root_target_topk_indices = None
+        root_target_topk_values = None
+        root_sampling_uniforms = None
+        root_sampled_tokens = None
+        ordinary_rows = (
+            None
+            if root_only_verify_mask is None
+            else torch.nonzero(~root_only_verify_mask, as_tuple=False).flatten()
+        )
+        root_rows = (
+            None
+            if root_only_verify_mask is None
+            else torch.nonzero(root_only_verify_mask, as_tuple=False).flatten()
+        )
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu or _is_hip:
-            target_predict = torch.argmax(next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
-                candidates=candidates,
-                retrieve_index=self.retrieve_index,
-                retrieve_next_token=self.retrieve_next_token,
-                retrieve_next_sibling=self.retrieve_next_sibling,
-                target_predict=target_predict,
-                topk=self.topk,
-            )
+            if ordinary_rows is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                    bs, self.draft_token_num
+                )
+                root_target_predict = target_predict
+                predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=num_correct_drafts,  # mutable
+                    candidates=candidates,
+                    retrieve_index=self.retrieve_index,
+                    retrieve_next_token=self.retrieve_next_token,
+                    retrieve_next_sibling=self.retrieve_next_sibling,
+                    target_predict=target_predict,
+                    topk=self.topk,
+                )
+            else:
+                token_offsets = torch.arange(
+                    self.draft_token_num, device=device, dtype=torch.long
+                )
+                ordinary_flat_rows = (
+                    ordinary_rows[:, None] * self.draft_token_num
+                    + token_offsets[None, :]
+                ).reshape(-1)
+                ordinary_target_predict = torch.argmax(
+                    next_token_logits[ordinary_flat_rows], dim=-1
+                ).reshape(ordinary_rows.numel(), self.draft_token_num)
+                root_target_predict = torch.argmax(
+                    next_token_logits[root_rows * self.draft_token_num], dim=-1
+                ).reshape(root_rows.numel(), 1)
+                if ordinary_rows.numel() > 0:
+                    ordinary_accept_index = accept_index[ordinary_rows].contiguous()
+                    ordinary_num_correct_drafts = num_correct_drafts[
+                        ordinary_rows
+                    ].contiguous()
+                    predict, ordinary_accept_index, ordinary_num_correct_drafts = (
+                        verify_tree_greedy_func(
+                            predicts=predict,
+                            accept_index=ordinary_accept_index,
+                            accept_token_num=ordinary_num_correct_drafts,
+                            candidates=candidates[ordinary_rows],
+                            retrieve_index=self.retrieve_index[ordinary_rows],
+                            retrieve_next_token=self.retrieve_next_token[ordinary_rows],
+                            retrieve_next_sibling=self.retrieve_next_sibling[
+                                ordinary_rows
+                            ],
+                            target_predict=ordinary_target_predict,
+                            topk=self.topk,
+                        )
+                    )
+                    accept_index[ordinary_rows] = ordinary_accept_index
+                    num_correct_drafts[ordinary_rows] = ordinary_num_correct_drafts
         else:
             if getattr(sampling_info, "sampling_seed", None) is not None:
                 verify_base_positions = welm_mtp_batch_base_positions(
@@ -685,28 +786,62 @@ class EagleVerifyInputV2Mixin:
                 and self.draft_topk_indices is not None
                 and self.draft_topk_values is not None
             )
+            use_top1_draft_representation = self.topk == 1 and (
+                self.draft_probs is not None or self.draft_topk_indices is not None
+            )
+            target_probs = None
+            target_topk_indices = None
+            target_topk_values = None
+            if (
+                root_only_verify_mask is not None
+                and verify_uniforms is None
+                and use_top1_draft_representation
+            ):
+                verify_uniforms = _welm_mtp_root_only_random_uniforms(
+                    root_only_verify_mask, accept_index.shape[1]
+                )
 
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
                 sampling_info.temperatures, self.draft_token_num, dim=0
             )  # (bs * num_draft_tokens, 1)
+            target_logits = next_token_logits
+            target_row_indices = None
+            ordinary_target_row_count = bs * self.draft_token_num
+            if ordinary_rows is not None:
+                token_offsets = torch.arange(
+                    self.draft_token_num, device=device, dtype=torch.long
+                )
+                ordinary_target_row_count = (
+                    ordinary_rows.numel() * self.draft_token_num
+                )
+                ordinary_flat_rows = (
+                    ordinary_rows[:, None] * self.draft_token_num
+                    + token_offsets[None, :]
+                ).reshape(-1)
+                root_flat_rows = root_rows * self.draft_token_num
+                target_row_indices = torch.cat(
+                    (ordinary_flat_rows, root_flat_rows)
+                )
+                target_logits = next_token_logits[target_row_indices]
+                expanded_temperature = expanded_temperature[target_row_indices]
 
             if use_sparse_verify_topk:
-                k = min(int(verify_sampling_topk), int(next_token_logits.shape[-1]))
+                k = min(int(verify_sampling_topk), int(target_logits.shape[-1]))
                 target_topk = None
                 if _is_cuda and not getattr(
                     sampling_info, "need_top_p_sampling", False
                 ):
                     uniform = (
                         torch.full(
-                            (next_token_logits.shape[0], 1),
+                            (target_logits.shape[0], 1),
                             0.5,
                             dtype=torch.float32,
                             device=next_token_logits.device,
                         )
                         if verify_uniforms is not None
                         else torch.empty(
-                            (next_token_logits.shape[0], 1),
+                            (target_logits.shape[0], 1),
                             dtype=torch.float32,
                             device=next_token_logits.device,
                         )
@@ -715,50 +850,85 @@ class EagleVerifyInputV2Mixin:
                         uniform.uniform_()
                     try:
                         target_topk = welmv4_mtp_fused_topk_softmax_sample(
-                            next_token_logits,
+                            target_logits,
                             expanded_temperature,
                             uniform,
                             k,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        if root_only_verify_mask is not None:
+                            raise RuntimeError(
+                                "WeLM MTP root-only Target top-k fast path failed."
+                            ) from exc
                         target_topk = None
 
                 if target_topk is not None:
                     _, _, target_topk_indices, target_topk_values = target_topk
                 else:
                     target_topk_logits, target_topk_indices = torch.topk(
-                        next_token_logits / expanded_temperature,
+                        target_logits / expanded_temperature,
                         k=k,
                         dim=-1,
                         sorted=False,
                     )
                     target_topk_values = F.softmax(target_topk_logits, dim=-1)
-                target_topk_indices = target_topk_indices.reshape(
-                    bs, self.draft_token_num, k
-                )
-                target_topk_values = target_topk_values.reshape(
-                    bs, self.draft_token_num, k
-                )
+                if ordinary_rows is None:
+                    target_topk_indices = target_topk_indices.reshape(
+                        bs, self.draft_token_num, k
+                    )
+                    target_topk_values = target_topk_values.reshape(
+                        bs, self.draft_token_num, k
+                    )
+                else:
+                    root_target_topk_indices = target_topk_indices[
+                        ordinary_target_row_count:
+                    ].reshape(root_rows.numel(), 1, k)
+                    root_target_topk_values = target_topk_values[
+                        ordinary_target_row_count:
+                    ].reshape(root_rows.numel(), 1, k)
+                    target_topk_indices = target_topk_indices[
+                        :ordinary_target_row_count
+                    ].reshape(ordinary_rows.numel(), self.draft_token_num, k)
+                    target_topk_values = target_topk_values[
+                        :ordinary_target_row_count
+                    ].reshape(ordinary_rows.numel(), self.draft_token_num, k)
                 target_probs = None
             else:
                 target_probs = F.softmax(
-                    next_token_logits / expanded_temperature, dim=-1
+                    target_logits / expanded_temperature, dim=-1
                 )  # (bs * num_draft_tokens, vocab_size)
                 if getattr(sampling_info, "need_top_k_sampling", True):
+                    expanded_top_ks = torch.repeat_interleave(
+                        sampling_info.top_ks, self.draft_token_num, dim=0
+                    )
+                    if target_row_indices is not None:
+                        expanded_top_ks = expanded_top_ks[target_row_indices]
                     target_probs = top_k_renorm_prob(
                         target_probs,
-                        torch.repeat_interleave(
-                            sampling_info.top_ks, self.draft_token_num, dim=0
-                        ),
+                        expanded_top_ks,
                     )  # (bs * num_draft_tokens, vocab_size)
                 if getattr(sampling_info, "need_top_p_sampling", False):
+                    expanded_top_ps = torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    )
+                    if target_row_indices is not None:
+                        expanded_top_ps = expanded_top_ps[target_row_indices]
                     target_probs = top_p_renorm_prob(
                         target_probs,
-                        torch.repeat_interleave(
-                            sampling_info.top_ps, self.draft_token_num, dim=0
-                        ),
+                        expanded_top_ps,
                     )
-                target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+                if ordinary_rows is None:
+                    target_probs = target_probs.reshape(
+                        bs, self.draft_token_num, -1
+                    )
+                else:
+                    vocab_size = target_probs.shape[-1]
+                    root_target_probs = target_probs[
+                        ordinary_target_row_count:
+                    ].reshape(root_rows.numel(), 1, vocab_size)
+                    target_probs = target_probs[:ordinary_target_row_count].reshape(
+                        ordinary_rows.numel(), self.draft_token_num, vocab_size
+                    )
 
             # Sync sampling results across TP ranks: different GPUs may
             # produce slightly different target_probs due to floating-point
@@ -769,9 +939,7 @@ class EagleVerifyInputV2Mixin:
                 if is_dp_attention_enabled()
                 else get_tp_group()
             )
-            if self.topk == 1 and (
-                self.draft_probs is not None or self.draft_topk_indices is not None
-            ):
+            if use_top1_draft_representation:
                 draft_probs = (
                     self.draft_probs.to(dtype=torch.float32, device=device).contiguous()
                     if self.draft_probs is not None
@@ -789,40 +957,93 @@ class EagleVerifyInputV2Mixin:
                     if self.draft_topk_values is not None
                     else None
                 )
-                if use_sparse_verify_topk:
+                ordinary_accept_index = (
+                    accept_index
+                    if ordinary_rows is None
+                    else accept_index[ordinary_rows].contiguous()
+                )
+                ordinary_num_correct_drafts = (
+                    num_correct_drafts
+                    if ordinary_rows is None
+                    else num_correct_drafts[ordinary_rows].contiguous()
+                )
+                ordinary_candidates = (
+                    candidates if ordinary_rows is None else candidates[ordinary_rows]
+                )
+                ordinary_retrieve_index = (
+                    self.retrieve_index
+                    if ordinary_rows is None
+                    else self.retrieve_index[ordinary_rows]
+                )
+                ordinary_retrieve_next_token = (
+                    self.retrieve_next_token
+                    if ordinary_rows is None
+                    else self.retrieve_next_token[ordinary_rows]
+                )
+                ordinary_target_probs = target_probs
+                ordinary_target_topk_indices = target_topk_indices
+                ordinary_target_topk_values = target_topk_values
+                ordinary_draft_probs = (
+                    draft_probs
+                    if ordinary_rows is None or draft_probs is None
+                    else draft_probs[ordinary_rows]
+                )
+                ordinary_draft_topk_indices = (
+                    draft_topk_indices
+                    if ordinary_rows is None or draft_topk_indices is None
+                    else draft_topk_indices[ordinary_rows]
+                )
+                ordinary_draft_topk_values = (
+                    draft_topk_values
+                    if ordinary_rows is None or draft_topk_values is None
+                    else draft_topk_values[ordinary_rows]
+                )
+                ordinary_uniforms = (
+                    verify_uniforms
+                    if ordinary_rows is None or verify_uniforms is None
+                    else verify_uniforms[ordinary_rows]
+                )
+                run_ordinary_verify = (
+                    ordinary_rows is None or ordinary_rows.numel() > 0
+                )
+                if use_sparse_verify_topk and run_ordinary_verify:
                     fused_verify_done = False
                     if _is_cuda and _welm_mtp_verify_fused_reject_enabled():
                         try:
                             fused_verify_done = welmv4_mtp_fused_verify_top1_sparse(
                                 predicts=predict,
-                                accept_index=accept_index,
-                                accept_token_num=num_correct_drafts,
-                                candidates=candidates,
-                                retrieve_index=self.retrieve_index,
-                                retrieve_next_token=self.retrieve_next_token,
-                                target_topk_indices=target_topk_indices,
-                                target_topk_values=target_topk_values,
-                                draft_topk_indices=draft_topk_indices,
-                                draft_topk_values=draft_topk_values,
-                                uniforms=verify_uniforms,
+                                accept_index=ordinary_accept_index,
+                                accept_token_num=ordinary_num_correct_drafts,
+                                candidates=ordinary_candidates,
+                                retrieve_index=ordinary_retrieve_index,
+                                retrieve_next_token=ordinary_retrieve_next_token,
+                                target_topk_indices=ordinary_target_topk_indices,
+                                target_topk_values=ordinary_target_topk_values,
+                                draft_topk_indices=ordinary_draft_topk_indices,
+                                draft_topk_values=ordinary_draft_topk_values,
+                                uniforms=ordinary_uniforms,
                             )
-                        except Exception:
+                        except Exception as exc:
+                            if root_only_verify_mask is not None:
+                                raise RuntimeError(
+                                    "WeLM MTP root-only sparse verify fast path failed."
+                                ) from exc
                             fused_verify_done = False
                     if not fused_verify_done:
                         verify_top1_chain_with_sparse_target_probs_v2_vectorized(
                             predicts=predict,
-                            accept_index=accept_index,
-                            accept_token_num=num_correct_drafts,
-                            candidates=candidates,
-                            retrieve_index=self.retrieve_index,
-                            retrieve_next_token=self.retrieve_next_token,
-                            target_topk_indices=target_topk_indices,
-                            target_topk_values=target_topk_values,
-                            draft_topk_indices=draft_topk_indices,
-                            draft_topk_values=draft_topk_values,
-                            uniforms=verify_uniforms,
+                            accept_index=ordinary_accept_index,
+                            accept_token_num=ordinary_num_correct_drafts,
+                            candidates=ordinary_candidates,
+                            retrieve_index=ordinary_retrieve_index,
+                            retrieve_next_token=ordinary_retrieve_next_token,
+                            target_topk_indices=ordinary_target_topk_indices,
+                            target_topk_values=ordinary_target_topk_values,
+                            draft_topk_indices=ordinary_draft_topk_indices,
+                            draft_topk_values=ordinary_draft_topk_values,
+                            uniforms=ordinary_uniforms,
                         )
-                else:
+                elif run_ordinary_verify:
                     fused_verify_done = False
                     if (
                         draft_probs is None
@@ -833,33 +1054,40 @@ class EagleVerifyInputV2Mixin:
                             fused_verify_done = (
                                 welmv4_mtp_fused_verify_top1_dense_target(
                                     predicts=predict,
-                                    accept_index=accept_index,
-                                    accept_token_num=num_correct_drafts,
-                                    candidates=candidates,
-                                    retrieve_index=self.retrieve_index,
-                                    retrieve_next_token=self.retrieve_next_token,
-                                    target_probs=target_probs,
-                                    draft_topk_indices=draft_topk_indices,
-                                    draft_topk_values=draft_topk_values,
-                                    uniforms=verify_uniforms,
+                                    accept_index=ordinary_accept_index,
+                                    accept_token_num=ordinary_num_correct_drafts,
+                                    candidates=ordinary_candidates,
+                                    retrieve_index=ordinary_retrieve_index,
+                                    retrieve_next_token=ordinary_retrieve_next_token,
+                                    target_probs=ordinary_target_probs,
+                                    draft_topk_indices=ordinary_draft_topk_indices,
+                                    draft_topk_values=ordinary_draft_topk_values,
+                                    uniforms=ordinary_uniforms,
                                 )
                             )
-                        except Exception:
+                        except Exception as exc:
+                            if root_only_verify_mask is not None:
+                                raise RuntimeError(
+                                    "WeLM MTP root-only dense verify fast path failed."
+                                ) from exc
                             fused_verify_done = False
                     if not fused_verify_done:
                         verify_top1_chain_with_draft_probs_v2(
                             predicts=predict,
-                            accept_index=accept_index,
-                            accept_token_num=num_correct_drafts,
-                            candidates=candidates,
-                            retrieve_index=self.retrieve_index,
-                            retrieve_next_token=self.retrieve_next_token,
-                            target_probs=target_probs,
-                            draft_probs=draft_probs,
-                            draft_topk_indices=draft_topk_indices,
-                            draft_topk_values=draft_topk_values,
-                            uniforms=verify_uniforms,
+                            accept_index=ordinary_accept_index,
+                            accept_token_num=ordinary_num_correct_drafts,
+                            candidates=ordinary_candidates,
+                            retrieve_index=ordinary_retrieve_index,
+                            retrieve_next_token=ordinary_retrieve_next_token,
+                            target_probs=ordinary_target_probs,
+                            draft_probs=ordinary_draft_probs,
+                            draft_topk_indices=ordinary_draft_topk_indices,
+                            draft_topk_values=ordinary_draft_topk_values,
+                            uniforms=ordinary_uniforms,
                         )
+                if ordinary_rows is not None and ordinary_rows.numel() > 0:
+                    accept_index[ordinary_rows] = ordinary_accept_index
+                    num_correct_drafts[ordinary_rows] = ordinary_num_correct_drafts
             else:
                 draft_probs = torch.zeros_like(target_probs)
 
@@ -871,40 +1099,105 @@ class EagleVerifyInputV2Mixin:
                     width=self.draft_token_num + 1,
                     salt=2000,
                 )
+                if root_only_verify_mask is not None and tree_uniforms is None:
+                    tree_uniforms = _welm_mtp_root_only_random_uniforms(
+                        root_only_verify_mask, self.draft_token_num + 1
+                    )
                 coins = (
-                    tree_uniforms[:, : self.draft_token_num]
+                    tree_uniforms[:, : self.draft_token_num].contiguous()
                     if tree_uniforms is not None
                     else torch.rand_like(candidates, dtype=torch.float32, device=device)
                 )
                 # coins for final sampling
                 coins_for_final_sampling = (
-                    tree_uniforms[:, self.draft_token_num]
+                    tree_uniforms[:, self.draft_token_num].contiguous()
                     if tree_uniforms is not None
                     else torch.rand((bs,), dtype=torch.float32, device=device)
                 )
+                ordinary_accept_index = (
+                    accept_index
+                    if ordinary_rows is None
+                    else accept_index[ordinary_rows].contiguous()
+                )
+                ordinary_num_correct_drafts = (
+                    num_correct_drafts
+                    if ordinary_rows is None
+                    else num_correct_drafts[ordinary_rows].contiguous()
+                )
+                if ordinary_rows is None or ordinary_rows.numel() > 0:
+                    tree_speculative_sampling_target_only(
+                        predicts=predict,
+                        accept_index=ordinary_accept_index,
+                        accept_token_num=ordinary_num_correct_drafts,
+                        candidates=(
+                            candidates
+                            if ordinary_rows is None
+                            else candidates[ordinary_rows]
+                        ),
+                        # kwarg LHS retained as `retrive_*` to match op schema.
+                        retrive_index=(
+                            self.retrieve_index
+                            if ordinary_rows is None
+                            else self.retrieve_index[ordinary_rows]
+                        ),
+                        retrive_next_token=(
+                            self.retrieve_next_token
+                            if ordinary_rows is None
+                            else self.retrieve_next_token[ordinary_rows]
+                        ),
+                        retrive_next_sibling=(
+                            self.retrieve_next_sibling
+                            if ordinary_rows is None
+                            else self.retrieve_next_sibling[ordinary_rows]
+                        ),
+                        uniform_samples=(
+                            coins if ordinary_rows is None else coins[ordinary_rows]
+                        ),
+                        uniform_samples_for_final_sampling=(
+                            coins_for_final_sampling
+                            if ordinary_rows is None
+                            else coins_for_final_sampling[ordinary_rows]
+                        ),
+                        target_probs=target_probs,
+                        draft_probs=draft_probs,
+                        threshold_single=(
+                            get_global_server_args().speculative_accept_threshold_single
+                        ),
+                        threshold_acc=(
+                            get_global_server_args().speculative_accept_threshold_acc
+                        ),
+                        deterministic=True,
+                    )
+                if ordinary_rows is not None and ordinary_rows.numel() > 0:
+                    accept_index[ordinary_rows] = ordinary_accept_index
+                    num_correct_drafts[ordinary_rows] = ordinary_num_correct_drafts
+                if root_only_verify_mask is not None:
+                    root_sampling_uniforms = tree_uniforms[:, -1]
 
-                tree_speculative_sampling_target_only(
-                    predicts=predict,  # mutable
-                    accept_index=accept_index,  # mutable
-                    accept_token_num=num_correct_drafts,  # mutable
-                    candidates=candidates,
-                    # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-                    retrive_index=self.retrieve_index,
-                    retrive_next_token=self.retrieve_next_token,
-                    retrive_next_sibling=self.retrieve_next_sibling,
-                    uniform_samples=coins,
-                    uniform_samples_for_final_sampling=coins_for_final_sampling,
-                    target_probs=target_probs,
-                    draft_probs=draft_probs,
-                    threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                    threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
-                    deterministic=True,
+            if root_only_verify_mask is not None:
+                if root_sampling_uniforms is None:
+                    root_sampling_uniforms = verify_uniforms[:, -1]
+                welmv4_mtp_apply_root_only_sampling(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=num_correct_drafts,
+                    retrieve_index=self.retrieve_index,
+                    root_only_verify_mask=root_only_verify_mask,
+                    target_probs=root_target_probs,
+                    target_topk_indices=root_target_topk_indices,
+                    target_topk_values=root_target_topk_values,
+                    root_uniforms=root_sampling_uniforms,
                 )
 
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+            if root_only_verify_mask is not None:
+                root_predict_indices = self.retrieve_index[
+                    root_only_verify_mask, 0
+                ].to(dtype=torch.long)
+                root_sampled_tokens = predict[root_predict_indices].clone()
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
@@ -915,6 +1208,34 @@ class EagleVerifyInputV2Mixin:
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
+            )
+
+        if root_only_verify_mask is not None:
+            if root_target_predict is not None:
+                welmv4_mtp_apply_root_only_sampling(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=num_correct_drafts,
+                    retrieve_index=self.retrieve_index,
+                    root_only_verify_mask=root_only_verify_mask,
+                    target_predict=root_target_predict,
+                )
+            elif SIMULATE_ACC_LEN > 0:
+                root_rows = torch.nonzero(
+                    root_only_verify_mask, as_tuple=False
+                ).flatten()
+                root_predict_indices = self.retrieve_index[root_rows, 0].to(
+                    dtype=torch.long
+                )
+                accept_index[root_rows] = -1
+                accept_index[root_rows, 0] = root_predict_indices.to(
+                    dtype=accept_index.dtype
+                )
+                num_correct_drafts[root_rows] = 0
+                predict[root_predict_indices] = root_sampled_tokens
+            torch._assert_async(
+                torch.all(num_correct_drafts[root_only_verify_mask] == 0),
+                "WeLM MTP root-only verify accepted a non-root draft token.",
             )
 
         # `num_correct_drafts` stays drafts-only inside this function; the returned

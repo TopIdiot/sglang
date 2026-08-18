@@ -105,6 +105,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
+        storage_draft_config = getattr(
+            mr, "welm_mtp_storage_draft_model_config", None
+        )
+        if storage_draft_config is not None:
+            if storage_draft_config.is_hybrid_swa:
+                raise RuntimeError(
+                    "storage-only Draft SWA layers require a Target SWA pool"
+                )
+            kv_size = torch._utils._element_size(mr.kv_cache_dtype)
+            tp_size = get_attention_tp_size()
+            self._cell_size += (
+                storage_draft_config.get_num_kv_heads(tp_size)
+                * (storage_draft_config.head_dim + storage_draft_config.v_head_dim)
+                * len(storage_draft_config.full_attention_layer_ids)
+                * kv_size
+            )
+
         # DFLASH: scale cell_size to account for draft model KV cache
         if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
@@ -229,6 +246,40 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
+        storage_draft_config = getattr(
+            mr, "welm_mtp_storage_draft_model_config", None
+        )
+        draft_full_cost = 0
+        draft_swa_cost = 0
+        if storage_draft_config is not None:
+            draft_full_layers = len(storage_draft_config.full_attention_layer_ids)
+            draft_swa_layers = len(storage_draft_config.swa_attention_layer_ids)
+            if self._full_layers_num == 0 and draft_full_layers:
+                raise RuntimeError(
+                    "storage-only Draft full-attention layers require a Target "
+                    "full KV pool"
+                )
+            if draft_full_layers:
+                draft_full_cost = (
+                    storage_draft_config.get_num_kv_heads(tp_size)
+                    * (
+                        storage_draft_config.head_dim
+                        + storage_draft_config.v_head_dim
+                    )
+                    * kv_size
+                    * draft_full_layers
+                )
+            if draft_swa_layers:
+                draft_swa_cost = (
+                    storage_draft_config.get_swa_num_kv_heads(tp_size)
+                    * (
+                        storage_draft_config.swa_head_dim
+                        + storage_draft_config.swa_v_head_dim
+                    )
+                    * kv_size
+                    * draft_swa_layers
+                )
+
         # Bytes per token of max_total_num_tokens.
         #
         # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
@@ -239,13 +290,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
         if self._full_layers_num == 0:
-            self._cell_size = self._swa_per_token * self._swa_layers_num
+            self._cell_size = (
+                self._swa_per_token * self._swa_layers_num + draft_swa_cost
+            )
         else:
             self._cell_size = (
                 self._full_per_token * self._full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
+                + draft_full_cost
+                + self._swa_full_tokens_ratio * draft_swa_cost
             )
 
     def _solve_pool_sizes(

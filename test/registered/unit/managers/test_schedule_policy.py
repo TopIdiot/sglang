@@ -114,6 +114,7 @@ def test_req_interval_rebuild_clears_stale_split_spec():
     req.fill_ids = [1, 2, 3, 4, 5, 6]
     req.logprob_start_len = -1
     req._scale_seq_factor = 1
+    req.retracted_stain = False
 
     req.set_extend_input_len(2)
 
@@ -161,6 +162,7 @@ def _make_sharded_prefill_ordering_fixture(
         req.positional_embed_overrides = None
         req.extra_key = None
         req.is_retracted = False
+        req.retracted_stain = False
         req.multimodal_inputs = None
         req._scale_seq_factor = 1
         req.init_next_round_input = MagicMock(wraps=req.init_next_round_input)
@@ -683,6 +685,9 @@ def test_decode_mode_clears_request_and_batch_split_specs():
     batch = ScheduleBatch(
         reqs=[req],
         spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
+        ),
         attn_cp_prefill_split_specs=(spec,),
     )
 

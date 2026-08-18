@@ -45,6 +45,8 @@ def _server_args(**overrides):
         "decode_attention_backend": None,
         "pp_size": 1,
         "speculative_algorithm": None,
+        "speculative_eagle_topk": 1,
+        "disable_overlap_schedule": False,
         "enable_hierarchical_cache": False,
         "disaggregation_decode_enable_offload_kvcache": False,
         "enable_dp_attention": False,
@@ -59,6 +61,15 @@ def _server_args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _mtp_model_config():
+    return _model_config(
+        hf_config=SimpleNamespace(
+            architectures=["WeLMV4MoeForCausalLM"],
+            num_nextn_predict_layers=1,
+        )
+    )
 
 
 def test_execution_mode_and_input_kind_have_stable_wire_values():
@@ -197,6 +208,24 @@ def test_deferred_mode_resolves_monolithic_without_transfer_backend():
     assert plan.execution_end_layer == 33
 
 
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+def test_deferred_mode_allows_welm_mtp_spec_v2(role):
+    plan = resolve_welm_deferred_mirror_plan(
+        _server_args(
+            disaggregation_mode=role,
+            disaggregation_transfer_backend=(
+                None if role == "null" else "mooncake"
+            ),
+            speculative_algorithm="EAGLE",
+        ),
+        _mtp_model_config(),
+        use_previous_precision=False,
+    )
+
+    assert plan is not None
+    assert plan.execution_end_layer == 33
+
+
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_deferred_pd_roles_still_require_mooncake(role):
     with pytest.raises(ValueError, match="mooncake"):
@@ -236,7 +265,34 @@ def test_deferred_mode_rejects_mixed_chunk_for_every_role(role):
         ),
         ({"attention_backend": "triton"}, {}, False, "FA3"),
         ({"pp_size": 2}, {}, False, "pipeline parallel"),
-        ({"speculative_algorithm": "EAGLE"}, {}, False, "speculative"),
+        ({"speculative_algorithm": "EAGLE"}, {}, False, "WeLM MTP"),
+        (
+            {
+                "speculative_algorithm": "EAGLE",
+                "speculative_eagle_topk": 2,
+            },
+            {"hf_config": _mtp_model_config().hf_config},
+            False,
+            "topk=1",
+        ),
+        (
+            {
+                "speculative_algorithm": "EAGLE",
+                "disable_overlap_schedule": True,
+            },
+            {"hf_config": _mtp_model_config().hf_config},
+            False,
+            "overlap",
+        ),
+        (
+            {
+                "speculative_algorithm": "EAGLE",
+                "attn_cp_size": 2,
+            },
+            {"hf_config": _mtp_model_config().hf_config},
+            False,
+            "AttnCP",
+        ),
         ({"enable_hierarchical_cache": True}, {}, False, "HiCache"),
         (
             {"disaggregation_decode_enable_offload_kvcache": True},

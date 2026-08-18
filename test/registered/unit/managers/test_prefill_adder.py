@@ -230,6 +230,32 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
 
+    def test_preempt_passes_kv_cache_offload_owner(self):
+        running_req = self.create_mock_req("run", priority=0, max_new_tokens=50)
+        running_batch = self.create_running_batch([running_req])
+        offload_owner = object()
+        adder = self.create_adder(
+            running_batch,
+            kv_cache_offload_owner=offload_owner,
+        )
+        self.mock_token_allocator.full_available_size.return_value = 50
+        self.mock_token_allocator.available_size.return_value = 50
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+
+        assert adder.preempt_to_schedule(
+            self.create_mock_req("new", priority=1, max_new_tokens=49),
+            server_args,
+        )
+
+        running_batch.release_req.assert_called_once_with(
+            0,
+            0,
+            server_args,
+            kv_cache_offload_owner=offload_owner,
+        )
+
     def test_preempt_success_low_priority_values_first(self):
         params = [
             ("run1", 0, 50),

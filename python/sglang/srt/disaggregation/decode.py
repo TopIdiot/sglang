@@ -796,7 +796,10 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            req.load_kv_cache(
+                self.req_to_token_pool,
+                self.scheduler._get_decode_kv_cache_offload_owner(),
+            )
 
         self.retracted_queue = [
             entry

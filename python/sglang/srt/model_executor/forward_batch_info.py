@@ -293,6 +293,24 @@ class NgramEmbeddingInfo:
 class WelmDeferredPrefillCompletion:
     """Typed in-process marker for Prefill completion without model outputs."""
 
+    model_specific_states: Optional[Dict[str, object]] = None
+
+
+def is_welm_deferred_dp_idle_peer(forward_batch: object) -> bool:
+    flags = getattr(forward_batch, "welm_deferred_prefill_flags", None)
+    forward_mode = getattr(
+        forward_batch,
+        "_original_forward_mode",
+        getattr(forward_batch, "forward_mode", None),
+    )
+    return bool(
+        not getattr(forward_batch, "welm_deferred_prefill", False)
+        and flags
+        and any(flags)
+        and forward_mode is not None
+        and forward_mode.is_idle()
+    )
+
 
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
@@ -1293,7 +1311,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         bs = self.batch_size
 
         if isinstance(logits_output, WelmDeferredPrefillCompletion):
-            if not self.welm_deferred_prefill:
+            local_deferred_prefill = bool(self.welm_deferred_prefill)
+            deferred_dp_idle_peer = is_welm_deferred_dp_idle_peer(self)
+            if not local_deferred_prefill and not deferred_dp_idle_peer:
                 raise RuntimeError(
                     "WeLM deferred Prefill completion requires an explicitly marked batch"
                 )
@@ -1301,7 +1321,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 raise RuntimeError(
                     "WeLM deferred Prefill completion does not support speculative execution"
                 )
-            if not self.forward_mode.is_extend():
+            if local_deferred_prefill and not self.forward_mode.is_extend():
                 raise RuntimeError(
                     "WeLM deferred Prefill completion requires an extend forward"
                 )

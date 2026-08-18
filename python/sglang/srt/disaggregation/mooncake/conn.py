@@ -1034,15 +1034,9 @@ class MooncakeKVManager(CommonKVManager):
             )
         return True
 
-    def _validate_equal_item_state_replication(
+    def _validate_state_replication_target(
         self,
         state_type: StateType,
-        src_data_ptrs: List[int],
-        src_item_lens: List[int],
-        src_dim_per_tensor: List[int],
-        dst_data_ptrs: List[int],
-        dst_item_lens: List[int],
-        dst_dim_per_tensor: List[int],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
     ) -> None:
@@ -1062,6 +1056,16 @@ class MooncakeKVManager(CommonKVManager):
                 f"shard {dst_span}, but sender owns {src_span}."
             )
 
+    @staticmethod
+    def _validate_state_item_layout(
+        state_type: StateType,
+        src_data_ptrs: List[int],
+        src_item_lens: List[int],
+        src_dim_per_tensor: List[int],
+        dst_data_ptrs: List[int],
+        dst_item_lens: List[int],
+        dst_dim_per_tensor: List[int],
+    ) -> None:
         if (
             len(src_data_ptrs) != len(dst_data_ptrs)
             or list(src_item_lens) != list(dst_item_lens)
@@ -1181,7 +1185,12 @@ class MooncakeKVManager(CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
-                    self._validate_equal_item_state_replication(
+                    self._validate_state_replication_target(
+                        st,
+                        target_rank_registration_info.dst_tp_rank,
+                        target_rank_registration_info.dst_attn_tp_size,
+                    )
+                    self._validate_state_item_layout(
                         st,
                         src_data_ptrs,
                         src_item_lens,
@@ -1189,8 +1198,20 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_ptrs,
                         dst_item_lens,
                         dst_dim_per_tensor,
-                        target_rank_registration_info.dst_tp_rank,
-                        target_rank_registration_info.dst_attn_tp_size,
+                    )
+                elif (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    == target_rank_registration_info.dst_attn_tp_size
+                ):
+                    self._validate_state_item_layout(
+                        st,
+                        src_data_ptrs,
+                        src_item_lens,
+                        src_dim_per_tensor,
+                        dst_data_ptrs,
+                        dst_item_lens,
+                        dst_dim_per_tensor,
                     )
                 src_indices = np.asarray(indices, dtype=np.int32)
                 dst_indices_local = np.asarray(dst_indices, dtype=np.int32)

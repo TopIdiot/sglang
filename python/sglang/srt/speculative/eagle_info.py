@@ -75,6 +75,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_probs: Optional[torch.Tensor] = None
     draft_topk_indices: Optional[torch.Tensor] = None
     draft_topk_values: Optional[torch.Tensor] = None
+    welm_mtp_root_only_verify_mask: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -704,6 +705,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     welm_mtp_base_positions: torch.Tensor = None
     welm_mtp_deferred_prefill_draft: bool = False
     welm_mtp_deferred_prefill_draft_mask: torch.Tensor = None
+    welm_mtp_root_only_verify_mask: torch.Tensor = None
     welm_mtp_draft_topk_indices: torch.Tensor = None
     welm_mtp_draft_topk_values: torch.Tensor = None
     draft_proposal_parent_list: torch.Tensor = None
@@ -896,6 +898,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         fields = (
             "draft_probs",
             "welm_mtp_deferred_prefill_draft_mask",
+            "welm_mtp_root_only_verify_mask",
             "welm_mtp_draft_topk_indices",
             "welm_mtp_draft_topk_values",
             "draft_proposal_parent_list",
@@ -924,6 +927,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             "draft_proposal_top_scores_index",
             "draft_proposal_tokens",
             "welm_mtp_deferred_prefill_draft_mask",
+            "welm_mtp_root_only_verify_mask",
             "welm_mtp_base_positions",
             "welm_mtp_oe_history_state",
             "welm_mtp_oe_prefix_rows",
@@ -987,10 +991,37 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self._sync_welm_mtp_deferred_prefill_draft_from_mask()
 
+    def _merge_welm_mtp_root_only_mask(self, spec_info: "EagleDraftInput") -> None:
+        lhs_mask = self.welm_mtp_root_only_verify_mask
+        rhs_mask = spec_info.welm_mtp_root_only_verify_mask
+        if lhs_mask is None and rhs_mask is None:
+            return
+
+        if self.future_indices is not None:
+            lhs_rows = int(self.future_indices.indices.numel())
+            rhs_rows = int(spec_info.future_indices.indices.numel())
+            device = self.future_indices.indices.device
+        else:
+            lhs_rows = 0 if self.topk_p is None else int(self.topk_p.shape[0])
+            rhs_rows = 0 if spec_info.topk_p is None else int(spec_info.topk_p.shape[0])
+            ref_tensor = self.topk_p if self.topk_p is not None else spec_info.topk_p
+            device = ref_tensor.device
+
+        if lhs_mask is None:
+            lhs_mask = torch.zeros((lhs_rows,), dtype=torch.bool, device=device)
+        if rhs_mask is None:
+            rhs_mask = torch.zeros((rhs_rows,), dtype=torch.bool, device=device)
+        if lhs_mask.ndim != 1 or int(lhs_mask.numel()) != lhs_rows:
+            raise RuntimeError("WeLM MTP root-only lhs mask is not request-aligned.")
+        if rhs_mask.ndim != 1 or int(rhs_mask.numel()) != rhs_rows:
+            raise RuntimeError("WeLM MTP root-only rhs mask is not request-aligned.")
+        self.welm_mtp_root_only_verify_mask = torch.cat((lhs_mask, rhs_mask))
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
         self._invalidate_welm_mtp_prebuilt_verify()
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            self._merge_welm_mtp_root_only_mask(spec_info)
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
@@ -1029,6 +1060,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
         if spec_info.hidden_states is None:
             return
+        self._merge_welm_mtp_root_only_mask(spec_info)
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
@@ -1052,6 +1084,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.draft_probs = spec_info.draft_probs
         self.welm_mtp_deferred_prefill_draft_mask = getattr(
             spec_info, "welm_mtp_deferred_prefill_draft_mask", None
+        )
+        self.welm_mtp_root_only_verify_mask = getattr(
+            spec_info, "welm_mtp_root_only_verify_mask", None
         )
         self._sync_welm_mtp_deferred_prefill_draft_from_mask()
         self.welm_mtp_draft_topk_indices = spec_info.welm_mtp_draft_topk_indices

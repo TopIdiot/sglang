@@ -226,6 +226,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.welm_mtp_direct_kv_enabled = eagle_worker.welm_mtp_direct_kv_enabled
         self.welm_mtp_mirror_kv_states = None
         self.welm_mtp_mirror_padding_index = 0
         self.welm_mtp_mirror_kv_len = 0
@@ -593,27 +594,28 @@ class WelmMTPDraftProposalCudaGraphRunner:
                 torch.zeros((1,), dtype=torch.int32) if self.use_token_owner else None
             )
 
-            self.welm_mtp_mirror_padding_index = self.max_num_token
-            self.welm_mtp_mirror_kv_len = self.max_num_token + 1
-            self.welm_mtp_mirror_kv_states = {}
-            # These mirror-KV scratch buffers hold a copy of the target's KV
-            # for the draft proposal graph. Tag them GPU_MEMORY_TYPE_KV_CACHE
-            # so release_memory_occupation / pause(GPU_MEMORY_TYPE_KV_CACHE)
-            # can release them alongside the draft's own KV pool. Stale data
-            # after resume is harmless: _copy_welmv4_mtp_mirror_kv_states
-            # refreshes them before graph.replay() on the next replay.
-            with self.model_runner.memory_saver_adapter.region(
-                GPU_MEMORY_TYPE_KV_CACHE
-            ):
-                for layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
-                    packed_kv = torch.zeros(
-                        (self.welm_mtp_mirror_kv_len, 2 * kv_size),
-                        dtype=self.model_runner.dtype,
-                    )
-                    self.welm_mtp_mirror_kv_states[layer_idx] = (
-                        packed_kv[:, :kv_size],
-                        packed_kv[:, kv_size:],
-                    )
+            if not self.welm_mtp_direct_kv_enabled:
+                self.welm_mtp_mirror_padding_index = self.max_num_token
+                self.welm_mtp_mirror_kv_len = self.max_num_token + 1
+                self.welm_mtp_mirror_kv_states = {}
+                # These mirror-KV scratch buffers hold a copy of the target's KV
+                # for the draft proposal graph. Tag them GPU_MEMORY_TYPE_KV_CACHE
+                # so release_memory_occupation / pause(GPU_MEMORY_TYPE_KV_CACHE)
+                # can release them alongside the draft's own KV pool. Stale data
+                # after resume is harmless: _copy_welmv4_mtp_mirror_kv_states
+                # refreshes them before graph.replay() on the next replay.
+                with self.model_runner.memory_saver_adapter.region(
+                    GPU_MEMORY_TYPE_KV_CACHE
+                ):
+                    for layer_idx, kv_size in self._welmv4_mtp_mirror_kv_specs():
+                        packed_kv = torch.zeros(
+                            (self.welm_mtp_mirror_kv_len, 2 * kv_size),
+                            dtype=self.model_runner.dtype,
+                        )
+                        self.welm_mtp_mirror_kv_states[layer_idx] = (
+                            packed_kv[:, :kv_size],
+                            packed_kv[:, kv_size:],
+                        )
 
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -721,11 +723,16 @@ class WelmMTPDraftProposalCudaGraphRunner:
         self, draft_input: EagleDraftInput, seq_lens: torch.Tensor
     ):
         """Return persistent verify tensors for the fixed top-k=1 MTP chain."""
-        if not self.linear_verify_prepare:
+        root_only_verify_mask = getattr(
+            draft_input, "welm_mtp_root_only_verify_mask", None
+        )
+        if not self.linear_verify_prepare and root_only_verify_mask is None:
             return None
         proposal_tokens = getattr(draft_input, "draft_proposal_tokens", None)
         bonus_tokens = getattr(draft_input, "bonus_tokens", None)
-        if proposal_tokens is None or bonus_tokens is None:
+        if bonus_tokens is None or (
+            proposal_tokens is None and root_only_verify_mask is None
+        ):
             return None
         bs = int(seq_lens.numel())
         if bs <= 0 or bs > self.max_bs:
@@ -739,11 +746,13 @@ class WelmMTPDraftProposalCudaGraphRunner:
             self.fused_linear_graph_outputs
             and getattr(draft_input, "welm_mtp_linear_verify_ready", False)
             and getattr(draft_input, "future_indices", None) is None
+            and root_only_verify_mask is None
         )
         if not graph_verify_ready:
             build_welm_mtp_linear_verify_inputs(
                 bonus_tokens=bonus_tokens,
                 proposal_tokens=proposal_tokens,
+                root_only_verify_mask=root_only_verify_mask,
                 seq_lens=seq_lens,
                 output_tokens=self.buffers.linear_verify_tokens,
                 output_positions=self.buffers.linear_verify_positions,
@@ -1522,7 +1531,7 @@ class WelmMTPDraftProposalCudaGraphRunner:
             return should_sample, should_use_top_p
 
         should_sample = (
-            self.eagle_worker._is_welmv4_mtp_draft_sampling_enabled()
+            self.eagle_worker.welmv4_mtp_sample_draft
             and self.topk == 1
             and (
                 self.eagle_worker._has_welmv4_mtp_fixed_draft_sampling_params()
@@ -2136,12 +2145,13 @@ class WelmMTPDraftProposalCudaGraphRunner:
             next_draft_input.welm_mtp_oe_history_state = (
                 buffers.welm_mtp_oe_entry_history[:raw_bs]
             )
-        self._copy_welmv4_mtp_mirror_kv_states(
-            None,
-            graph_num_tokens,
-            model_specific_states=batch_result.logits_output.model_specific_states,
-            mirrored_kv_indices=buffers.mirrored_kv_indices[:graph_num_tokens],
-        )
+        if not self.welm_mtp_direct_kv_enabled:
+            self._copy_welmv4_mtp_mirror_kv_states(
+                None,
+                graph_num_tokens,
+                model_specific_states=batch_result.logits_output.model_specific_states,
+                mirrored_kv_indices=buffers.mirrored_kv_indices[:graph_num_tokens],
+            )
         self._copy_sampling_params_from_info(batch.sampling_info, raw_bs, bs)
         self._copy_sampling_randomness_from_info(
             batch.sampling_info, buffers.seq_lens, raw_bs, bs
@@ -2369,7 +2379,10 @@ class WelmMTPDraftProposalCudaGraphRunner:
             raw_bs=raw_bs,
             graph_num_tokens=graph_num_tokens,
         )
-        self._copy_welmv4_mtp_mirror_kv_states(forward_batch, graph_num_tokens)
+        if not self.welm_mtp_direct_kv_enabled:
+            self._copy_welmv4_mtp_mirror_kv_states(
+                forward_batch, graph_num_tokens
+            )
         self._copy_sampling_params(forward_batch, raw_bs, bs)
         self._copy_sampling_randomness(forward_batch, raw_bs, bs)
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)

@@ -72,6 +72,97 @@ def welm_mtp_sample_from_weights_with_uniform(
     return torch.sum(cdf < threshold).clamp(max=weights.numel() - 1)
 
 
+def welmv4_mtp_apply_root_only_sampling(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    root_only_verify_mask: torch.Tensor,
+    target_predict: Optional[torch.Tensor] = None,
+    target_probs: Optional[torch.Tensor] = None,
+    target_topk_indices: Optional[torch.Tensor] = None,
+    target_topk_values: Optional[torch.Tensor] = None,
+    root_uniforms: Optional[torch.Tensor] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Overwrite seed rows with one root Target sample and no accepted drafts."""
+    batch_size = int(accept_token_num.numel())
+    if (
+        root_only_verify_mask.dtype != torch.bool
+        or root_only_verify_mask.ndim != 1
+        or root_only_verify_mask.numel() != batch_size
+    ):
+        raise RuntimeError("WeLM MTP root-only sampling mask is not request-aligned.")
+    root_rows = torch.nonzero(root_only_verify_mask, as_tuple=False).flatten()
+    if root_rows.numel() == 0:
+        return None
+
+    has_sparse_target = (
+        target_topk_indices is not None or target_topk_values is not None
+    )
+    source_count = int(target_predict is not None) + int(target_probs is not None)
+    source_count += int(has_sparse_target)
+    if source_count != 1 or has_sparse_target != (
+        target_topk_indices is not None and target_topk_values is not None
+    ):
+        raise RuntimeError(
+            "WeLM MTP root-only sampling requires exactly one Target distribution."
+        )
+
+    def root_source_rows(value: torch.Tensor) -> torch.Tensor:
+        if value.shape[0] == batch_size:
+            return value[root_rows, 0]
+        if value.shape[0] == root_rows.numel():
+            return value[:, 0]
+        raise RuntimeError(
+            "WeLM MTP root-only Target rows are neither batch nor root aligned."
+        )
+
+    if target_predict is not None:
+        sampled_tokens = root_source_rows(target_predict).to(dtype=predicts.dtype)
+    else:
+        if target_probs is not None:
+            weights = root_source_rows(target_probs).to(dtype=torch.float32)
+            token_ids = None
+        else:
+            weights = root_source_rows(target_topk_values).to(dtype=torch.float32)
+            token_ids = root_source_rows(target_topk_indices)
+
+        if root_uniforms is None:
+            uniforms = torch.rand(
+                (root_rows.numel(),), dtype=torch.float32, device=weights.device
+            )
+        elif root_uniforms.numel() == batch_size:
+            uniforms = root_uniforms.reshape(-1).index_select(0, root_rows)
+        elif root_uniforms.numel() == root_rows.numel():
+            uniforms = root_uniforms.reshape(-1)
+        else:
+            raise RuntimeError(
+                "WeLM MTP root-only sampling uniforms are not request-aligned."
+            )
+        totals = weights.sum(dim=1)
+        torch._assert_async(
+            torch.all(totals > 0),
+            "WeLM MTP root-only Target distribution has zero probability mass.",
+        )
+        thresholds = uniforms * totals
+        sample_pos = torch.sum(
+            torch.cumsum(weights, dim=1) < thresholds[:, None], dim=1
+        ).clamp(max=weights.shape[1] - 1)
+        sampled_tokens = (
+            sample_pos
+            if token_ids is None
+            else token_ids.gather(1, sample_pos[:, None]).squeeze(1)
+        ).to(dtype=predicts.dtype)
+
+    root_predict_indices = retrieve_index[root_rows, 0].to(dtype=torch.long)
+    accept_index[root_rows] = -1
+    accept_index[root_rows, 0] = root_predict_indices.to(dtype=accept_index.dtype)
+    accept_token_num[root_rows] = 0
+    predicts[root_predict_indices] = sampled_tokens
+    return root_rows, sampled_tokens
+
+
 if triton is not None:
 
     @triton.jit

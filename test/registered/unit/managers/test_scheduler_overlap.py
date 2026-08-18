@@ -261,6 +261,33 @@ class TestSchedulerOverlap(unittest.TestCase):
         self.assertEqual(local_record.numel(), baseline_record.numel())
         self.assertEqual(local_record[6].item(), baseline_record[6].item() | 8)
 
+    def test_mlp_sync_packs_root_only_mtp_partition_counts(self):
+        info = MLPSyncBatchInfo(
+            dp_size=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=1,
+            num_tokens_for_logprob=1,
+            num_reqs=1,
+            can_cuda_graph=True,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=1,
+            welm_mtp_root_only_num_reqs=1,
+            welm_mtp_root_only_num_tokens=8,
+        )
+
+        local_record = info._get_local_tensor(device="cpu")
+        self.assertEqual(local_record[11].item(), (8 << 32) | 1)
+
+        peer_record = local_record.clone()
+        peer_record[11] = 0
+        info._finish_parse(torch.stack((local_record, peer_record)))
+        self.assertNotIn("is_welm_mtp_root_only", info.__dataclass_fields__)
+        self.assertFalse(hasattr(info, "welm_mtp_root_only_flags"))
+        self.assertEqual(info.welm_mtp_global_root_only_num_reqs, [1, 0])
+        self.assertEqual(info.welm_mtp_global_root_only_num_tokens, [8, 0])
+
     @mock.patch("sglang.srt.managers.scheduler_dp_attn_mixin.get_tp_group")
     @mock.patch("torch.distributed.all_gather_into_tensor")
     def test_mlp_sync_unpacks_request_aligned_deferred_flags(

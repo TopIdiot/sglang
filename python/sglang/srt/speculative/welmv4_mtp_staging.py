@@ -451,19 +451,31 @@ def gather_welm_mtp_last_hash(
 def _build_linear_verify_inputs_kernel(
     bonus_tokens,
     proposal_tokens,
+    root_only_verify_mask,
     seq_lens,
     output_tokens,
     output_positions,
     num_rows,
     TOKENS_PER_BS: tl.constexpr,
+    HAS_PROPOSAL: tl.constexpr,
+    HAS_ROOT_ONLY_MASK: tl.constexpr,
 ):
     idx = tl.program_id(0)
     row = idx // TOKENS_PER_BS
     local_pos = idx % TOKENS_PER_BS
     valid = row < num_rows
     bonus = tl.load(bonus_tokens + row, mask=valid, other=0)
+    root_only = False
+    if HAS_ROOT_ONLY_MASK:
+        root_only = tl.load(root_only_verify_mask + row, mask=valid, other=False)
     proposal_idx = row * (TOKENS_PER_BS - 1) + tl.maximum(local_pos - 1, 0)
-    proposal = tl.load(proposal_tokens + proposal_idx, mask=valid, other=0)
+    proposal = 0
+    if HAS_PROPOSAL:
+        proposal = tl.load(
+            proposal_tokens + proposal_idx,
+            mask=valid & (local_pos > 0) & ~root_only,
+            other=0,
+        )
     seq_len = tl.load(seq_lens + row, mask=valid, other=0)
     tl.store(output_tokens + idx, tl.where(local_pos == 0, bonus, proposal), mask=valid)
     tl.store(output_positions + idx, seq_len + local_pos, mask=valid)
@@ -472,7 +484,8 @@ def _build_linear_verify_inputs_kernel(
 def build_welm_mtp_linear_verify_inputs(
     *,
     bonus_tokens: torch.Tensor,
-    proposal_tokens: torch.Tensor,
+    proposal_tokens: Optional[torch.Tensor],
+    root_only_verify_mask: Optional[torch.Tensor] = None,
     seq_lens: torch.Tensor,
     output_tokens: torch.Tensor,
     output_positions: torch.Tensor,
@@ -482,17 +495,38 @@ def build_welm_mtp_linear_verify_inputs(
     """Build the fixed four-token top-k=1 verify chain in one launch."""
     if batch_size <= 0:
         return
-    if int(proposal_tokens.numel()) < batch_size * (tokens_per_bs - 1):
+    if root_only_verify_mask is not None:
+        if root_only_verify_mask.dtype != torch.bool:
+            raise TypeError("Linear MTP root-only mask must have dtype bool.")
+        if int(root_only_verify_mask.numel()) != batch_size:
+            raise ValueError("Linear MTP root-only mask has incompatible shape.")
+    if proposal_tokens is None:
+        if root_only_verify_mask is None:
+            raise ValueError(
+                "Linear MTP proposals may be omitted only for root-only rows."
+            )
+        torch._assert_async(
+            torch.all(root_only_verify_mask),
+            "Linear MTP proposals may be omitted only for root-only rows.",
+        )
+    elif int(proposal_tokens.numel()) < batch_size * (tokens_per_bs - 1):
         raise ValueError("Linear MTP proposal token buffer is too small.")
     num_tokens = batch_size * tokens_per_bs
     _build_linear_verify_inputs_kernel[(num_tokens,)](
         bonus_tokens,
-        proposal_tokens,
+        proposal_tokens if proposal_tokens is not None else output_tokens,
+        (
+            root_only_verify_mask
+            if root_only_verify_mask is not None
+            else output_positions
+        ),
         seq_lens,
         output_tokens,
         output_positions,
         batch_size,
         TOKENS_PER_BS=tokens_per_bs,
+        HAS_PROPOSAL=proposal_tokens is not None,
+        HAS_ROOT_ONLY_MASK=root_only_verify_mask is not None,
         num_warps=1,
     )
 

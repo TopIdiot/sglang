@@ -1238,6 +1238,57 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         )
         return key
 
+    def forward_q_only_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        last_index: Optional[torch.Tensor] = None,
+        last_query_positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        query_num_heads = query.shape[-1] // self.head_size
+        query = query.view(query.shape[0], query_num_heads, self.head_size)
+        if last_index is None:
+            if query.shape[0] != positions.shape[0]:
+                raise ValueError(
+                    "WeLM Q-only RoPE requires one position per query row: "
+                    f"{positions.shape[0]} vs {query.shape[0]}"
+                )
+        elif query.shape[0] != last_index.numel():
+            raise ValueError(
+                "WeLM Q-only RoPE expects contracted Q rows to match last_index: "
+                f"{query.shape[0]} vs {last_index.numel()}"
+            )
+        if last_query_positions is not None and (
+            last_index is None or last_query_positions.shape[0] != last_index.numel()
+        ):
+            raise ValueError(
+                "WeLM Q-only RoPE expects last_query_positions to match last_index"
+            )
+        if query.numel() == 0:
+            return query
+        num_sms = min(positions.shape[0], self.num_sms)
+        _welmv4_inplace_rope_kernel[(num_sms,)](
+            query,
+            query,
+            positions,
+            self.cos_sin_cache,
+            last_index,
+            last_query_positions,
+            positions.shape[0],
+            last_index.numel() if last_index is not None else 0,
+            query.stride(0),
+            query.stride(0),
+            self.head_size,
+            self.rotary_dim,
+            num_sms,
+            4,
+            query.shape[-2],
+            0,
+            triton.next_power_of_2(query.shape[-2]),
+            1,
+        )
+        return query
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"

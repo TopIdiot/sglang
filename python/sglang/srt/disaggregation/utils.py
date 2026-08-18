@@ -681,7 +681,7 @@ def setup_state_kv_args(
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-    from sglang.srt.speculative.spec_utils import (
+    from sglang.srt.speculative.welmv4_mtp_kv import (
         get_welmv4_mtp_kv_mirror_state_buf_infos,
     )
 
@@ -697,6 +697,15 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            if isinstance(draft_token_to_kv_pool, BaseSWAKVPool):
+                (
+                    draft_data_ptrs,
+                    draft_data_lens,
+                    draft_item_lens,
+                ) = draft_token_to_kv_pool.get_state_buf_infos()
+                data_ptrs = data_ptrs + draft_data_ptrs
+                data_lens = data_lens + draft_data_lens
+                item_lens = item_lens + draft_item_lens
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )

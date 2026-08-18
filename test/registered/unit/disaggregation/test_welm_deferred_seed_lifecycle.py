@@ -89,6 +89,7 @@ def test_inflight_retract_restores_ready_and_marks_seed_slot_overallocated(
     req.kv_allocated_len = len(prompt_token_ids)
     req.offload_kv_cache = MagicMock()
     req.reset_for_retract = MagicMock()
+    kv_cache_owner = object()
 
     batch = ScheduleBatch(
         reqs=[req],
@@ -121,9 +122,12 @@ def test_inflight_retract_restores_ready_and_marks_seed_slot_overallocated(
             0,
             remaing_req_count=0,
             server_args=SimpleNamespace(disaggregation_mode="decode"),
+            kv_cache_offload_owner=kv_cache_owner,
         )
 
-    req.offload_kv_cache.assert_called_once()
+    req.offload_kv_cache.assert_called_once_with(
+        batch.req_to_token_pool, kv_cache_owner
+    )
     req.reset_for_retract.assert_called_once()
     assert captured == {
         "phase": schedule_batch_module.WelmDeferredDecodePhase.READY,
@@ -134,23 +138,137 @@ def test_inflight_retract_restores_ready_and_marks_seed_slot_overallocated(
     }
 
 
-@pytest.mark.parametrize(
-    "phase",
-    (
-        schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING,
-        schedule_batch_module.WelmDeferredDecodePhase.READY,
-    ),
-)
-def test_retract_rejects_deferred_state_that_is_not_running(phase):
+def test_retract_rejects_prefill_pending_deferred_state():
     req = Req.__new__(Req)
     req.origin_input_ids = [11, 12, 13]
     req.output_ids = []
-    req.welm_deferred_decode_state = _state(req.origin_input_ids, phase)
+    req.welm_deferred_decode_state = _state(
+        req.origin_input_ids,
+        schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING,
+    )
     req.kv_committed_len = 2
     req.kv_allocated_len = 2
 
-    with pytest.raises(RuntimeError, match="requires INFLIGHT or CONSUMED"):
+    with pytest.raises(RuntimeError, match="requires READY, INFLIGHT, or CONSUMED"):
         req.prepare_for_retract()
+
+
+def test_spec_v2_inflight_retract_uses_standard_overallocation_release():
+    prompt_token_ids = [11, 12, 13]
+    state = _state(
+        prompt_token_ids,
+        schedule_batch_module.WelmDeferredDecodePhase.INFLIGHT,
+    )
+    req = Req.__new__(Req)
+    req.rid = "seed"
+    req.origin_input_ids = prompt_token_ids
+    req.output_ids = []
+    req.welm_deferred_decode_state = state
+    req.kv_committed_len = state.committed_kv_len + 1
+    req.kv_allocated_len = state.committed_kv_len + 6
+    req.offload_kv_cache = MagicMock()
+    req.reset_for_retract = MagicMock()
+
+    batch = ScheduleBatch(
+        reqs=[req],
+        tree_cache=object(),
+        req_to_token_pool=object(),
+        token_to_kv_pool_allocator=object(),
+        enable_overlap=True,
+        spec_algorithm=SimpleNamespace(
+            is_none=lambda: False,
+            supports_spec_v2=lambda: True,
+        ),
+    )
+    captured = {}
+
+    def capture_release(
+        released_req,
+        _tree_cache,
+        *,
+        is_insert,
+        allow_uncommitted_tail=False,
+    ):
+        captured.update(
+            phase=released_req.welm_deferred_decode_state.phase,
+            committed=released_req.kv_committed_len,
+            allocated=released_req.kv_allocated_len,
+            is_insert=is_insert,
+            allow_uncommitted_tail=allow_uncommitted_tail,
+        )
+
+    with (
+        patch(
+            "sglang.srt.managers.schedule_batch.release_kv_cache",
+            side_effect=capture_release,
+        ),
+        patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache"),
+    ):
+        batch.release_req(
+            0,
+            remaing_req_count=0,
+            server_args=SimpleNamespace(disaggregation_mode="decode"),
+        )
+
+    assert captured == {
+        "phase": schedule_batch_module.WelmDeferredDecodePhase.READY,
+        "committed": state.committed_kv_len,
+        "allocated": state.committed_kv_len + 6,
+        "is_insert": False,
+        "allow_uncommitted_tail": False,
+    }
+
+
+def test_spec_v2_ready_monolithic_retract_reenters_prefill():
+    prompt_token_ids = [11, 12, 13]
+    state = _state(
+        prompt_token_ids,
+        schedule_batch_module.WelmDeferredDecodePhase.READY,
+    )
+    req = Req.__new__(Req)
+    req.origin_input_ids = prompt_token_ids
+    req.output_ids = []
+    req.welm_deferred_decode_state = state
+    req.kv_committed_len = state.committed_kv_len
+    req.kv_allocated_len = state.committed_kv_len
+    req.reset_for_retract = MagicMock()
+    batch = ScheduleBatch(
+        reqs=[req],
+        tree_cache=object(),
+        enable_overlap=True,
+        spec_algorithm=SimpleNamespace(
+            is_none=lambda: False,
+            supports_spec_v2=lambda: True,
+        ),
+    )
+
+    with (
+        patch("sglang.srt.managers.schedule_batch.release_kv_cache") as release,
+        patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache"),
+    ):
+        batch.release_req(
+            0,
+            remaing_req_count=0,
+            server_args=SimpleNamespace(disaggregation_mode="null"),
+        )
+
+    release.assert_called_once_with(req, batch.tree_cache, is_insert=False)
+    assert state.phase is schedule_batch_module.WelmDeferredDecodePhase.PREFILL_PENDING
+
+
+def test_root_only_result_rejects_more_than_target_root_acceptance():
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([42, 43, -1], dtype=torch.int64),
+        accept_lens=torch.tensor([2], dtype=torch.int32),
+        speculative_num_draft_tokens=3,
+        welm_mtp_root_only_verify_mask=torch.tensor([True]),
+    )
+    batch = ScheduleBatch(reqs=[SimpleNamespace()])
+
+    with pytest.raises(RuntimeError, match="accept_len=1"):
+        SchedulerOutputProcessorMixin._resolve_spec_overlap_tokens(
+            SimpleNamespace(), result, batch
+        )
 
 
 def test_release_kv_cache_requires_explicit_uncommitted_tail_permission():

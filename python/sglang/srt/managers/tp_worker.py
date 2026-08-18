@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
     WelmDeferredPrefillCompletion,
+    is_welm_deferred_dp_idle_peer,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
@@ -552,7 +553,9 @@ class TpModelWorker(BaseTpWorker):
                     capture_hidden_mode is not None
                     and capture_hidden_mode.need_capture()
                 )
-                if model_worker_batch.return_logprob or return_hidden_states:
+                if (
+                    model_worker_batch.return_logprob or return_hidden_states
+                ) and not is_welm_deferred_dp_idle_peer(model_worker_batch):
                     raise RuntimeError(
                         "WeLM deferred Prefill does not support an output payload"
                     )

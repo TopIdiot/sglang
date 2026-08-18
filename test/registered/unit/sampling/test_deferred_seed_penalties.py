@@ -120,6 +120,9 @@ def _decode_req(rid, token_id, deferred_state=None):
         kv_allocated_len=1 if deferred_state is None else 0,
         kv_committed_len=1 if deferred_state is None else 0,
         decode_batch_idx=0,
+        return_logprob=False,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
         input_embeds=None,
         attn_cp_prefill_split_spec=None,
         _scale_seq_factor=1,
@@ -191,3 +194,39 @@ def test_prepare_for_decode_masks_ready_and_inflight_seed_but_cumulates_y0():
     assert inflight_call.kwargs["row_active_mask"].tolist() == [True, False]
     assert consumed_call.args[0].tolist() == [92, 42]
     assert consumed_call.kwargs["row_active_mask"] is None
+
+
+def test_spec_v2_prepare_reuses_deferred_penalty_mask_before_inflight():
+    state = schedule_batch_module.WelmDeferredDecodeState.from_prompt_tokens([13])
+    state.transition_to(schedule_batch_module.WelmDeferredDecodePhase.READY)
+    normal = _decode_req("normal", 91)
+    seed = _decode_req("seed", 13, deferred_state=state)
+    spec_info = MagicMock()
+    batch = ScheduleBatch(
+        reqs=[normal, seed],
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        spec_algorithm=SimpleNamespace(
+            is_none=lambda: False,
+            supports_spec_v2=lambda: True,
+        ),
+        spec_info=spec_info,
+        device="cpu",
+        enable_overlap=True,
+        output_ids=torch.tensor([91, 13], dtype=torch.int64),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        seq_lens=torch.tensor([1, 0], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([1, 0], dtype=torch.int64),
+        orig_seq_lens=torch.tensor([1, 0], dtype=torch.int32),
+        seq_lens_sum=1,
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=MagicMock(is_required=True)
+        ),
+    )
+
+    batch.prepare_for_decode()
+
+    spec_info.prepare_for_decode.assert_called_once()
+    args, kwargs = spec_info.prepare_for_decode.call_args
+    assert args == (batch,)
+    assert kwargs["row_active_mask"].tolist() == [True, False]
+    assert state.phase is schedule_batch_module.WelmDeferredDecodePhase.INFLIGHT

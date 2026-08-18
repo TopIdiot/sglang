@@ -1297,6 +1297,41 @@ class TestCPShardedTransfer(unittest.TestCase):
 
         manager._send_kvcache_generic.assert_not_called()
 
+    def test_same_tp_rejects_non_matching_state_layout(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 2
+        manager.attn_tp_rank = 0
+        manager.is_mla_backend = False
+        manager.is_cp_sharded_kv = False
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.SWA],
+            state_data_ptrs=[[100, 200]],
+            state_item_lens=[[64, 64]],
+            state_dim_per_tensor=[[]],
+        )
+        manager._send_kvcache_generic = MagicMock(return_value=0)
+        req = SimpleNamespace(
+            mooncake_session_id="session:1",
+            dst_state_indices=[[11, 12]],
+        )
+        target = SimpleNamespace(
+            dst_tp_rank=0,
+            dst_attn_tp_size=2,
+            dst_state_data_ptrs=[[500]],
+            dst_state_item_lens=[[32]],
+            dst_state_dim_per_tensor=[[]],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "state item layout"):
+            manager.maybe_send_extra(
+                req,
+                [np.array([1, 2])],
+                MagicMock(),
+                target,
+            )
+
+        manager._send_kvcache_generic.assert_not_called()
+
     def test_tp2_to_tp4_rejects_misrouted_state_target(self):
         manager = object.__new__(MooncakeKVManager)
         manager.attn_tp_size = 2

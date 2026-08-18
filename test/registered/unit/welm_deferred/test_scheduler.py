@@ -73,6 +73,7 @@ def _scheduler():
     scheduler._set_or_validate_priority = MagicMock(return_value=True)
     scheduler._abort_on_queued_limit = MagicMock(return_value=False)
     scheduler._prefetch_kvcache = MagicMock()
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     scheduler.stream_output = MagicMock()
     return scheduler
 
@@ -145,8 +146,31 @@ def test_monolithic_admission_rejects_unsupported_payload_before_prefetch(
     assert scheduler.waiting_queue == []
 
 
-def test_monolithic_session_continuation_is_rejected_before_session_lookup():
+def test_monolithic_mtp_admission_rejects_single_token_prompt_before_prefetch():
     scheduler = _scheduler()
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    req = _req([77])
+
+    with patch.object(scheduler_module, "prepare_abort") as prepare_abort:
+        Scheduler._add_request_to_queue(scheduler, req)
+
+    prepare_abort.assert_called_once()
+    assert "at least two prompt tokens" in prepare_abort.call_args.args[1]
+    assert prepare_abort.call_args.kwargs["status_code"] is HTTPStatus.BAD_REQUEST
+    scheduler.stream_output.assert_called_once_with([req], req.return_logprob)
+    scheduler._prefetch_kvcache.assert_not_called()
+    assert scheduler.waiting_queue == []
+
+
+@pytest.mark.parametrize(
+    "disaggregation_mode",
+    [DisaggregationMode.NULL, DisaggregationMode.PREFILL, DisaggregationMode.DECODE],
+)
+def test_deferred_session_continuation_is_rejected_before_session_lookup(
+    disaggregation_mode,
+):
+    scheduler = _scheduler()
+    scheduler.disaggregation_mode = disaggregation_mode
 
     class SessionLookupGuard:
         def __contains__(self, _session_id):
@@ -192,6 +216,24 @@ def test_monolithic_full_hit_transitions_ready_without_transfer():
     assert scheduler.waiting_queue == [req]
     scheduler.send_kv_chunk.assert_not_called()
     assert scheduler.disagg_prefill_inflight_queue == []
+
+
+def test_monolithic_mtp_full_hit_requires_final_prefill_forward():
+    scheduler = _scheduler()
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    req = _req([66, 77])
+    req.extend_input_len = 0
+    Scheduler._add_request_to_queue(scheduler, req)
+    scheduler.waiting_queue.clear()
+
+    with pytest.raises(RuntimeError, match="requires a final Prefill forward"):
+        Scheduler.process_deferred_prefill_without_forward(scheduler, [req])
+
+    assert (
+        req.welm_deferred_decode_state.phase
+        is WelmDeferredDecodePhase.PREFILL_PENDING
+    )
+    assert scheduler.waiting_queue == []
 
 
 def test_monolithic_inflight_retraction_reenters_prefill_after_kv_release():
@@ -314,6 +356,53 @@ def test_monolithic_main_loop_admits_ready_seed_into_running_batch():
     scheduler.update_running_batch.assert_called_once_with(seed_batch)
 
 
+def test_monolithic_forwarded_ready_seed_builds_spec_before_running_admission():
+    req = _deferred_completion_req("final", [21, 22, 23], final=True)
+    req.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.READY)
+    last_batch = ScheduleBatch(
+        reqs=[req],
+        forward_mode=ForwardMode.EXTEND,
+        welm_deferred_prefill=True,
+    )
+    last_batch.filter_batch = MagicMock()
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_fpm = False
+    scheduler._abort_on_waiting_timeout = MagicMock()
+    scheduler._abort_on_running_timeout = MagicMock()
+    scheduler.dllm_config = None
+    scheduler.dllm_manager = None
+    scheduler.enable_hisparse = False
+    scheduler.last_batch = last_batch
+    scheduler.chunked_req = None
+    scheduler.running_batch = ScheduleBatch(reqs=[])
+    scheduler.require_mlp_sync = False
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+    scheduler.server_args = SimpleNamespace(speculative_skip_dp_mlp_sync=True)
+    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    root_spec = object()
+    scheduler._prepare_welm_deferred_seed_batch = MagicMock(
+        side_effect=lambda batch: setattr(batch, "spec_info", root_spec)
+    )
+    scheduler._admit_new_welm_deferred_seed_batch = MagicMock()
+    scheduler.get_new_batch_prefill = MagicMock(return_value=None)
+    scheduler.maybe_prepare_mlp_sync_batch = MagicMock(
+        side_effect=lambda batch, **_kwargs: batch
+    )
+    scheduler._maybe_prepare_ngram_embedding = MagicMock(
+        side_effect=lambda batch: batch
+    )
+    scheduler.update_running_batch = MagicMock(side_effect=lambda batch: batch)
+
+    with patch.object(scheduler_module, "set_schedule_time_batch"):
+        batch = Scheduler.get_next_batch_to_run(scheduler)
+
+    scheduler._prepare_welm_deferred_seed_batch.assert_called_once_with(last_batch)
+    assert scheduler.running_batch is last_batch
+    assert scheduler.running_batch.spec_info is root_spec
+    assert batch is last_batch
+
+
 def _deferred_completion_req(rid, token_ids, *, final):
     req = _req(token_ids)
     req.rid = rid
@@ -347,6 +436,47 @@ def _deferred_completion_result(size):
         logits_output=None,
         next_token_ids=torch.full((size,), -1, dtype=torch.int64),
         welm_deferred_prefill_completion=WelmDeferredPrefillCompletion(),
+    )
+
+
+def test_deferred_dp_idle_peer_consumes_completion_without_request_lifecycle():
+    batch = SimpleNamespace(
+        reqs=[],
+        forward_mode=ForwardMode.IDLE,
+        welm_deferred_prefill=False,
+        welm_deferred_prefill_flags=[False, True],
+        spec_info=None,
+    )
+
+    rows = Scheduler._validate_welm_deferred_prefill_completion(
+        _scheduler(),
+        batch,
+        _deferred_completion_result(0),
+        continuation_completed=False,
+    )
+
+    assert rows == []
+
+
+def test_monolithic_completion_rejects_unconsumed_payload_before_cache_publish():
+    req = _deferred_completion_req("final", [21, 22, 23], final=True)
+    batch = _deferred_completion_batch([req], [True])
+    result = _deferred_completion_result(1)
+    result.welm_deferred_prefill_completion = WelmDeferredPrefillCompletion(
+        model_specific_states={"welm_kv_mirror_states": {}}
+    )
+    scheduler = _scheduler()
+
+    with patch.object(scheduler_module, "maybe_cache_unfinished_req") as cache_prefix:
+        with pytest.raises(RuntimeError, match="unconsumed mirror payload"):
+            Scheduler._prepare_welm_deferred_prefill_result_for_decode(
+                scheduler, batch, result
+            )
+
+    cache_prefix.assert_not_called()
+    assert (
+        req.welm_deferred_decode_state.phase
+        is WelmDeferredDecodePhase.PREFILL_PENDING
     )
 
 
@@ -462,6 +592,76 @@ def test_overlap_run_batch_patches_seed_before_future_map_store():
     assert batch.output_ids.tolist() == [-7]
 
 
+@pytest.mark.parametrize("deferred_dp_idle_peer", [False, True])
+def test_overlap_mtp_prefill_completion_bypasses_future_map(
+    deferred_dp_idle_peer,
+):
+    req = (
+        None
+        if deferred_dp_idle_peer
+        else _deferred_completion_req("final", [21, 22, 23], final=True)
+    )
+    batch = _deferred_completion_batch(
+        [] if deferred_dp_idle_peer else [req],
+        [] if deferred_dp_idle_peer else [True],
+    )
+    if deferred_dp_idle_peer:
+        batch.forward_mode = ForwardMode.IDLE
+        batch.welm_deferred_prefill = False
+        batch.welm_deferred_prefill_flags = [False, True]
+    batch.enable_overlap = True
+    batch.spec_algorithm = SimpleNamespace(
+        is_none=lambda: False,
+        supports_spec_v2=lambda: True,
+    )
+    batch.is_spec_v2 = True
+    worker_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(copy_for_forward=lambda: object()),
+        seq_lens=[] if deferred_dp_idle_peer else [2],
+    )
+    batch.get_model_worker_batch = lambda: worker_batch
+    result = _deferred_completion_result(0 if deferred_dp_idle_peer else 1)
+    future_map = MagicMock()
+
+    class StreamContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    scheduler = _scheduler()
+    scheduler.forward_ct = 0
+    scheduler._profile_batch_predicate = MagicMock()
+    scheduler.forward_sleep_time = None
+    scheduler.is_generation = True
+    scheduler.spec_algorithm = batch.spec_algorithm
+    scheduler.enable_overlap = True
+    scheduler.record_batch_in_overlap = MagicMock()
+    scheduler.future_map = future_map
+    scheduler.forward_stream_ctx = StreamContext()
+    scheduler.forward_stream = SimpleNamespace(wait_stream=MagicMock())
+    scheduler.schedule_stream = object()
+    scheduler.model_worker = SimpleNamespace(
+        forward_batch_generation=MagicMock(return_value=result)
+    )
+    scheduler.device_module = SimpleNamespace(
+        Event=MagicMock(return_value=MagicMock()),
+        StreamContext=lambda _stream: StreamContext(),
+    )
+    scheduler.server_args.enable_dp_attention = False
+
+    with patch.object(scheduler_module, "maybe_cache_unfinished_req"):
+        Scheduler.run_batch(scheduler, batch)
+
+    future_map.alloc_future_indices.assert_not_called()
+    future_map.resolve_future.assert_not_called()
+    future_map.store_to_map.assert_not_called()
+    assert batch.output_ids.tolist() == ([] if deferred_dp_idle_peer else [23])
+    if req is not None:
+        assert req.welm_deferred_decode_state.phase is WelmDeferredDecodePhase.READY
+
+
 def test_non_overlap_run_batch_uses_seed_as_decode_input():
     req = _deferred_completion_req("final", [31, 32, 33], final=True)
     batch = _deferred_completion_batch([req], [True])
@@ -488,6 +688,40 @@ def test_non_overlap_run_batch_uses_seed_as_decode_input():
     cache_prefix.assert_called_once_with(req, scheduler.tree_cache)
     assert batch.output_ids.tolist() == [33]
     assert req.welm_deferred_decode_state.phase is WelmDeferredDecodePhase.READY
+
+
+@pytest.mark.parametrize(
+    ("committed_len", "raises"),
+    [(3, False), (4, True)],
+)
+def test_delayed_inflight_completion_allows_only_physical_overallocation(
+    committed_len, raises
+):
+    req = _deferred_completion_req("final", [21, 22, 23], final=True)
+    req.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.READY)
+    req.welm_deferred_decode_state.transition_to(WelmDeferredDecodePhase.INFLIGHT)
+    req.kv_committed_len = committed_len
+    req.kv_allocated_len = 16
+    batch = _deferred_completion_batch([req], [True])
+    result = _deferred_completion_result(1)
+    scheduler = _scheduler()
+
+    if raises:
+        with pytest.raises(RuntimeError, match="KV length"):
+            Scheduler._validate_welm_deferred_prefill_completion(
+                scheduler,
+                batch,
+                result,
+                continuation_completed=True,
+            )
+    else:
+        rows = Scheduler._validate_welm_deferred_prefill_completion(
+            scheduler,
+            batch,
+            result,
+            continuation_completed=True,
+        )
+        assert rows == [(req, req.welm_deferred_decode_state, True)]
 
 
 def test_completion_uses_frozen_final_mask_after_chunk_state_advances():

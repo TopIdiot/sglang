@@ -38,10 +38,20 @@ def test_generation_result_preserves_legacy_positional_field_order():
 def test_deferred_prefill_model_returns_typed_completion_without_logits(
     omit_final_output,
 ):
+    payload = {
+        "welm_kv_mirror_states": {
+            48: (
+                torch.ones((2, 4), dtype=torch.bfloat16),
+                torch.full((2, 4), 2, dtype=torch.bfloat16),
+            )
+        }
+    }
+
     class FakeBaseModel(nn.Module):
         scale_seq_times = 0
 
-        def forward(self, *_args, **_kwargs):
+        def forward(self, _input_ids, _positions, forward_batch, *_args, **_kwargs):
+            forward_batch.model_specific_states = payload
             return torch.ones((2, 4), dtype=torch.bfloat16)
 
     model = welmv4_model.WeLMV4MoeForCausalLM.__new__(
@@ -69,6 +79,7 @@ def test_deferred_prefill_model_returns_typed_completion_without_logits(
         welm_deferred_prefill=True,
         spec_info=None,
         enable_welm_kv_mirror_opt=False,
+        model_specific_states=None,
     )
 
     output = model(
@@ -78,6 +89,7 @@ def test_deferred_prefill_model_returns_typed_completion_without_logits(
     )
 
     assert isinstance(output, forward_batch_info.WelmDeferredPrefillCompletion)
+    assert output.model_specific_states is payload
     model.logits_processor.assert_not_called()
     model.lm_head.assert_not_called()
 
@@ -111,9 +123,11 @@ def test_monolithic_deferred_prefill_participates_in_remote_dp_logits(monkeypatc
         forward_mode=SimpleNamespace(is_extend=lambda **_kwargs: True),
         welm_deferred_prefill=True,
         welm_deferred_prefill_flags=[True, False],
+        global_num_tokens_cpu=[0, 0],
         global_num_tokens_for_logprob_cpu=[0, 1],
         spec_info=None,
         enable_welm_kv_mirror_opt=False,
+        model_specific_states=None,
     )
 
     output = model(
@@ -159,6 +173,75 @@ def test_zero_row_idle_peer_skips_logits_when_no_dp_rank_has_output():
     assert output.next_token_logits.shape == (0, 32)
 
 
+@pytest.mark.parametrize(
+    (
+        "local_deferred",
+        "flags",
+        "forward_mode",
+        "global_num_tokens",
+        "expected_logits_calls",
+    ),
+    [
+        (False, [False, True], forward_batch_info.ForwardMode.IDLE, [0, 0], 0),
+        (False, [False, True], forward_batch_info.ForwardMode.IDLE, [0, 3], 1),
+        (True, [True, False], forward_batch_info.ForwardMode.EXTEND, [0, 3], 1),
+    ],
+)
+def test_deferred_dp_empty_participant_returns_after_required_logits_collective(
+    monkeypatch,
+    local_deferred,
+    flags,
+    forward_mode,
+    global_num_tokens,
+    expected_logits_calls,
+):
+    class FakeBaseModel(nn.Module):
+        scale_seq_times = 0
+
+        def forward(self, *_args, **_kwargs):
+            return torch.empty((0, 4), dtype=torch.bfloat16)
+
+    model = welmv4_model.WeLMV4MoeForCausalLM.__new__(
+        welmv4_model.WeLMV4MoeForCausalLM
+    )
+    nn.Module.__init__(model)
+    model.model = FakeBaseModel()
+    model.config = SimpleNamespace(vocab_size=32)
+    model.deferred_execution = SimpleNamespace(
+        omit_final_output=False,
+        role=welmv4_model.WelmDeferredExecutionRole.MONOLITHIC,
+    )
+    model.pp_group = SimpleNamespace(is_last_rank=True)
+    model.logits_processor = object()
+    model.lm_head = object()
+    compute_logits = MagicMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(welmv4_model, "_welm_compute_logits_output", compute_logits)
+    forward_batch = SimpleNamespace(
+        forward_mode=forward_mode,
+        welm_deferred_prefill=local_deferred,
+        welm_deferred_prefill_flags=flags,
+        global_num_tokens_cpu=global_num_tokens,
+        spec_info=None,
+        enable_welm_kv_mirror_opt=False,
+        model_specific_states=None,
+        return_logprob=False,
+        capture_hidden_mode=(
+            None
+            if local_deferred
+            else SimpleNamespace(need_capture=lambda: True)
+        ),
+    )
+
+    output = model(
+        torch.empty((0,), dtype=torch.int64),
+        torch.empty((0,), dtype=torch.int64),
+        forward_batch,
+    )
+
+    assert isinstance(output, forward_batch_info.WelmDeferredPrefillCompletion)
+    assert compute_logits.call_count == expected_logits_calls
+
+
 def test_post_forward_sync_restores_batch_without_slicing_completion():
     original_forward_mode = SimpleNamespace(is_extend=lambda **_kwargs: True)
     forward_batch = SimpleNamespace(
@@ -195,7 +278,10 @@ def test_post_forward_sync_rejects_unmarked_deferred_completion():
         )
 
 
-def test_tp_worker_skips_sampler_and_returns_only_internal_bookkeeping_ids(monkeypatch):
+@pytest.mark.parametrize("deferred_dp_idle_peer", [False, True])
+def test_tp_worker_skips_sampler_and_returns_only_internal_bookkeeping_ids(
+    monkeypatch, deferred_dp_idle_peer
+):
     completion = _completion()
     forward_batch = SimpleNamespace(
         batch_size=2,
@@ -209,6 +295,20 @@ def test_tp_worker_skips_sampler_and_returns_only_internal_bookkeeping_ids(monke
         input_ids=forward_batch.input_ids,
         sampling_info=SimpleNamespace(grammars=None),
         is_prefill_only=False,
+        forward_mode=(
+            forward_batch_info.ForwardMode.IDLE
+            if deferred_dp_idle_peer
+            else forward_batch_info.ForwardMode.EXTEND
+        ),
+        welm_deferred_prefill=not deferred_dp_idle_peer,
+        welm_deferred_prefill_flags=(
+            [False, True] if deferred_dp_idle_peer else [True, False]
+        ),
+        capture_hidden_mode=(
+            SimpleNamespace(need_capture=lambda: True)
+            if deferred_dp_idle_peer
+            else None
+        ),
     )
     monkeypatch.setattr(
         tp_worker_module.ForwardBatch,
@@ -309,6 +409,25 @@ def test_prefill_completion_transfers_kv_without_output_or_grammar(monkeypatch):
     scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
     assert scheduler.disagg_prefill_inflight_queue == [req]
     req.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
+
+
+def test_prefill_completion_rejects_unconsumed_mirror_payload(monkeypatch):
+    req = _request(chunked=0)
+    scheduler = _scheduler(overlap=False)
+    result = _result()
+    result.welm_deferred_prefill_completion = (
+        forward_batch_info.WelmDeferredPrefillCompletion(
+            model_specific_states={"welm_kv_mirror_states": {}}
+        )
+    )
+    cache_req = MagicMock()
+    monkeypatch.setattr(prefill_module, "maybe_cache_unfinished_req", cache_req)
+
+    with pytest.raises(RuntimeError, match="unconsumed mirror payload"):
+        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+
+    cache_req.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
 
 
 def test_nonfinal_chunk_cannot_emit_deferred_completion(monkeypatch):
