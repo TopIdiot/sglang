@@ -22,6 +22,11 @@ from sglang.srt.function_call.glm4_moe_detector import (
     get_argument_type,
     parse_arguments,
 )
+from sglang.srt.function_call.utils import (
+    coerce_union_literal,
+    get_argument_types,
+    still_possible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +245,8 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self._separator_ids: List[int] = []
         self._current_key: Optional[str] = None
         self._current_value_type: str = "string"
+        self._current_value_types: set = set()
+        self._value_undecided = False
         self._current_value_ids: List[int] = []
         self._current_value_decoder: Optional[_IncrementalDecoder] = None
         self._arg_count = 0
@@ -293,6 +300,8 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self._separator_ids = []
         self._current_key = None
         self._current_value_type = "string"
+        self._current_value_types = set()
+        self._value_undecided = False
         self._current_value_ids = []
         self._current_value_decoder = None
         self._arg_count = 0
@@ -496,7 +505,12 @@ class WelmV4ToolDetector(BaseFormatDetector):
         for key, value in pairs:
             arg_type = get_argument_type(func_name, key, tools)
             if arg_type == "string":
-                arguments[key] = value
+                # A union that also permits a non-string type may reinterpret a
+                # bare literal; a pure string keeps the rendered text verbatim.
+                coerced, was_coerced = coerce_union_literal(
+                    value, get_argument_types(func_name, key, tools)
+                )
+                arguments[key] = coerced if was_coerced else value
                 continue
             parsed_value, is_valid_json = parse_arguments(value, arg_type)
             if arg_type is None:
@@ -585,12 +599,20 @@ class WelmV4ToolDetector(BaseFormatDetector):
         self._current_value_type = (
             get_argument_type(func_name, self._current_key, tools) or "string"
         )
+        self._current_value_types = get_argument_types(
+            func_name, self._current_key, tools
+        )
+        self._value_undecided = self._current_value_type == "string" and bool(
+            self._current_value_types - {"string"}
+        )
         self._current_value_ids = []
         self._current_value_decoder = self._new_decoder()
 
         prefix = "{" if self._arg_count == 0 else ", "
         prefix += json.dumps(self._current_key, ensure_ascii=False) + ": "
-        if self._current_value_type == "string":
+        # An undecided union may still resolve to a bare literal, so the opening
+        # quote is withheld until the value is known to be a string.
+        if self._current_value_type == "string" and not self._value_undecided:
             prefix += '"'
         self._append_arg_delta(calls, prefix)
         self._phase = _StreamPhase.VALUE
@@ -604,6 +626,17 @@ class WelmV4ToolDetector(BaseFormatDetector):
         delta = self._current_value_decoder.step(self._current_value_ids)
         if not delta:
             return
+        if self._value_undecided:
+            buffered = self._current_value_decoder.emitted
+            if still_possible(buffered, self._current_value_types):
+                return
+            # No literal candidate survives this prefix: commit to string and
+            # flush everything held back so far, then resume token-by-token.
+            self._value_undecided = False
+            self._append_arg_delta(
+                calls, '"' + json.dumps(buffered, ensure_ascii=False)[1:-1]
+            )
+            return
         if self._current_value_type == "string":
             delta = json.dumps(delta, ensure_ascii=False)[1:-1]
         self._append_arg_delta(calls, delta)
@@ -613,15 +646,27 @@ class WelmV4ToolDetector(BaseFormatDetector):
             self._phase = _StreamPhase.DRAINING
             return
         pending = self._current_value_decoder.flush(self._current_value_ids)
-        if pending:
+        if self._value_undecided:
+            raw_value = self._current_value_decoder.emitted
+            coerced, was_coerced = coerce_union_literal(
+                raw_value, self._current_value_types
+            )
+            self._append_arg_delta(
+                calls,
+                json.dumps(coerced if was_coerced else raw_value, ensure_ascii=False),
+            )
+        else:
+            if pending:
+                if self._current_value_type == "string":
+                    pending = json.dumps(pending, ensure_ascii=False)[1:-1]
+                self._append_arg_delta(calls, pending)
             if self._current_value_type == "string":
-                pending = json.dumps(pending, ensure_ascii=False)[1:-1]
-            self._append_arg_delta(calls, pending)
-        if self._current_value_type == "string":
-            self._append_arg_delta(calls, '"')
+                self._append_arg_delta(calls, '"')
         self._arg_count += 1
         self._current_key = None
         self._current_value_type = "string"
+        self._current_value_types = set()
+        self._value_undecided = False
         self._current_value_ids = []
         self._current_value_decoder = None
         self._separator_ids = []

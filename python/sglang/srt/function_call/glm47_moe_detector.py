@@ -12,7 +12,12 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import infer_type_from_json_schema
+from sglang.srt.function_call.utils import (
+    coerce_union_literal,
+    get_argument_types,
+    infer_type_from_json_schema,
+    still_possible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +187,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._cached_value_types: set = set()
+        # True while a union-typed value is buffered pending string-vs-literal
+        self._value_undecided = False
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
 
@@ -297,16 +305,28 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Default to string (safest fallback)
         return "string"
 
-    def _format_value_complete(self, value: str, value_type: str) -> str:
+    def _format_value_complete(
+        self,
+        value: str,
+        value_type: str,
+        value_types: Optional[set] = None,
+    ) -> str:
         """Format complete value based on type.
 
         Args:
             value: Raw value string
             value_type: Expected type ('string', 'number', 'object')
+            value_types: Full set of schema-permitted types, when the value is a
+                union that may still resolve to a bare JSON literal
 
         Returns:
             Properly formatted JSON value string
         """
+        if value_types:
+            coerced, was_coerced = coerce_union_literal(value, value_types)
+            if was_coerced:
+                return json.dumps(coerced, ensure_ascii=False)
+
         if value_type == "string":
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
@@ -373,6 +393,15 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
+                    self._cached_value_types = get_argument_types(
+                        func_name, self._current_key, tools
+                    )
+                    # Auto-detection (no declared type) and union resolution are
+                    # mutually exclusive: the latter needs an explicit schema.
+                    self._value_undecided = (
+                        self._cached_value_type == "string"
+                        and bool(self._cached_value_types - {"string"})
+                    )
 
             elif self._stream_state == StreamState.IN_VALUE:
                 if self._xml_tag_buffer.endswith("</arg_value>"):
@@ -395,9 +424,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                         if value_type == "string":
                             json_output += '"'
                     else:
-                        # Value was never started (empty or complete in one chunk)
+                        # Value was never started (empty, complete in one chunk,
+                        # or held back as an undecided union literal)
                         json_output += self._format_value_complete(
-                            self._current_value, value_type
+                            self._current_value,
+                            value_type,
+                            self._cached_value_types if self._value_undecided else None,
                         )
 
                     self._xml_tag_buffer = ""
@@ -405,6 +437,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
+                    self._cached_value_types = set()
+                    self._value_undecided = False
                 else:
                     closing_tag = "</arg_value>"
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
@@ -416,7 +450,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Use cached value type for consistency
                         value_type = self._cached_value_type or "string"
 
-                        if value_type == "string":
+                        if self._value_undecided:
+                            if content:
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                                if not still_possible(
+                                    self._current_value, self._cached_value_types
+                                ):
+                                    # No literal candidate survives this prefix:
+                                    # commit to string and resume streaming.
+                                    json_output += (
+                                        '"'
+                                        + json.dumps(
+                                            self._current_value, ensure_ascii=False
+                                        )[1:-1]
+                                    )
+                                    self._value_started = True
+                                    self._value_undecided = False
+                        elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -579,8 +630,10 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
+        elif not self._sent_empty_object:
+            # Need to close brace. The opening brace was streamed with the first
+            # argument and is never closed before this point, including when the
+            # last value is itself an object.
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -760,23 +813,19 @@ class Glm47MoeDetector(BaseFormatDetector):
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
-            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
             if arg_type == "string":
-                # Only convert to string if explicitly defined as string type
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                elif isinstance(parsed_value, (dict, list)):
-                    # If parsed as dict/list but schema says string, convert to JSON string
-                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
-                else:
-                    arguments[arg_key] = str(parsed_value)
-            elif arg_type is None:
-                # If type is not defined, keep the parsed value as-is
-                arguments[arg_key] = parsed_value if is_good_json else arg_value
-            else:
-                # For other types (number, object, array, etc.), use parsed value
-                arguments[arg_key] = parsed_value if is_good_json else arg_value
+                # The template writes string values verbatim, so the raw text is
+                # the only faithful reconstruction. Only a union that also
+                # permits a non-string type may reinterpret a bare literal.
+                coerced, was_coerced = coerce_union_literal(
+                    arg_value, get_argument_types(func_name, arg_key, tools)
+                )
+                arguments[arg_key] = coerced if was_coerced else arg_value
+                continue
+
+            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
+            arguments[arg_key] = parsed_value if is_good_json else arg_value
 
         return arguments
 

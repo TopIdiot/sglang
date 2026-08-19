@@ -2749,9 +2749,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
         ]
         for thinking_mode in (False, True):
             for tool_choice in choices:
-                with self.subTest(
-                    thinking_mode=thinking_mode, tool_choice=tool_choice
-                ):
+                with self.subTest(thinking_mode=thinking_mode, tool_choice=tool_choice):
                     structural_tag = self.detector.get_structural_tag(
                         self.tools,
                         tool_choice=tool_choice,
@@ -3388,6 +3386,223 @@ class TestGlm47MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+
+# Chat templates render string values verbatim and everything else through
+# tojson, so a bare `null`/`true`/`5` in the output is ambiguous. These cases
+# pin down the resolution rule for both GLM detectors, in both directions.
+BARE_LITERAL_CASES = [
+    # (label, schema, rendered value, expected argument)
+    ("pure_string_null", {"type": "string"}, "null", "null"),
+    ("pure_string_bool", {"type": "string"}, "true", "true"),
+    ("pure_string_exponent", {"type": "string"}, "1e3", "1e3"),
+    ("pure_string_trailing_zero", {"type": "string"}, "1.230", "1.230"),
+    ("pure_string_nan", {"type": "string"}, "NaN", "NaN"),
+    ("pure_string_object_literal", {"type": "string"}, '{"a":1}', '{"a":1}'),
+    ("pure_string_array_literal", {"type": "string"}, "[1,2]", "[1,2]"),
+    ("nullable_null", {"type": ["string", "null"]}, "null", None),
+    ("nullable_text", {"type": ["string", "null"]}, "hello", "hello"),
+    ("nullable_padded_null", {"type": ["string", "null"]}, " null ", " null "),
+    ("nullable_uppercase_null", {"type": ["string", "null"]}, "NULL", "NULL"),
+    ("nullable_empty", {"type": ["string", "null"]}, "", ""),
+    ("nullable_null_prefix", {"type": ["string", "null"]}, "nullable x", "nullable x"),
+    ("nullable_quoted_text", {"type": ["string", "null"]}, '"hi"', '"hi"'),
+    ("openapi_nullable", {"type": "string", "nullable": True}, "null", None),
+    ("enum_with_null", {"enum": ["a", None]}, "null", None),
+    ("enum_with_null_member", {"enum": ["a", None]}, "a", "a"),
+    (
+        "union_bool_true",
+        {"anyOf": [{"type": "string"}, {"type": "boolean"}]},
+        "true",
+        True,
+    ),
+    (
+        "union_bool_false",
+        {"anyOf": [{"type": "string"}, {"type": "boolean"}]},
+        "false",
+        False,
+    ),
+    ("union_number", {"anyOf": [{"type": "string"}, {"type": "number"}]}, "5", 5),
+    (
+        "union_number_exponent",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "1e3",
+        1000.0,
+    ),
+    (
+        "union_number_unparsable",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "abc",
+        "abc",
+    ),
+    (
+        "union_number_nan_stays_string",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "NaN",
+        "NaN",
+    ),
+    (
+        "union_object",
+        {"anyOf": [{"type": "string"}, {"type": "object"}]},
+        '{"a":1}',
+        {"a": 1},
+    ),
+    (
+        "ref_to_nullable_string",
+        {"$ref": "#/$defs/MaybeText"},
+        "null",
+        None,
+    ),
+    ("plain_number", {"type": "number"}, "5", 5),
+    ("nullable_number", {"type": ["number", "null"]}, "null", None),
+]
+
+
+class TestGlmBareJsonLiteralArguments(unittest.TestCase):
+    """Bare JSON literals in argument values, for GLM-4.5 and GLM-4.7."""
+
+    @staticmethod
+    def _tools(schema):
+        return [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "$defs": {"MaybeText": {"type": ["string", "null"]}},
+                        "type": "object",
+                        "properties": {"x": schema},
+                    },
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _text(detector_cls, value):
+        if detector_cls is Glm47MoeDetector:
+            return (
+                f"<tool_call>f<arg_key>x</arg_key>"
+                f"<arg_value>{value}</arg_value></tool_call>"
+            )
+        return (
+            f"<tool_call>f\n<arg_key>x</arg_key>\n"
+            f"<arg_value>{value}</arg_value>\n</tool_call>"
+        )
+
+    def _non_stream(self, detector_cls, schema, value):
+        result = detector_cls().detect_and_parse(
+            self._text(detector_cls, value), self._tools(schema)
+        )
+        return json.loads(result.calls[0].parameters)["x"]
+
+    def _stream(self, detector_cls, schema, value, chunk_size):
+        detector = detector_cls()
+        tools = self._tools(schema)
+        text = self._text(detector_cls, value)
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        # A trailing empty chunk lets the state machine drain a buffer that
+        # still held a complete tool call when the last chunk arrived.
+        merged = ""
+        for chunk in chunks + [""]:
+            for call in detector.parse_streaming_increment(chunk, tools).calls:
+                if call.name is None:
+                    merged += call.parameters
+        return json.loads(merged)["x"], detector
+
+    def test_decision_table_non_streaming(self):
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            for label, schema, value, expected in BARE_LITERAL_CASES:
+                with self.subTest(detector=detector_cls.__name__, case=label):
+                    self.assertEqual(
+                        self._non_stream(detector_cls, schema, value), expected
+                    )
+
+    def test_decision_table_streaming_matches_non_streaming(self):
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            for label, schema, value, expected in BARE_LITERAL_CASES:
+                for chunk_size in (1, 4, 1024):
+                    with self.subTest(
+                        detector=detector_cls.__name__,
+                        case=label,
+                        chunk_size=chunk_size,
+                    ):
+                        streamed, _ = self._stream(
+                            detector_cls, schema, value, chunk_size
+                        )
+                        self.assertEqual(streamed, expected)
+
+    def test_streamed_args_match_backfill_expectation(self):
+        """serving_chat backfills by prefix-matching these two states."""
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            for label, schema, value, _ in BARE_LITERAL_CASES:
+                with self.subTest(detector=detector_cls.__name__, case=label):
+                    _, detector = self._stream(detector_cls, schema, value, 1)
+                    expected_call = json.dumps(
+                        detector.prev_tool_call_arr[0]["arguments"], ensure_ascii=False
+                    )
+                    self.assertEqual(detector.streamed_args_for_tool[0], expected_call)
+
+    def test_undecided_union_releases_buffer_at_shortest_prefix(self):
+        """A union value must not block streaming beyond the decidable prefix."""
+        schema = {"type": ["string", "null"]}
+        # (value, number of value characters consumed before the first delta)
+        expectations = [
+            ("Hello world, a long sentence", 1),
+            ("note: something", 2),
+            ("nullable and a long paragraph", 5),
+        ]
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            for value, expected_delay in expectations:
+                with self.subTest(detector=detector_cls.__name__, value=value):
+                    detector = detector_cls()
+                    tools = self._tools(schema)
+                    text = self._text(detector_cls, value)
+                    value_start = text.index(value, text.index("<arg_value>"))
+                    merged = ""
+                    prefix_len = None
+                    first_delta_at = None
+                    for i, char in enumerate(text):
+                        for call in detector.parse_streaming_increment(
+                            char, tools
+                        ).calls:
+                            if call.name is None:
+                                merged += call.parameters
+                        if i == value_start - 1:
+                            prefix_len = len(merged)
+                        elif (
+                            prefix_len is not None
+                            and first_delta_at is None
+                            and len(merged) > prefix_len
+                        ):
+                            first_delta_at = i - value_start + 1
+                    self.assertEqual(first_delta_at, expected_delay)
+
+    def test_undecided_union_literal_buffers_until_value_end(self):
+        schema = {"type": ["string", "null"]}
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            with self.subTest(detector=detector_cls.__name__):
+                detector = detector_cls()
+                tools = self._tools(schema)
+                text = self._text(detector_cls, "null")
+                value_end = text.index("</arg_value>")
+                merged = ""
+                at_value_end = None
+                for i, char in enumerate(text):
+                    for call in detector.parse_streaming_increment(char, tools).calls:
+                        if call.name is None:
+                            merged += call.parameters
+                    if i == value_end - 1:
+                        at_value_end = merged
+                self.assertEqual(at_value_end, '{"x": ')
+                self.assertEqual(merged, '{"x": null}')
+
+    def test_streaming_closes_object_after_trailing_object_value(self):
+        """The outer brace must be emitted even when the last value ends in '}'."""
+        schema = {"type": "object"}
+        for detector_cls in (Glm4MoeDetector, Glm47MoeDetector):
+            with self.subTest(detector=detector_cls.__name__):
+                streamed, _ = self._stream(detector_cls, schema, '{"a":1}', 1)
+                self.assertEqual(streamed, {"a": 1})
 
 
 class TestJsonArrayParser(unittest.TestCase):

@@ -1,6 +1,7 @@
+import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -118,6 +119,111 @@ def _resolve_local_json_schema_ref(
     return resolved if isinstance(resolved, dict) else None
 
 
+# Tool schemas exported from DB/ORM tooling carry database type names
+# ("varchar", "int32", "list[str]") rather than JSON Schema ones. Resolving them
+# here keeps type-directed parsing working; the schema itself is never mutated,
+# so request validation and the rendered prompt stay untouched.
+_STANDARD_JSON_SCHEMA_TYPES = frozenset(
+    {"null", "boolean", "object", "array", "number", "string", "integer"}
+)
+
+_JSON_SCHEMA_TYPE_ALIASES = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "uuid": "string",
+    "date": "string",
+    "datetime": "string",
+    "time": "string",
+    "timestamp": "string",
+    "binary": "string",
+    "blob": "string",
+    "bytea": "string",
+    "bytes": "string",
+    "varbinary": "string",
+    "bool": "boolean",
+    "bigint": "integer",
+    "smallint": "integer",
+    "tinyint": "integer",
+    "double": "number",
+    "decimal": "number",
+    "real": "number",
+    "numeric": "number",
+    "arr": "array",
+    "tuple": "array",
+    "set": "array",
+    "map": "object",
+    "none": "null",
+}
+
+# A prefix only matches when it spans the whole token or is followed by a
+# non-identifier char, so "int" does not swallow "internal" and "list" does not
+# swallow "list_price".
+_TYPE_PREFIX_BOUNDARY_CHARS = frozenset("0123456789[<( \t")
+_JSON_SCHEMA_TYPE_PREFIXES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (("int", "uint", "long", "short", "unsigned"), "integer"),
+    (("num", "float"), "number"),
+    (("list",), "array"),
+    (("dict",), "object"),
+)
+
+
+def _matches_type_prefix(base: str, prefixes: Tuple[str, ...]) -> bool:
+    for prefix in prefixes:
+        if base == prefix:
+            return True
+        if (
+            len(base) > len(prefix)
+            and base.startswith(prefix)
+            and base[len(prefix)] in _TYPE_PREFIX_BOUNDARY_CHARS
+        ):
+            return True
+    return False
+
+
+def _resolve_standard_json_schema_type(type_name: Any) -> Optional[str]:
+    """Standard JSON Schema type behind a possibly non-standard type name.
+
+    Returns None when nothing standard can be recognized, so callers can fall
+    back to the verbatim value and let downstream logic surface the oddity.
+    """
+    if not isinstance(type_name, str):
+        return None
+    if type_name in _STANDARD_JSON_SCHEMA_TYPES:
+        return type_name
+    # ``split("(", 1)[0]`` strips parameters such as ``varchar(255)``.
+    base = type_name.split("(", 1)[0].strip().lower()
+    if base in _STANDARD_JSON_SCHEMA_TYPES:
+        return base
+    aliased = _JSON_SCHEMA_TYPE_ALIASES.get(base)
+    if aliased is not None:
+        return aliased
+    for prefixes, target in _JSON_SCHEMA_TYPE_PREFIXES:
+        if _matches_type_prefix(base, prefixes):
+            return target
+    return None
+
+
+def _enum_overrides_type(schema: Dict[str, Any]) -> bool:
+    """Whether an ``enum`` list should win over a non-standard ``type``.
+
+    ``{"type": "enum", "enum": [1, 2, 3]}`` is not valid JSON Schema; such a
+    ``type`` is a DB/ORM artifact and says nothing reliable about the values,
+    while the enum members describe them exactly.
+    """
+    enum_values = schema.get("enum")
+    if not isinstance(enum_values, list) or not enum_values:
+        return False
+    type_value = schema.get("type")
+    entries = type_value if isinstance(type_value, list) else [type_value]
+    return any(
+        isinstance(entry, str) and entry not in _STANDARD_JSON_SCHEMA_TYPES
+        for entry in entries
+    )
+
+
 def infer_type_from_json_schema(
     schema: Dict[str, Any],
     root_schema: Optional[Dict[str, Any]] = None,
@@ -148,13 +254,14 @@ def infer_type_from_json_schema(
     visited_refs = _visited_refs or set()
 
     # Priority 1: Direct type field (including type arrays)
-    if "type" in schema:
+    if "type" in schema and not _enum_overrides_type(schema):
         type_value = schema["type"]
         if isinstance(type_value, str):
-            return type_value
+            return _resolve_standard_json_schema_type(type_value) or type_value
         elif isinstance(type_value, list) and type_value:
             # Handle type arrays: return first non-null type
-            non_null_types = [t for t in type_value if t != "null"]
+            resolved = [_resolve_standard_json_schema_type(t) or t for t in type_value]
+            non_null_types = [t for t in resolved if t != "null"]
             if non_null_types:
                 return non_null_types[0]
             return "string"  # If only null, default to string
@@ -243,6 +350,205 @@ def infer_type_from_json_schema(
         return "array"
 
     return None
+
+
+# Chat templates render string argument values verbatim (no quotes) and every
+# other type through ``tojson``. A bare ``null``/``true``/``5`` in the output is
+# therefore ambiguous: it may be the JSON literal, or a string that happens to
+# spell it. The schema is the only disambiguator, so the helpers below expose
+# the *full* set of permitted types instead of a single primary type.
+
+_NUMBER_START_CHARS = frozenset("-0123456789")
+_NUMBER_BODY_CHARS = frozenset("0123456789.eE+-")
+
+
+def _normalize_json_schema_type(type_name: Any) -> Optional[str]:
+    resolved = _resolve_standard_json_schema_type(type_name)
+    if resolved is not None:
+        return resolved
+    if not isinstance(type_name, str):
+        return None
+    return type_name.strip().lower() or None
+
+
+def _json_type_names(value: Any) -> Set[str]:
+    """JSON Schema type names that ``value`` satisfies."""
+    if value is None:
+        return {"null"}
+    if isinstance(value, bool):
+        return {"boolean"}
+    if isinstance(value, int):
+        return {"integer", "number"}
+    if isinstance(value, float):
+        return {"number"}
+    if isinstance(value, str):
+        return {"string"}
+    if isinstance(value, list):
+        return {"array"}
+    if isinstance(value, dict):
+        return {"object"}
+    return set()
+
+
+def infer_json_schema_types(
+    schema: Dict[str, Any],
+    root_schema: Optional[Dict[str, Any]] = None,
+    _visited_refs: Optional[set] = None,
+) -> Set[str]:
+    """Infer every type a parameter is allowed to take from its JSON Schema.
+
+    Mirrors the traversal of :func:`infer_type_from_json_schema` (type arrays,
+    ``$ref``, ``anyOf``/``oneOf``/``allOf``, ``enum``, ``properties``,
+    ``items``) but returns the union of all permitted types rather than a
+    single primary type. Also honours the OpenAPI ``nullable: true`` extension.
+
+    Returns:
+        Set of normalized type names, or an empty set when nothing is declared.
+    """
+    if not isinstance(schema, dict):
+        return set()
+    if root_schema is None:
+        root_schema = schema
+    visited_refs = _visited_refs or set()
+
+    types: Set[str] = set()
+    if schema.get("nullable") is True:
+        types.add("null")
+
+    if "type" in schema and not _enum_overrides_type(schema):
+        type_value = schema["type"]
+        declared: Set[str] = set()
+        if isinstance(type_value, str):
+            normalized = _normalize_json_schema_type(type_value)
+            if normalized:
+                declared.add(normalized)
+        elif isinstance(type_value, list):
+            for entry in type_value:
+                normalized = _normalize_json_schema_type(entry)
+                if normalized:
+                    declared.add(normalized)
+        if declared:
+            return types | declared
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        if ref in visited_refs:
+            return types
+        resolved_schema = _resolve_local_json_schema_ref(ref, root_schema)
+        if resolved_schema is None:
+            return types
+        return types | infer_json_schema_types(
+            resolved_schema, root_schema, visited_refs | {ref}
+        )
+
+    for combiner in ("anyOf", "oneOf", "allOf"):
+        sub_schemas = schema.get(combiner)
+        if isinstance(sub_schemas, list):
+            for sub_schema in sub_schemas:
+                types |= infer_json_schema_types(sub_schema, root_schema, visited_refs)
+
+    if isinstance(schema.get("enum"), list):
+        for value in schema["enum"]:
+            types |= _json_type_names(value)
+
+    if not types:
+        if "properties" in schema:
+            types.add("object")
+        elif "items" in schema:
+            types.add("array")
+
+    return types
+
+
+def get_argument_types(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> Set[str]:
+    """Full set of schema-permitted types for one argument of one tool.
+
+    Companion to the detectors' ``get_argument_type`` (primary type only).
+    Returns an empty set when the tool, the property, or its type is undeclared.
+    """
+    for tool in defined_tools:
+        if tool.function.name != func_name:
+            continue
+        parameters = tool.function.parameters or {}
+        if not isinstance(parameters, dict):
+            return set()
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return set()
+        arg_schema = properties.get(arg_key)
+        if not isinstance(arg_schema, dict):
+            return set()
+        return infer_json_schema_types(arg_schema, parameters)
+    return set()
+
+
+def _reject_json_constant(name: str) -> Any:
+    # NaN/Infinity/-Infinity are a Python extension, not valid JSON (RFC 8259).
+    # Accepting them here would let a union-typed argument produce a payload
+    # that strict client-side parsers (orjson, JS JSON.parse) reject.
+    raise ValueError(f"{name} is not a valid JSON literal")
+
+
+def coerce_union_literal(raw: str, types: Set[str]) -> Tuple[Any, bool]:
+    """Recover a bare JSON literal from a union-typed argument value.
+
+    Applies only when the schema permits a non-string type. Pure ``string``
+    parameters always keep the raw text, because the template writes string
+    values verbatim and re-encoding would lose the original bytes.
+
+    Args:
+        raw: Verbatim argument text as rendered by the model.
+        types: Result of :func:`infer_json_schema_types` for this argument.
+
+    Returns:
+        Tuple of (value, coerced). ``coerced`` is False when the caller should
+        keep ``raw`` unchanged.
+    """
+    if not types or not (types - {"string"}):
+        return raw, False
+
+    # ``json.loads`` tolerates surrounding whitespace, but ``tojson`` never
+    # emits any, so " null " can only have come from a string.
+    if raw != raw.strip():
+        return raw, False
+
+    try:
+        parsed = json.loads(raw, parse_constant=_reject_json_constant)
+    except (JSONDecodeError, ValueError):
+        return raw, False
+
+    # A parsed string means the raw text was already quoted; keeping it verbatim
+    # preserves those quotes, which are part of the string value itself.
+    if (_json_type_names(parsed) - {"string"}) & types:
+        return parsed, True
+    return raw, False
+
+
+def still_possible(buf: str, types: Set[str]) -> bool:
+    """Whether ``buf`` can still be the prefix of a non-string JSON literal.
+
+    Used by streaming parsers to buffer a union-typed value only until the
+    shortest decidable prefix is reached, then resume token-by-token output.
+    """
+    if not buf:
+        return True
+
+    if "null" in types and "null".startswith(buf):
+        return True
+    if "boolean" in types and ("true".startswith(buf) or "false".startswith(buf)):
+        return True
+    if types & {"number", "integer"}:
+        if buf[0] in _NUMBER_START_CHARS and all(
+            char in _NUMBER_BODY_CHARS for char in buf
+        ):
+            return True
+    if "object" in types and buf[0] == "{":
+        return True
+    if "array" in types and buf[0] == "[":
+        return True
+    return False
 
 
 def get_json_schema_constraint(

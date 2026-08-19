@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.utils import infer_type_from_json_schema
+from sglang.srt.function_call.utils import (
+    coerce_union_literal,
+    infer_json_schema_types,
+    infer_type_from_json_schema,
+    still_possible,
+)
 from sglang.srt.function_call.welm_v4_detector import (
     WelmV4StreamingParseError,
     WelmV4ToolDetector,
@@ -486,6 +491,175 @@ class TestJsonSchemaTypeInference(CustomTestCase):
         ):
             with self.subTest(schema=schema):
                 self.assertIsNone(infer_type_from_json_schema(schema, root))
+                self.assertEqual(infer_json_schema_types(schema, root), set())
+
+    def test_full_type_set_covers_unions_and_aliases(self):
+        root = {"$defs": {"MaybeText": {"type": ["string", "null"]}}}
+        cases = [
+            ({"type": "string"}, {"string"}),
+            ({"type": ["string", "null"]}, {"string", "null"}),
+            ({"type": "str"}, {"string"}),
+            ({"type": "bool"}, {"boolean"}),
+            ({"type": "string", "nullable": True}, {"string", "null"}),
+            (
+                {"anyOf": [{"type": "string"}, {"type": "number"}]},
+                {"string", "number"},
+            ),
+            (
+                {"oneOf": [{"type": "object"}, {"type": "null"}]},
+                {"object", "null"},
+            ),
+            ({"enum": ["a", None, 1]}, {"string", "null", "integer", "number"}),
+            ({"$ref": "#/$defs/MaybeText"}, {"string", "null"}),
+            ({"properties": {"a": {"type": "string"}}}, {"object"}),
+            ({"items": {"type": "string"}}, {"array"}),
+            ({}, set()),
+        ]
+        for schema, expected in cases:
+            with self.subTest(schema=schema):
+                self.assertEqual(infer_json_schema_types(schema, root), expected)
+
+    def test_db_style_type_names_resolve_to_standard_types(self):
+        cases = [
+            ("varchar", "string"),
+            ("varchar(255)", "string"),
+            ("char", "string"),
+            ("text", "string"),
+            ("uuid", "string"),
+            ("timestamp", "string"),
+            ("STRING", "string"),
+            ("bigint", "integer"),
+            ("int32", "integer"),
+            ("uint8", "integer"),
+            ("float64", "number"),
+            ("decimal(10,2)", "number"),
+            ("bool", "boolean"),
+            ("list[str]", "array"),
+            ("tuple", "array"),
+            ("dict[str, int]", "object"),
+            ("map", "object"),
+            ("none", "null"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(type=raw):
+                self.assertEqual(infer_type_from_json_schema({"type": raw}), expected)
+                self.assertEqual(infer_json_schema_types({"type": raw}), {expected})
+
+    def test_unrecognized_type_names_are_kept_verbatim(self):
+        # A prefix only matches on a token boundary, so these must not be
+        # mistaken for "int"/"list"/"num".
+        for raw in ("internal", "list_price", "numbering", "MyType"):
+            with self.subTest(type=raw):
+                self.assertEqual(infer_type_from_json_schema({"type": raw}), raw)
+
+    def test_db_style_type_arrays_keep_nullability(self):
+        self.assertEqual(
+            infer_type_from_json_schema({"type": ["varchar", "none"]}), "string"
+        )
+        self.assertEqual(
+            infer_json_schema_types({"type": ["varchar", "none"]}), {"string", "null"}
+        )
+
+    def test_enum_list_wins_over_non_standard_type(self):
+        # ``{"type": "enum"}`` is not valid JSON Schema, so the members decide.
+        cases = [
+            ({"type": "enum", "enum": [1, 2, 3]}, "integer", {"integer", "number"}),
+            ({"type": "enum", "enum": ["a", None]}, "string", {"string", "null"}),
+            ({"type": "MyType", "enum": ["a", "b"]}, "string", {"string"}),
+            # No usable enum list: fall back to resolving the type name.
+            ({"type": "enum"}, "string", {"string"}),
+            ({"type": "enum", "enum": []}, "string", {"string"}),
+            ({"type": "enum", "enum": "abc"}, "string", {"string"}),
+        ]
+        for schema, expected_type, expected_types in cases:
+            with self.subTest(schema=schema):
+                self.assertEqual(infer_type_from_json_schema(schema), expected_type)
+                self.assertEqual(infer_json_schema_types(schema), expected_types)
+
+    def test_standard_type_still_wins_over_enum_list(self):
+        # Declared standard types are authoritative; only bogus ones defer.
+        for schema, expected in (
+            ({"type": "string", "enum": ["a", None]}, {"string"}),
+            ({"type": "integer", "enum": [1, 2]}, {"integer"}),
+        ):
+            with self.subTest(schema=schema):
+                self.assertEqual(infer_json_schema_types(schema), expected)
+
+
+class TestUnionLiteralCoercion(CustomTestCase):
+    def test_pure_string_and_empty_type_set_never_coerce(self):
+        for types in (set(), {"string"}):
+            for raw in ("null", "true", "5", '{"a":1}'):
+                with self.subTest(types=types, raw=raw):
+                    self.assertEqual(coerce_union_literal(raw, types), (raw, False))
+
+    def test_special_types_win_over_string(self):
+        cases = [
+            ("null", {"string", "null"}, None),
+            ("true", {"string", "boolean"}, True),
+            ("false", {"string", "boolean"}, False),
+            ("5", {"string", "number"}, 5),
+            ("1e3", {"string", "number"}, 1000.0),
+            ('{"a":1}', {"string", "object"}, {"a": 1}),
+            ("[1,2]", {"string", "array"}, [1, 2]),
+        ]
+        for raw, types, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(coerce_union_literal(raw, types), (expected, True))
+
+    def test_strict_matching_keeps_raw_text(self):
+        cases = [
+            (" null ", {"string", "null"}),  # tojson never pads
+            ("NULL", {"string", "null"}),  # tojson emits lowercase
+            ("none", {"string", "null"}),
+            ("", {"string", "null"}),
+            ("nullable", {"string", "null"}),
+            ("yes", {"string", "boolean"}),
+            ("abc", {"string", "number"}),
+            ("1.5", {"string", "integer"}),  # parsed type outside the type set
+            ('"hi"', {"string", "null"}),  # already-quoted string keeps its quotes
+            ("NaN", {"string", "number"}),  # not valid JSON per RFC 8259
+            ("Infinity", {"string", "number"}),
+        ]
+        for raw, types in cases:
+            with self.subTest(raw=raw, types=types):
+                self.assertEqual(coerce_union_literal(raw, types), (raw, False))
+
+
+class TestStreamingLiteralPrefix(CustomTestCase):
+    def test_empty_buffer_is_always_undecided(self):
+        self.assertTrue(still_possible("", {"string", "null"}))
+
+    def test_prefix_of_a_candidate_keeps_buffering(self):
+        for literal, types in (
+            ("null", {"string", "null"}),
+            ("true", {"string", "boolean"}),
+            ("false", {"string", "boolean"}),
+        ):
+            for length in range(1, len(literal) + 1):
+                with self.subTest(buf=literal[:length]):
+                    self.assertTrue(still_possible(literal[:length], types))
+        for buf in ("-", "1", "1.2", "1e", "1e-3"):
+            with self.subTest(buf=buf):
+                self.assertTrue(still_possible(buf, {"string", "number"}))
+        self.assertTrue(still_possible('{"a"', {"string", "object"}))
+        self.assertTrue(still_possible("[1", {"string", "array"}))
+
+    def test_first_diverging_character_ends_buffering(self):
+        cases = [
+            ("H", {"string", "null"}),
+            ("no", {"string", "null"}),
+            ("nulla", {"string", "null"}),
+            (" ", {"string", "null"}),
+            ("true ", {"string", "boolean"}),
+            ("1a", {"string", "number"}),
+            ("{", {"string", "array"}),
+            ("[", {"string", "object"}),
+            ("null", {"string", "boolean"}),
+        ]
+        for buf, types in cases:
+            with self.subTest(buf=buf, types=types):
+                self.assertFalse(still_possible(buf, types))
 
 
 class TestWelmV4Tool(CustomTestCase):
@@ -1551,6 +1725,244 @@ class TestWelmV4Tool(CustomTestCase):
         merged = "".join(c.parameters for c in calls if c.name is None)
         self.assertEqual(json.loads(merged), {"meta": {"a": 1}})
         self.assertNotIn("}}}", merged)
+
+
+# Chat templates render string values verbatim and everything else through
+# tojson, so a bare `null`/`true`/`5` in the output is ambiguous and only the
+# schema can resolve it. Every WeLM path must agree on the resolution: the
+# id-based main path, the Glm4MoeDetector fallback, and streaming.
+BARE_LITERAL_CASES = [
+    # (label, schema, rendered value, expected argument)
+    ("pure_string_null", {"type": "string"}, "null", "null"),
+    ("pure_string_bool", {"type": "string"}, "true", "true"),
+    ("pure_string_exponent", {"type": "string"}, "1e3", "1e3"),
+    ("pure_string_trailing_zero", {"type": "string"}, "1.230", "1.230"),
+    ("pure_string_nan", {"type": "string"}, "NaN", "NaN"),
+    ("pure_string_object_literal", {"type": "string"}, '{"a":1}', '{"a":1}'),
+    ("pure_string_array_literal", {"type": "string"}, "[1,2]", "[1,2]"),
+    ("nullable_null", {"type": ["string", "null"]}, "null", None),
+    ("nullable_text", {"type": ["string", "null"]}, "hello", "hello"),
+    ("nullable_padded_null", {"type": ["string", "null"]}, " null ", " null "),
+    ("nullable_uppercase_null", {"type": ["string", "null"]}, "NULL", "NULL"),
+    ("nullable_empty", {"type": ["string", "null"]}, "", ""),
+    ("nullable_null_prefix", {"type": ["string", "null"]}, "nullable x", "nullable x"),
+    ("nullable_quoted_text", {"type": ["string", "null"]}, '"hi"', '"hi"'),
+    ("openapi_nullable", {"type": "string", "nullable": True}, "null", None),
+    ("enum_with_null", {"enum": ["a", None]}, "null", None),
+    ("enum_with_null_member", {"enum": ["a", None]}, "a", "a"),
+    (
+        "union_bool_true",
+        {"anyOf": [{"type": "string"}, {"type": "boolean"}]},
+        "true",
+        True,
+    ),
+    (
+        "union_bool_false",
+        {"anyOf": [{"type": "string"}, {"type": "boolean"}]},
+        "false",
+        False,
+    ),
+    ("union_number", {"anyOf": [{"type": "string"}, {"type": "number"}]}, "5", 5),
+    (
+        "union_number_exponent",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "1e3",
+        1000.0,
+    ),
+    (
+        "union_number_unparsable",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "abc",
+        "abc",
+    ),
+    (
+        "union_number_nan_stays_string",
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        "NaN",
+        "NaN",
+    ),
+    (
+        "union_object",
+        {"anyOf": [{"type": "string"}, {"type": "object"}]},
+        '{"a":1}',
+        {"a": 1},
+    ),
+    ("ref_to_nullable_string", {"$ref": "#/$defs/MaybeText"}, "null", None),
+    ("plain_number", {"type": "number"}, "5", 5),
+    ("nullable_number", {"type": ["number", "null"]}, "null", None),
+]
+
+
+class TestWelmV4BareJsonLiteralArguments(CustomTestCase):
+    """Bare JSON literals in argument values, across all three WeLM paths."""
+
+    def setUp(self):
+        self.tok = FakeWelmTokenizer()
+
+    @staticmethod
+    def _tools(schema):
+        return [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "$defs": {"MaybeText": {"type": ["string", "null"]}},
+                        "type": "object",
+                        "properties": {"x": schema},
+                    },
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _ids(value):
+        return (
+            [C["<tool_call>"]]
+            + enc("f\n")
+            + [C["<arg_key>"]]
+            + enc("x")
+            + [C["</arg_key>"]]
+            + enc("\n")
+            + [C["<arg_value>"]]
+            + enc(value)
+            + [C["</arg_value>"], C["</tool_call>"]]
+        )
+
+    @staticmethod
+    def _text(value):
+        return (
+            f"<tool_call>f\n<arg_key>x</arg_key>\n"
+            f"<arg_value>{value}</arg_value>\n</tool_call>"
+        )
+
+    def _main_path(self, schema, value):
+        detector = WelmV4ToolDetector(tokenizer=self.tok)
+        result = detector.detect_and_parse("", self._tools(schema), self._ids(value))
+        return json.loads(result.calls[0].parameters)["x"]
+
+    def _fallback_path(self, schema, value):
+        # No tokenizer means no control-token ids, so detect_and_parse delegates
+        # to Glm4MoeDetector. This is what /parse_function_call exercises.
+        detector = WelmV4ToolDetector(tokenizer=None)
+        result = detector.detect_and_parse(self._text(value), self._tools(schema))
+        return json.loads(result.calls[0].parameters)["x"]
+
+    def _stream_path(self, schema, value, chunk_size):
+        detector = WelmV4ToolDetector(tokenizer=self.tok)
+        tools = self._tools(schema)
+        ids = self._ids(value)
+        merged = ""
+        for i in range(0, len(ids), chunk_size):
+            result = detector.parse_streaming_increment(
+                "", tools, ids[i : i + chunk_size]
+            )
+            for call in result.calls:
+                if call.name is None:
+                    merged += call.parameters
+        return json.loads(merged)["x"], detector
+
+    def test_decision_table_all_paths_agree(self):
+        for label, schema, value, expected in BARE_LITERAL_CASES:
+            with self.subTest(case=label):
+                self.assertEqual(self._main_path(schema, value), expected)
+                self.assertEqual(self._fallback_path(schema, value), expected)
+                for chunk_size in (1, 4, len(self._ids(value))):
+                    with self.subTest(chunk_size=chunk_size):
+                        streamed, _ = self._stream_path(schema, value, chunk_size)
+                        self.assertEqual(streamed, expected)
+
+    def test_db_style_string_types_are_quoted_on_every_path(self):
+        """Without alias resolution these stream as bare text and break JSON."""
+        for type_name in ("varchar", "varchar(255)", "str", "text", "enum", "uuid"):
+            for value in ("hello", "N/A", "", "unknown"):
+                with self.subTest(type=type_name, value=value):
+                    schema = {"type": type_name}
+                    self.assertEqual(self._main_path(schema, value), value)
+                    self.assertEqual(self._fallback_path(schema, value), value)
+                    streamed, _ = self._stream_path(schema, value, 1)
+                    self.assertEqual(streamed, value)
+
+    def test_db_style_nullable_type_array_recovers_json_null(self):
+        schema = {"type": ["varchar", "none"]}
+        self.assertIsNone(self._main_path(schema, "null"))
+        self.assertIsNone(self._fallback_path(schema, "null"))
+        self.assertIsNone(self._stream_path(schema, "null", 1)[0])
+        # A non-literal value on the same schema stays a string.
+        self.assertEqual(
+            self._stream_path(schema, "nullable text", 1)[0], "nullable text"
+        )
+
+    def test_streamed_args_match_backfill_expectation(self):
+        """serving_chat backfills by prefix-matching these two states."""
+        for label, schema, value, _ in BARE_LITERAL_CASES:
+            with self.subTest(case=label):
+                _, detector = self._stream_path(schema, value, 1)
+                expected_call = json.dumps(
+                    detector.prev_tool_call_arr[0]["arguments"], ensure_ascii=False
+                )
+                self.assertEqual(detector.streamed_args_for_tool[0], expected_call)
+
+    def test_undecided_union_releases_buffer_at_shortest_prefix(self):
+        """A union value must not block streaming beyond the decidable prefix."""
+        schema = {"type": ["string", "null"]}
+        expectations = [
+            ("Hello world, a long sentence", 1),
+            ("note: something", 2),
+            ("nullable and a long paragraph", 5),
+        ]
+        for value, expected_delay in expectations:
+            with self.subTest(value=value):
+                detector = WelmV4ToolDetector(tokenizer=self.tok)
+                tools = self._tools(schema)
+                ids = self._ids(value)
+                value_start = ids.index(C["<arg_value>"])
+                merged = ""
+                prefix_len = None
+                first_delta_at = None
+                for pos, token_id in enumerate(ids):
+                    result = detector.parse_streaming_increment("", tools, [token_id])
+                    for call in result.calls:
+                        if call.name is None:
+                            merged += call.parameters
+                    if pos == value_start:
+                        prefix_len = len(merged)
+                    elif (
+                        prefix_len is not None
+                        and first_delta_at is None
+                        and len(merged) > prefix_len
+                    ):
+                        first_delta_at = pos - value_start
+                self.assertEqual(first_delta_at, expected_delay)
+
+    def test_unresolved_ref_keeps_value_verbatim_on_main_path(self):
+        # An unresolvable $ref yields no type at all, so the value never reaches
+        # the union rule. The main path keeps it verbatim; the Glm4MoeDetector
+        # fallback still parses untyped values, a pre-existing divergence that
+        # the union fix deliberately leaves alone.
+        schema = {"$ref": "#/$defs/Missing"}
+        self.assertEqual(self._main_path(schema, "null"), "null")
+        for chunk_size in (1, 4):
+            with self.subTest(chunk_size=chunk_size):
+                streamed, _ = self._stream_path(schema, "null", chunk_size)
+                self.assertEqual(streamed, "null")
+
+    def test_undecided_union_literal_buffers_until_value_end(self):
+        detector = WelmV4ToolDetector(tokenizer=self.tok)
+        tools = self._tools({"type": ["string", "null"]})
+        ids = self._ids("null")
+        value_end = ids.index(C["</arg_value>"])
+        merged = ""
+        at_value_end = None
+        for pos, token_id in enumerate(ids):
+            result = detector.parse_streaming_increment("", tools, [token_id])
+            for call in result.calls:
+                if call.name is None:
+                    merged += call.parameters
+            if pos == value_end - 1:
+                at_value_end = merged
+        self.assertEqual(at_value_end, '{"x": ')
+        self.assertEqual(merged, '{"x": null}')
 
 
 class TestTrimMatchedStopForIdParser(CustomTestCase):
